@@ -1,0 +1,12 @@
+[package]
+name = "adeploy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version= "4.5.34", features = ["derive"]}
+tokio = { version = "1", features = ["full"] }
+log2 = { version= "0.2.0"}
+anyhow = { version = "1.0.97"}
+rhai = "1.21.0"
+uuid = { version = "1.16.0", features = ["v4"] }

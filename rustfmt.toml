@@ -1,0 +1,6 @@
+tab_spaces = 2
+
+# unsafe config
+imports_granularity = "Crate"
+reorder_imports = true
+group_imports = "StdExternalCrate"
