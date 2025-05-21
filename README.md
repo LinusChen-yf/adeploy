@@ -1,20 +1,22 @@
 # adeploy
 
 adeploy (any deploy) is a cross-platform application deployment tool. Custom deployment logic is implemented through Rhai scripts.
+
 It is inspired by the `cros deploy` tool from Chromium OS.
 
 ## Features
+
 - Cross-platform
 - Customizable deployment logic through Rhai scripts
 
 ## Todo list
-- [✓] Customizable deployment logic through Rhai scripts
-- [✓] Support Cross-platform Client
-- [✓] Support Windows Server
-- [x] Support Linux Server
-- [x] Support MacOS Server
-- [x] Support more built-in functions
-- [x] Support server as lib to integrate with your program
+- [x] Customizable deployment logic through Rhai scripts
+- [x] Support cross-platform client
+- [x] Support Windows Server
+- [ ] Support Linux Server
+- [ ] Support macOS Server
+- [ ] Support more built-in functions
+- [ ] Support server as a library to integrate with your program
 
 ## How to Use
 
