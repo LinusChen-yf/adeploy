@@ -9,6 +9,7 @@ pub fn register_platform_functions(engine: &mut Engine) {
   engine.register_fn("stop_process", platform_functions::stop_process);
   engine.register_fn("start_service", platform_functions::start_service);
   engine.register_fn("stop_service", platform_functions::stop_service);
+  engine.register_fn("list_files", platform_functions::list_files);
 }
 
 pub fn register_update_binary(engine: &mut Engine, source_path: PathBuf, target_path: PathBuf) {
@@ -18,7 +19,7 @@ pub fn register_update_binary(engine: &mut Engine, source_path: PathBuf, target_
       &source_path.display(),
       &target_path.display()
     );
-    adeploy::platform_functions::update_binary(source_path.clone(), target_path.clone())
+    platform_functions::update_binary(source_path.clone(), target_path.clone())
   });
 }
 

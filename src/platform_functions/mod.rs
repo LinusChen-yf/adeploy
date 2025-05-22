@@ -2,6 +2,7 @@
 
 use std::{fs, path::PathBuf};
 
+use log2::warn;
 use rhai::Dynamic;
 
 // Declare platform-specific modules
@@ -119,4 +120,38 @@ pub fn update_binary(source_path: PathBuf, target_path: PathBuf) -> rhai::Dynami
             ))
     }
   }
+}
+
+pub fn list_files(path_str: String) -> rhai::Dynamic {
+  let path = PathBuf::from(&path_str);
+  if !path.exists() {
+    return Dynamic::from(format!("Path '{}' does not exist.", path_str));
+  }
+  if !path.is_dir() {
+    return Dynamic::from(format!("Path '{}' is not a directory.", path_str));
+  }
+  let mut file_list = rhai::Array::new();
+
+  let files = match path.read_dir() {
+    Ok(files) => files,
+    Err(e) => return Dynamic::from(format!("Failed to read directory '{}': {}", path_str, e)),
+  };
+  for file in files {
+    let file = match file {
+      Ok(file) => file,
+      Err(e) => {
+        warn!("Failed to read file: {}", e);
+        continue;
+      }
+    };
+    let path = file.path();
+    let mut file_info = rhai::Map::new();
+    file_info.insert(
+      "name".into(),
+      Dynamic::from(file.file_name().to_string_lossy().to_string()),
+    );
+    file_info.insert("is_dir".into(), Dynamic::from(path.is_dir()));
+    file_list.push(Dynamic::from(file_info));
+  }
+  Dynamic::from(file_list)
 }
