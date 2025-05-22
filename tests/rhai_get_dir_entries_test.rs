@@ -7,10 +7,10 @@ use std::{
 use adeploy::platform_functions;
 use rhai::{Dynamic, Engine, Scope};
 
-// Helper function to create a Rhai engine with the list_files function registered.
+// Helper function to create a Rhai engine with the get_dir_entries function registered.
 fn create_engine() -> Engine {
   let mut engine = Engine::new();
-  engine.register_fn("list_files", platform_functions::list_files);
+  engine.register_fn("get_dir_entries", platform_functions::get_dir_entries);
   engine
 }
 
@@ -37,11 +37,11 @@ mod tests {
   }
 
   #[test]
-  fn test_list_files_existing_directory() {
+  fn test_get_dir_entries_existing_directory() {
     let engine = create_engine();
     let mut scope = Scope::new();
 
-    let test_dir_name = "test_list_files_dir";
+    let test_dir_name = "test_get_dir_entries";
     let mut temp_dir = std::env::temp_dir();
     temp_dir.push(test_dir_name);
 
@@ -51,7 +51,7 @@ mod tests {
 
     let script = format!(
       r#"
-            let files = list_files("{}");
+            let files = get_dir_entries("{}");
             for item in files {{
                 print("Name: " + item.name + ", Is Dir: " + item.is_dir);
             }}
@@ -109,14 +109,14 @@ mod tests {
   }
 
   #[test]
-  fn test_list_files_non_existent_path() {
+  fn test_get_dir_entries_non_existent_path() {
     let engine = create_engine();
     let mut scope = Scope::new();
     let non_existent_path = "./non_existent_path_for_test";
 
     let script = format!(
       r#"
-            list_files("{}")
+            get_dir_entries("{}")
             "#,
       non_existent_path
     );
@@ -137,11 +137,11 @@ mod tests {
   }
 
   #[test]
-  fn test_list_files_with_file_path() {
+  fn test_get_dir_entries_with_file_path() {
     let engine = create_engine();
     let mut scope = Scope::new();
 
-    let test_file_name = "test_file_for_list_files.txt";
+    let test_file_name = "test_file_for_get_dir_entries.txt";
     let mut temp_file_path = std::env::temp_dir();
     temp_file_path.push(test_file_name);
 
@@ -152,7 +152,7 @@ mod tests {
 
     let script = format!(
       r#"
-            list_files("{}")
+            get_dir_entries("{}")
             "#,
       temp_file_path.to_str().unwrap().replace("\\", "/")
     );

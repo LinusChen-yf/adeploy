@@ -75,5 +75,5 @@ fn start_service(service_name: String);
 // Update binary
 fn update_binary();
 // Get all file information under the specified path
-fn list_files(path: String);
+fn get_dir_entries(path: String);
 ```

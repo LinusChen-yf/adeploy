@@ -122,7 +122,7 @@ pub fn update_binary(source_path: PathBuf, target_path: PathBuf) -> rhai::Dynami
   }
 }
 
-pub fn list_files(path_str: String) -> rhai::Dynamic {
+pub fn get_dir_entries(path_str: String) -> rhai::Dynamic {
   let path = PathBuf::from(&path_str);
   if !path.exists() {
     return Dynamic::from(format!("Path '{}' does not exist.", path_str));
