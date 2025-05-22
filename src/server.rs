@@ -94,6 +94,10 @@ async fn handle_connection(mut stream: TcpStream) -> Result<(), Box<dyn Error>> 
     let source_path = receive_file(&mut stream, "source program", &session_files_dir).await?;
 
     let mut engine = Engine::new();
+    register_platform_functions(&mut engine);
+    engine.on_print(|content| {
+      info!("[Rhai] {}", content);
+    });
     let ast = engine.compile_file(script_file_path.clone())?;
 
     // 2. Parse Rhai script to get config (especially target_path)
@@ -105,7 +109,6 @@ async fn handle_connection(mut stream: TcpStream) -> Result<(), Box<dyn Error>> 
     info!("Received deploy files successfully.");
 
     // 3. Register platform functions, making update_binary use server-side context
-    register_platform_functions(&mut engine);
     register_update_binary(&mut engine, source_path.clone(), target_path.clone());
 
     info!("Executing Rhai script...");

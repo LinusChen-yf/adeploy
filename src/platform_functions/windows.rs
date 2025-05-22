@@ -1,7 +1,8 @@
 // src/platform_functions/windows.rs
 
-use std::{fs, path::PathBuf, process::Command};
+use std::process::Command;
 
+use log2::warn;
 use rhai::Dynamic;
 
 pub fn stop_process_impl(process_name: String) -> Result<(), String> {
@@ -60,7 +61,7 @@ pub fn stop_service_impl(service_name: String) -> rhai::Dynamic {
       } else {
         if output.status.code() == Some(1062) {
           warn!("Service '{}' is already stopped.", service_name);
-          Dynamic::from(true)
+          return Dynamic::from(true);
         }
         Dynamic::from(format!(
           "Failed to stop service '{}' on Windows. Exit code: {}. Stderr: {}",

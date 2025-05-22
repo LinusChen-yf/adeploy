@@ -107,15 +107,14 @@ pub fn stop_service(service_name: String) -> rhai::Dynamic {
 
 /// Moves a file from source to target path.
 pub fn update_binary(source_path: PathBuf, target_path: PathBuf) -> rhai::Dynamic {
-  let target_exe = target_path.join("test.exe");
-  match fs::copy(&source_path, &target_exe) {
+  match fs::copy(&source_path, &target_path) {
     Ok(_) => Dynamic::from(true),
     Err(e) => {
       // fs::rename might fail across different drives. A copy and delete might be more robust.
       Dynamic::from(format!(
                 "Failed to update binary from '{}' to '{}' on Windows: {}. Consider implementing a copy-then-delete strategy for cross-drive moves.",
                 source_path.display(),
-                target_exe.display(),
+                target_path.display(),
                 e
             ))
     }
