@@ -84,7 +84,7 @@ pub fn stop_service(service_name: String) -> rhai::Dynamic {
   }
   #[cfg(target_os = "linux")]
   {
-    Err(format!(
+    Dynamic::from(format!(
       "stop_service not yet implemented for Linux for service: {}",
       service_name
     ))
