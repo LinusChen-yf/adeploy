@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package adeploy;
+
+// Deploy service definition
+service DeployService {
+    rpc Deploy(DeployRequest) returns (DeployResponse);
+    rpc GetStatus(StatusRequest) returns (StatusResponse);
+    rpc ListPackages(ListPackagesRequest) returns (ListPackagesResponse);
+}
+
+// Deploy request message
+message DeployRequest {
+    string package_name = 1;
+    string version = 2;
+    bytes file_data = 3;
+    string ssh_signature = 4;
+    string client_public_key = 5;
+    map<string, string> metadata = 6;
+}
+
+// Deploy response message
+message DeployResponse {
+    bool success = 1;
+    string message = 2;
+    string deploy_id = 3;
+    repeated string logs = 4;
+}
+
+// Status request message
+message StatusRequest {
+    string deploy_id = 1;
+}
+
+// Status response message
+message StatusResponse {
+    enum DeployStatus {
+        PENDING = 0;
+        RUNNING = 1;
+        SUCCESS = 2;
+        FAILED = 3;
+    }
+    DeployStatus status = 1;
+    string message = 2;
+    repeated string logs = 3;
+}
+
+// List packages request
+message ListPackagesRequest {}
+
+// List packages response
+message ListPackagesResponse {
+    repeated PackageInfo packages = 1;
+}
+
+// Package information
+message PackageInfo {
+    string name = 1;
+    string deploy_path = 2;
+    bool backup_enabled = 3;
+    string last_deploy_time = 4;
+    string version = 5;
+}

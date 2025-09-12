@@ -1,132 +1,223 @@
-use std::path::PathBuf; // PathBuf added for session_files_dir, Path for save_dir type hint
-use std::{error::Error, fs, path::Path};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
-use log2::{error, info};
-use rhai::{Engine, Scope};
-use tokio::{
-  fs::File as TokioFile,
-  io::{AsyncReadExt, BufReader},
-  net::{TcpListener, TcpStream},
+use base64::{engine::general_purpose, Engine as _};
+use log2::*;
+use tokio::sync::RwLock;
+use tonic::{transport::Server, Request, Response, Status};
+
+use crate::{
+  adeploy::{
+    deploy_service_server::{DeployService, DeployServiceServer},
+    status_response::DeployStatus,
+    DeployRequest, DeployResponse, ListPackagesRequest, ListPackagesResponse, PackageInfo,
+    StatusRequest, StatusResponse,
+  },
+  auth::SshAuth,
+  config::{load_server_config, ServerDeployConfig},
+  deploy::DeployManager,
+  error::{AdeployError, Result},
 };
-use uuid::Uuid;
 
-use crate::rhai_utils::{self, register_platform_functions, register_update_binary}; // Added for unique session IDs
+/// Deployment status tracking
+#[derive(Debug, Clone)]
+struct DeploymentStatus {
+  status: DeployStatus,
+  message: String,
+  logs: Vec<String>,
+}
 
-const PORT: u16 = 4441;
-const RECEIVED_FILES_DIR: &str = "deploy_files";
+/// ADeploy gRPC service implementation
+pub struct AdeployService {
+  config: ServerDeployConfig,
+  deployments: Arc<RwLock<HashMap<String, DeploymentStatus>>>,
+}
 
-pub async fn run_server() -> Result<(), Box<dyn Error>> {
-  let addr = format!("0.0.0.0:{}", PORT);
-  let listener = TcpListener::bind(&addr).await?;
-  info!("Server: Listening for incoming connections on {}", addr);
-
-  loop {
-    match listener.accept().await {
-      Ok((stream, _)) => {
-        tokio::spawn(async move {
-          if let Err(e) = handle_connection(stream).await {
-            error!("Failed to handle connection: {}", e);
-          }
-        });
-      }
-      Err(e) => {
-        error!("Failed to accept connection: {}", e);
-      }
+impl AdeployService {
+  pub fn new(config: ServerDeployConfig) -> Self {
+    Self {
+      config,
+      deployments: Arc::new(RwLock::new(HashMap::new())),
     }
   }
 }
 
-async fn receive_file(
-  stream: &mut TcpStream,
-  file_description: &str,
-  save_dir: &Path, // New parameter: directory to save the file in
-) -> Result<PathBuf, Box<dyn Error>> {
-  // 1. Read filename length (u32)
-  let filename_len = stream.read_u32().await?;
+#[tonic::async_trait]
+impl DeployService for AdeployService {
+  async fn deploy(
+    &self,
+    request: Request<DeployRequest>,
+  ) -> std::result::Result<Response<DeployResponse>, Status> {
+    let req = request.into_inner();
 
-  // 2. Read filename
-  let mut filename_bytes = vec![0u8; filename_len as usize];
-  stream.read_exact(&mut filename_bytes).await?;
-  let filename_str = String::from_utf8(filename_bytes)?;
+    info!("Received deploy request for package: {}", req.package_name);
 
-  // Sanitize filename to prevent path traversal and use only the base name
-  let filename = Path::new(&filename_str)
-    .file_name()
-    .ok_or("Invalid filename received from client")?
-    .to_string_lossy()
-    .into_owned();
+    // Verify SSH signature
+    let signature = general_purpose::STANDARD
+      .decode(&req.ssh_signature)
+      .map_err(|e| Status::invalid_argument(format!("Invalid signature: {}", e)))?;
 
-  // 3. Read file content length (u64)
-  let file_content_len = stream.read_u64().await?;
-
-  // The save_dir is expected to exist, created by handle_connection.
-  let save_path = save_dir.join(&filename);
-
-  // 4. Create file and write content
-  let mut file = TokioFile::create(&save_path).await?;
-
-  // Use tokio::io::copy to stream data from the socket to the file, limited by file_content_len
-  let mut reader = BufReader::new(stream.take(file_content_len));
-  let bytes_copied = tokio::io::copy(&mut reader, &mut file).await?;
-
-  info!(
-    "Server: Successfully received and saved {} ({} bytes) to: {:?}",
-    file_description, bytes_copied, save_path
-  );
-  Ok(save_path)
-}
-
-async fn handle_connection(mut stream: TcpStream) -> Result<(), Box<dyn Error>> {
-  let peer_addr = stream.peer_addr()?;
-  info!("Accepted connection from: {}", peer_addr);
-
-  // 1. Create unique temporary directory for this session
-  let session_id = Uuid::new_v4().to_string();
-  let session_files_dir = PathBuf::from(RECEIVED_FILES_DIR).join(&session_id);
-  fs::create_dir_all(&session_files_dir)?;
-
-  // Wrap the main logic in a block to ensure cleanup
-  let result = async {
-    // Receive the Rhai script file into the session directory
-    let script_file_path = receive_file(&mut stream, "Rhai script", &session_files_dir).await?;
-
-    // Receive the source program file into the session directory
-    let source_path = receive_file(&mut stream, "source program", &session_files_dir).await?;
-
-    let mut engine = Engine::new();
-    register_platform_functions(&mut engine);
-    engine.on_print(|content| {
-      info!("[Rhai] {}", content);
-    });
-    let ast = engine.compile_file(script_file_path.clone())?;
-
-    // 2. Parse Rhai script to get config (especially target_path)
-    let target_path_str = rhai_utils::parse_target_path(&engine, &ast)?;
-    let target_path = PathBuf::from(target_path_str);
-    if !target_path.exists() {
-      error!("target_path does not exist");
+    if !SshAuth::verify_signature(&req.client_public_key, &req.file_data, &signature)
+      .map_err(|e| Status::unauthenticated(format!("Auth error: {}", e)))?
+    {
+      return Err(Status::unauthenticated("Invalid SSH signature"));
     }
-    info!("Received deploy files successfully.");
 
-    // 3. Register platform functions, making update_binary use server-side context
-    register_update_binary(&mut engine, source_path.clone(), target_path.clone());
+    // Check if package is configured
+    let package_config =
+      self.config.packages.get(&req.package_name).ok_or_else(|| {
+        Status::not_found(format!("Package '{}' not configured", req.package_name))
+      })?;
 
-    info!("Executing Rhai script...");
+    // Create deployment manager
+    let deploy_manager = DeployManager::new();
+    let deploy_id = deploy_manager.deploy_id.clone();
 
-    let mut scope = Scope::new();
-    match engine.call_fn::<()>(&mut scope, &ast, "deploy", ()) {
-      Ok(_) => info!("Rhai script executed successfully with deployment actions."),
+    // Initialize deployment status
+    {
+      let mut deployments = self.deployments.write().await;
+      deployments.insert(
+        deploy_id.clone(),
+        DeploymentStatus {
+          status: DeployStatus::Running,
+          message: "Deployment started".to_string(),
+          logs: vec!["Starting deployment...".to_string()],
+        },
+      );
+    }
+
+    // Execute deployment synchronously for now
+    // TODO: Implement proper async deployment with Send-safe types
+    let result = Self::execute_deployment(&deploy_manager, &package_config, &req.file_data).await;
+
+    match result {
+      Ok(logs) => {
+        let mut deployments = self.deployments.write().await;
+        deployments.insert(
+          deploy_id.clone(),
+          DeploymentStatus {
+            status: DeployStatus::Success,
+            message: "Deployment completed successfully".to_string(),
+            logs: logs.clone(),
+          },
+        );
+
+        Ok(Response::new(DeployResponse {
+          success: true,
+          message: "Deployment completed successfully".to_string(),
+          deploy_id,
+          logs,
+        }))
+      }
       Err(e) => {
-        return Err(format!("Error executing Rhai script with deployment actions: {}", e).into());
+        let mut deployments = self.deployments.write().await;
+        deployments.insert(
+          deploy_id.clone(),
+          DeploymentStatus {
+            status: DeployStatus::Failed,
+            message: format!("Deployment failed: {}", e),
+            logs: vec![format!("ERROR: {}", e)],
+          },
+        );
+
+        Err(Status::internal(format!("Deployment failed: {}", e)))
       }
     }
-
-    Ok(())
   }
-  .await;
 
-  // 4. Cleanup temporary directory
-  fs::remove_dir_all(&session_files_dir)?;
+  async fn get_status(
+    &self,
+    request: Request<StatusRequest>,
+  ) -> std::result::Result<Response<StatusResponse>, Status> {
+    let req = request.into_inner();
 
-  result
+    let deployments = self.deployments.read().await;
+    let deployment = deployments
+      .get(&req.deploy_id)
+      .ok_or_else(|| Status::not_found("Deploy ID not found"))?;
+
+    Ok(Response::new(StatusResponse {
+      status: deployment.status as i32,
+      message: deployment.message.clone(),
+      logs: deployment.logs.clone(),
+    }))
+  }
+
+  async fn list_packages(
+    &self,
+    _request: Request<ListPackagesRequest>,
+  ) -> std::result::Result<Response<ListPackagesResponse>, Status> {
+    let packages: Vec<PackageInfo> = self
+      .config
+      .packages
+      .iter()
+      .map(|(name, config)| PackageInfo {
+        name: name.clone(),
+        deploy_path: config.deploy_path.clone(),
+        backup_enabled: config.backup_enabled,
+        last_deploy_time: "N/A".to_string(), // TODO: Track actual deploy times
+        version: "N/A".to_string(),          // TODO: Track versions
+      })
+      .collect();
+
+    Ok(Response::new(ListPackagesResponse { packages }))
+  }
+}
+
+impl AdeployService {
+  async fn execute_deployment(
+    deploy_manager: &DeployManager,
+    package_config: &crate::config::DeployPackageConfig,
+    file_data: &[u8],
+  ) -> Result<Vec<String>> {
+    let mut logs = Vec::new();
+
+    // Execute pre-deploy script
+    let pre_logs = deploy_manager.execute_pre_deploy_script(package_config)?;
+    logs.extend(pre_logs);
+
+    // Extract and deploy files
+    deploy_manager.extract_files(file_data, package_config)?;
+    logs.push("Files extracted successfully".to_string());
+
+    // Execute post-deploy script
+    let post_logs = deploy_manager.execute_post_deploy_script(package_config)?;
+    logs.extend(post_logs);
+
+    logs.push("Deployment completed successfully".to_string());
+    Ok(logs)
+  }
+}
+
+/// Start the gRPC server
+pub async fn start_server(
+  port: u16,
+  config_path: PathBuf,
+  _daemon: bool, // TODO: Implement daemon mode
+) -> Result<()> {
+  // Load server configuration
+  let config = load_server_config(config_path)?;
+
+  // Initialize logger for server with file output
+  std::fs::create_dir_all("./logs").ok();
+  log2::open("./logs/server.log")
+    .size(10 * 1024 * 1024)
+    .rotate(5)
+    .level("info")
+    .start();
+
+  let addr = format!("0.0.0.0:{}", port)
+    .parse()
+    .map_err(|e| AdeployError::Network(format!("Invalid address: {}", e)))?;
+
+  let adeploy_service = AdeployService::new(config);
+
+  info!("Starting ADeploy server on {}", addr);
+
+  Server::builder()
+    .add_service(DeployServiceServer::new(adeploy_service))
+    .serve(addr)
+    .await
+    .map_err(|e| AdeployError::Network(format!("Server error: {}", e)))?;
+
+  Ok(())
 }
