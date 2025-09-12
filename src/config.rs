@@ -4,46 +4,48 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AdeployError, Result};
 
+/// Client configuration structure based on DESIGN.md
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
-  pub package: PackageConfig,
-  pub server: ServerConfig,
+  pub packages: HashMap<String, PackageConfig>,
+  pub servers: HashMap<String, ServerConfig>,
 }
 
+/// Package configuration for client
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackageConfig {
-  pub name: String,
-  pub version: String,
-  pub path: String,
-  pub exclude: Vec<String>,
-  pub include_hidden: bool,
+  pub sources: Vec<String>,
 }
 
+/// Server configuration for client
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
-  pub host: String,
   pub port: u16,
   pub ssh_key_path: String,
   pub timeout: u64,
 }
 
+/// Server deployment configuration structure based on DESIGN.md
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerDeployConfig {
   pub packages: HashMap<String, DeployPackageConfig>,
   pub server: ServerSettings,
 }
 
+/// Package deployment configuration for server
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeployPackageConfig {
   pub deploy_path: String,
   pub pre_deploy_script: Option<String>,
   pub post_deploy_script: Option<String>,
+  #[serde(default)]
   pub backup_enabled: bool,
   pub backup_path: Option<String>,
   pub owner: Option<String>,
   pub permissions: Option<String>,
 }
 
+/// Server settings configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerSettings {
   pub port: u16,
@@ -51,24 +53,35 @@ pub struct ServerSettings {
   pub allowed_ssh_keys: Vec<String>,
 }
 
+/// Load client configuration from TOML file
 pub fn load_client_config<P: AsRef<Path>>(path: P) -> Result<ClientConfig> {
   let content = std::fs::read_to_string(path)
     .map_err(|e| AdeployError::Config(format!("Failed to read config file: {}", e)))?;
 
-  // Use a simple JSON-based configuration for now to avoid Rhai Send issues
-  let config: ClientConfig = serde_json::from_str(&content)
-    .map_err(|e| AdeployError::Config(format!("Failed to parse JSON config: {}", e)))?;
+  let config: ClientConfig = toml::from_str(&content)
+    .map_err(|e| AdeployError::Config(format!("Failed to parse TOML config: {}", e)))?;
 
   Ok(config)
 }
 
+/// Load server configuration from TOML file
 pub fn load_server_config<P: AsRef<Path>>(path: P) -> Result<ServerDeployConfig> {
   let content = std::fs::read_to_string(path)
     .map_err(|e| AdeployError::Config(format!("Failed to read config file: {}", e)))?;
 
-  // Use a simple JSON-based configuration for now to avoid Rhai Send issues
-  let config: ServerDeployConfig = serde_json::from_str(&content)
-    .map_err(|e| AdeployError::Config(format!("Failed to parse JSON config: {}", e)))?;
+  let config: ServerDeployConfig = toml::from_str(&content)
+    .map_err(|e| AdeployError::Config(format!("Failed to parse TOML config: {}", e)))?;
 
   Ok(config)
+}
+
+/// Get server configuration by IP address, fallback to default if not found
+pub fn get_server_config<'a>(
+  client_config: &'a ClientConfig,
+  ip: &str,
+) -> Option<&'a ServerConfig> {
+  client_config
+    .servers
+    .get(ip)
+    .or_else(|| client_config.servers.get("default"))
 }

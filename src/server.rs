@@ -1,16 +1,13 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::path::PathBuf;
 
 use base64::{engine::general_purpose, Engine as _};
 use log2::*;
-use tokio::sync::RwLock;
 use tonic::{transport::Server, Request, Response, Status};
 
 use crate::{
   adeploy::{
     deploy_service_server::{DeployService, DeployServiceServer},
-    status_response::DeployStatus,
-    DeployRequest, DeployResponse, ListPackagesRequest, ListPackagesResponse, PackageInfo,
-    StatusRequest, StatusResponse,
+    DeployRequest, DeployResponse,
   },
   auth::SshAuth,
   config::{load_server_config, ServerDeployConfig},
@@ -18,25 +15,18 @@ use crate::{
   error::{AdeployError, Result},
 };
 
-/// Deployment status tracking
-#[derive(Debug, Clone)]
-struct DeploymentStatus {
-  status: DeployStatus,
-  message: String,
-  logs: Vec<String>,
-}
+
 
 /// ADeploy gRPC service implementation
+#[derive(Clone)]
 pub struct AdeployService {
   config: ServerDeployConfig,
-  deployments: Arc<RwLock<HashMap<String, DeploymentStatus>>>,
 }
 
 impl AdeployService {
   pub fn new(config: ServerDeployConfig) -> Self {
     Self {
       config,
-      deployments: Arc::new(RwLock::new(HashMap::new())),
     }
   }
 }
@@ -72,18 +62,8 @@ impl DeployService for AdeployService {
     let deploy_manager = DeployManager::new();
     let deploy_id = deploy_manager.deploy_id.clone();
 
-    // Initialize deployment status
-    {
-      let mut deployments = self.deployments.write().await;
-      deployments.insert(
-        deploy_id.clone(),
-        DeploymentStatus {
-          status: DeployStatus::Running,
-          message: "Deployment started".to_string(),
-          logs: vec!["Starting deployment...".to_string()],
-        },
-      );
-    }
+    // Log deployment start
+    info!("Starting deployment for package: {}", req.package_name);
 
     // Execute deployment synchronously for now
     // TODO: Implement proper async deployment with Send-safe types
@@ -91,15 +71,7 @@ impl DeployService for AdeployService {
 
     match result {
       Ok(logs) => {
-        let mut deployments = self.deployments.write().await;
-        deployments.insert(
-          deploy_id.clone(),
-          DeploymentStatus {
-            status: DeployStatus::Success,
-            message: "Deployment completed successfully".to_string(),
-            logs: logs.clone(),
-          },
-        );
+        info!("Deployment completed successfully for package: {}", req.package_name);
 
         Ok(Response::new(DeployResponse {
           success: true,
@@ -109,58 +81,16 @@ impl DeployService for AdeployService {
         }))
       }
       Err(e) => {
-        let mut deployments = self.deployments.write().await;
-        deployments.insert(
-          deploy_id.clone(),
-          DeploymentStatus {
-            status: DeployStatus::Failed,
-            message: format!("Deployment failed: {}", e),
-            logs: vec![format!("ERROR: {}", e)],
-          },
-        );
+        error!("Deployment failed for package {}: {}", req.package_name, e);
 
         Err(Status::internal(format!("Deployment failed: {}", e)))
       }
     }
   }
 
-  async fn get_status(
-    &self,
-    request: Request<StatusRequest>,
-  ) -> std::result::Result<Response<StatusResponse>, Status> {
-    let req = request.into_inner();
 
-    let deployments = self.deployments.read().await;
-    let deployment = deployments
-      .get(&req.deploy_id)
-      .ok_or_else(|| Status::not_found("Deploy ID not found"))?;
 
-    Ok(Response::new(StatusResponse {
-      status: deployment.status as i32,
-      message: deployment.message.clone(),
-      logs: deployment.logs.clone(),
-    }))
-  }
 
-  async fn list_packages(
-    &self,
-    _request: Request<ListPackagesRequest>,
-  ) -> std::result::Result<Response<ListPackagesResponse>, Status> {
-    let packages: Vec<PackageInfo> = self
-      .config
-      .packages
-      .iter()
-      .map(|(name, config)| PackageInfo {
-        name: name.clone(),
-        deploy_path: config.deploy_path.clone(),
-        backup_enabled: config.backup_enabled,
-        last_deploy_time: "N/A".to_string(), // TODO: Track actual deploy times
-        version: "N/A".to_string(),          // TODO: Track versions
-      })
-      .collect();
-
-    Ok(Response::new(ListPackagesResponse { packages }))
-  }
 }
 
 impl AdeployService {
@@ -189,21 +119,9 @@ impl AdeployService {
 }
 
 /// Start the gRPC server
-pub async fn start_server(
-  port: u16,
-  config_path: PathBuf,
-  _daemon: bool, // TODO: Implement daemon mode
-) -> Result<()> {
+pub async fn start_server(port: u16, config_path: PathBuf) -> Result<()> {
   // Load server configuration
   let config = load_server_config(config_path)?;
-
-  // Initialize logger for server with file output
-  std::fs::create_dir_all("./logs").ok();
-  log2::open("./logs/server.log")
-    .size(10 * 1024 * 1024)
-    .rotate(5)
-    .level("info")
-    .start();
 
   let addr = format!("0.0.0.0:{}", port)
     .parse()

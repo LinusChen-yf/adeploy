@@ -2,13 +2,13 @@
 
 ## 项目概述
 
-ADeploy 是一个使用 Rust 开发的通用部署工具，支持跨平台、跨语言的应用程序部署。通过 gRPC 通信和 Rhai 脚本配置，提供灵活、安全的部署解决方案。程序由并且由Tokio 驱动，支持异步部署。
+ADeploy 是一个使用 Rust 开发的通用部署工具，支持跨平台、跨语言的应用程序部署。通过 gRPC 通信和 TOML 配置文件，提供简洁、安全的部署解决方案。程序由 Tokio 驱动，支持异步部署。
 
 ## 核心特性
 
 1. **跨平台支持**: 支持 Windows、Linux、macOS 等主流操作系统
 2. **语言无关**: 可部署任何语言编写的应用程序
-3. **灵活配置**: 使用 Rhai 脚本语言进行配置，支持复杂的部署逻辑
+3. **简洁配置**: 使用 TOML 配置文件进行配置，语法简单易懂
 4. **安全传输**: 基于 SSH 密钥的身份验证和加密传输
 5. **统一工具**: 单一二进制文件同时支持客户端和服务端模式
 
@@ -20,7 +20,7 @@ ADeploy 是一个使用 Rust 开发的通用部署工具，支持跨平台、跨
 ┌─────────────────┐         gRPC/TLS         ┌─────────────────┐
 │   Client Side   │◄─────────────────────────►│   Server Side   │
 ├─────────────────┤                          ├─────────────────┤
-│ • adeploy.rhai  │                          │ • config.rhai   │
+│ • adeploy.toml  │                          │ • config.toml   │
 │ • SSH Key       │                          │ • Deploy Scripts│
 │ • File Scanner  │                          │ • Backup System │
 │ • gRPC Client   │                          │ • gRPC Server   │
@@ -30,77 +30,116 @@ ADeploy 是一个使用 Rust 开发的通用部署工具，支持跨平台、跨
 ### 核心组件
 
 #### 1. 客户端组件
-- **配置解析器**: 解析 `adeploy.rhai` 配置文件
+- **配置解析器**: 解析 `adeploy.toml` 配置文件
 - **文件扫描器**: 扫描并打包需要部署的文件
 - **gRPC 客户端**: 与服务端通信
 - **SSH 认证**: 处理 SSH 密钥认证
 
 #### 2. 服务端组件
 - **gRPC 服务器**: 接收部署请求
-- **配置管理器**: 管理 `config.rhai` 配置文件
+- **配置管理器**: 管理 `config.toml` 配置文件
 - **部署执行器**: 执行部署前后脚本
 - **备份管理器**: 可选的备份功能
 - **安全验证器**: SSH 密钥验证
 
 ## 配置文件设计
 
-### 客户端配置 (adeploy.rhai)
+### 客户端配置 (adeploy.toml)
 
-```rhai
-// Package configuration
-let package = #{
-    name: "my-web-app",
-    version: "1.0.0",
-    path: "./dist",
-    exclude: ["*.log", "node_modules", ".git"],
-    include_hidden: false
-};
+```toml
+# package 配置，key 为 name
+[packages.myapp1]
+sources = ["./dist/myapp1"]
 
-// Server configuration
-let server = #{
-    host: "192.168.50.11",
-    port: 6060,
-    ssh_key_path: "~/.ssh/id_rsa",
-    timeout: 30
-};
+[packages.myapp2]
+sources = ["./api-dist/myapp2"]
 
-// Export configuration
-package
+# server 配置，key 为 IP 地址
+[servers."192.168.50.11"]
+port = 6060
+ssh_key_path = "~/.ssh/id_rsa.pub"
+timeout = 30
+
+[servers."192.168.50.12"]
+port = 8080
+ssh_key_path = "~/.ssh/id_rsa.pub"
+timeout = 60
+
+# 默认服务器配置
+[servers.default]
+port = 6060
+ssh_key_path = "~/.ssh/id_rsa.pub"
+timeout = 30
 ```
 
-### 服务端配置 (config.rhai)
+### 服务端配置 (config.toml)
 
-```rhai
-// Define packages and their deployment configurations
-let packages = #{
-    "my-web-app": #{
-        deploy_path: "/var/www/my-web-app",
-        pre_deploy_script: "./scripts/pre_deploy.sh",
-        post_deploy_script: "./scripts/post_deploy.sh",
-        backup_enabled: true,
-        backup_path: "/var/backups/my-web-app",
-        owner: "www-data",
-        permissions: "755"
-    },
-    "api-service": #{
-        deploy_path: "/opt/api-service",
-        pre_deploy_script: "./scripts/stop_service.sh",
-        post_deploy_script: "./scripts/start_service.sh",
-        backup_enabled: false
-    }
-};
+```toml
+[server]
+port = 6060
+max_file_size = 104857600  # 100MB in bytes
+allowed_ssh_keys = [
+    "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAB...",
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI..."
+]
 
-// Server settings
-let server = #{
-    port: 6060,
-    max_file_size: 100 * 1024 * 1024, // 100MB
-    allowed_ssh_keys: [
-        "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAB...",
-        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI..."
-    ]
-};
+# package 配置，key 为 name
+[packages.myapp1]
+deploy_path = "/opt/myapp1"
+pre_deploy_script = "./scripts/pre_deploy.sh"
+post_deploy_script = "./scripts/post_deploy.sh"
+backup_enabled = true
 
-packages
+[packages.myapp2]
+deploy_path = "/opt/myapp2"
+pre_deploy_script = "./scripts/pre_deploy.sh"
+post_deploy_script = "./scripts/post_deploy.sh"
+backup_enabled = false
+```
+
+### 配置文件使用说明
+
+#### 配置结构设计
+
+配置文件采用 TOML 的分层结构，使用点号分隔的键名来组织配置：
+
+- **packages 配置**：使用 `[packages.name]` 语法，每个 package 的 key 是其 `name`
+- **servers 配置**：使用 `[servers."IP地址"]` 语法，每个 server 的 key 是其 `IP 地址`
+
+注意：在 TOML 中，不需要显式声明 `[packages]` 或 `[servers]` 空节点，直接使用 `[packages.key]` 语法即可。
+
+#### Package 配置
+
+使用 `[packages.package-name]` 语法定义 package 配置：
+
+**注意事项：**
+- package 的 key（name）必须唯一
+- `sources` 字段是一个字符串数组，支持多个源路径
+- 每个源路径支持相对路径和绝对路径
+- 程序通过 package name 查找对应的配置信息
+
+#### Server 配置
+
+使用 `[servers."IP地址"]` 语法定义 server 配置：
+
+- **IP 地址作为 key**：直接使用目标服务器的 IP 地址作为配置 key
+- **默认配置**：`[servers.default]` 作为备用配置，当指定的 IP 地址没有对应配置时使用
+- **配置优先级**：命令行参数 > IP 特定配置 > 默认配置
+- 程序通过 IP 地址查找对应的服务器配置信息
+
+#### 使用示例
+
+```bash
+# 部署到 192.168.50.11，使用该 IP 对应的配置
+./adeploy 192.168.50.11
+
+# 部署到 192.168.50.99，由于没有对应配置，将使用 default 配置
+./adeploy 192.168.50.99
+
+# 只部署指定的 package
+./adeploy 192.168.50.11 --package my-web-app
+或者
+./adeploy 192.168.50.11 my-api-app
 ```
 
 ## gRPC 服务接口设计
@@ -193,12 +232,14 @@ message PackageInfo {
 ### 客户端流程
 
 ```
-1. 读取 adeploy.rhai 配置
-2. 扫描并打包文件
-3. 生成 SSH 签名
-4. 发送 gRPC 请求
-5. 等待部署结果
-6. 显示部署日志
+1. 读取 adeploy.toml 配置
+2. 根据目标 IP 地址选择对应的服务器配置
+3. 确定要部署的 packages（全部或指定的）
+4. 为每个 package 扫描并打包文件
+5. 生成 SSH 签名
+6. 发送 gRPC 请求（可能是多个 package 的批量请求）
+7. 等待部署结果
+8. 显示部署日志
 ```
 
 ### 服务端流程
@@ -219,20 +260,16 @@ message PackageInfo {
 ### 客户端使用方式
 
 ```bash
-# 基本部署
-./adeploy 192.168.50.11
 
-# 指定端口
-./adeploy 192.168.50.11 --port 8080
+# 基本部署（部署所有 packages 到指定 IP）
+./adeploy 192.168.50.11 my-app1
+or
+./adeploy client 192.168.50.11 my-app1
 
-# 指定配置文件
-./adeploy 192.168.50.11 --config ./custom.rhai
-
-# 查看状态
-./adeploy 192.168.50.11 --status deploy-id-123
-
-# 列出服务端包
-./adeploy 192.168.50.11 --list
+# 部署指定的 package
+./adeploy 192.168.50.11 --package my-app1
+or
+./adeploy client 192.168.50.11 my-app1
 ```
 
 ### 服务端使用方式
@@ -248,10 +285,8 @@ message PackageInfo {
 ./adeploy server --backup
 
 # 指定配置文件
-./adeploy server --config ./server-config.rhai
+./adeploy server --config ./server-config.toml
 
-# 后台运行
-./adeploy server --daemon
 ```
 
 ## 错误处理和日志
@@ -275,26 +310,7 @@ message PackageInfo {
 
 #### 日志配置
 
-使用 log2 库进行日志管理，支持以下特性：
-
-**客户端日志配置**:
-```rust
-// Initialize logger for client (console output only)
-log2::stderr()
-    .level(log::Level::Info)
-    .start();
-```
-
-**服务端日志配置**:
-```rust
-// Initialize logger for server with file output
-log2::open("./logs/server.log")
-    .size_limit(10*1024*1024) // 10MB
-    .rotate(5) // Keep 5 backup files
-    .level(log::Level::Debug)
-    .tee(true) // Output to both console and file
-    .start();
-```
+使用 log2 库进行日志管理
 
 #### 日志格式
 
@@ -313,58 +329,12 @@ log2::open("./logs/server.log")
 2024-01-15T10:31:05.012Z [ERROR] adeploy::script - Pre-deploy script failed: exit code 1
 ```
 
-#### 服务端日志文件管理
-
-服务端在程序目录下创建 `logs/` 目录存储日志文件：
-
-```
-adeploy/
-├── adeploy (binary)
-├── config.rhai
-├── logs/
-│   ├── adeploy-server.log (当前日志)
-│   ├── adeploy-server.log.1 (备份1)
-│   ├── adeploy-server.log.2 (备份2)
-│   └── ...
-└── scripts/
-```
-
 #### 日志轮转策略
 
 - **大小限制**: 单个日志文件最大 10MB
 - **备份数量**: 保留最近 5 个备份文件
 - **压缩**: 自动压缩旧的日志文件 (可选)
 - **清理**: 定期清理超过保留期限的日志文件
-
-#### 结构化日志
-
-对于重要事件，使用结构化日志记录：
-
-```rust
-use log::{info, error};
-
-// Deploy start event
-info!("deploy_start"; 
-    "deploy_id" => deploy_id,
-    "package_name" => package_name,
-    "client_ip" => client_ip,
-    "file_size" => file_size
-);
-
-// Deploy completion event
-info!("deploy_complete";
-    "deploy_id" => deploy_id,
-    "duration_ms" => duration.as_millis(),
-    "status" => "success"
-);
-
-// Error event
-error!("deploy_failed";
-    "deploy_id" => deploy_id,
-    "error_type" => "script_execution",
-    "error_message" => error_msg
-);
-```
 
 ## 性能优化
 
@@ -401,7 +371,7 @@ error!("deploy_failed";
 
 1. **项目初始化**
    - 创建 Cargo 项目结构
-   - 配置依赖项 (tonic, rhai, clap, tokio, log2)
+   - 配置依赖项 (tonic, toml, clap, tokio, log2)
    - 设置 CI/CD 流程
 
 2. **gRPC 服务定义**
@@ -410,7 +380,7 @@ error!("deploy_failed";
    - 实现基础服务接口
 
 3. **配置文件解析**
-   - 实现 Rhai 配置解析器
+   - 实现 TOML 配置解析器
    - 定义配置数据结构
    - 添加配置验证逻辑
 
@@ -471,7 +441,7 @@ error!("deploy_failed";
 ### 核心依赖
 
 - **tonic**: gRPC 框架
-- **rhai**: 脚本语言引擎
+- **toml**: TOML 配置文件解析
 - **clap**: 命令行参数解析
 - **tokio**: 异步运行时
 - **serde**: 序列化/反序列化

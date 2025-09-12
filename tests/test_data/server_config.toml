@@ -1,0 +1,32 @@
+# Server configuration for ADeploy
+# Based on DESIGN.md specification
+
+[server]
+port = 6060
+max_file_size = 52428800  # 50MB in bytes
+allowed_ssh_keys = [
+    "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC7vK8...",
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI..."
+]
+
+# Package configurations - key is the package name
+[packages.test-web-app]
+deploy_path = "/tmp/test-deploy/web-app"
+pre_deploy_script = "./scripts/stop_nginx.sh"
+post_deploy_script = "./scripts/start_nginx.sh"
+backup_enabled = true
+backup_path = "/tmp/backups/web-app"
+owner = "www-data"
+permissions = "755"
+
+[packages.api-service]
+deploy_path = "/tmp/test-deploy/api"
+pre_deploy_script = "./scripts/stop_api.sh"
+post_deploy_script = "./scripts/start_api.sh"
+backup_enabled = false
+owner = "api-user"
+permissions = "644"
+
+[packages.simple-app]
+deploy_path = "/tmp/test-deploy/simple"
+backup_enabled = false

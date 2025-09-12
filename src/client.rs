@@ -6,21 +6,43 @@ use tonic::transport::Channel;
 
 use crate::{
   adeploy::{
-    deploy_service_client::DeployServiceClient, DeployRequest, ListPackagesRequest, StatusRequest,
+    deploy_service_client::DeployServiceClient, DeployRequest,
   },
   auth::SshAuth,
-  config::load_client_config,
+  config::{get_server_config, load_client_config},
   deploy::DeployManager,
   error::{AdeployError, Result},
 };
 
 /// Deploy to a remote server
-pub async fn deploy(host: &str, port: u16, config_path: PathBuf) -> Result<()> {
+pub async fn deploy(host: &str, port: u16, config_path: PathBuf, package_name: &str) -> Result<()> {
+  deploy_packages(host, port, config_path, Some(vec![package_name.to_string()])).await
+}
+
+/// Deploy specific packages to a remote server
+pub async fn deploy_packages(
+  host: &str,
+  port: u16,
+  config_path: PathBuf,
+  package_names: Option<Vec<String>>,
+) -> Result<()> {
   // Load client configuration
   let config = load_client_config(config_path)?;
 
+  // Get server configuration for the target host
+  let server_config = get_server_config(&config, host).ok_or_else(|| {
+    AdeployError::Config(format!("No server configuration found for host: {}", host))
+  })?;
+
+  // Use port from config if not overridden
+  let actual_port = if port != 6060 {
+    port
+  } else {
+    server_config.port
+  };
+
   // Connect to server
-  let endpoint = format!("http://{}:{}", host, port);
+  let endpoint = format!("http://{}:{}", host, actual_port);
   let channel = Channel::from_shared(endpoint)
     .map_err(|e| AdeployError::Network(format!("Invalid endpoint: {}", e)))?
     .connect()
@@ -32,128 +54,78 @@ pub async fn deploy(host: &str, port: u16, config_path: PathBuf) -> Result<()> {
   // Create deployment manager
   let deploy_manager = DeployManager::new();
 
-  // Package files
-  let file_data = deploy_manager.package_files(&config.package)?;
-
   // Setup SSH authentication
   let ssh_auth = SshAuth::new();
-  let public_key = SshAuth::load_public_key(&config.server.ssh_key_path)?;
-  let signature = ssh_auth.sign_data(&file_data)?;
+  let public_key = SshAuth::load_public_key(&server_config.ssh_key_path)?;
 
-  // Create deploy request
-  let request = tonic::Request::new(DeployRequest {
-    package_name: config.package.name.clone(),
-    version: config.package.version.clone(),
-    file_data,
-    ssh_signature: general_purpose::STANDARD.encode(&signature),
-    client_public_key: public_key,
-    metadata: std::collections::HashMap::new(),
-  });
-
-  // Send deploy request
-  info!(
-    "Sending deployment request for package: {}",
-    config.package.name
-  );
-  let response = client
-    .deploy(request)
-    .await
-    .map_err(|e| AdeployError::Grpc(e))?;
-
-  let deploy_response = response.into_inner();
-
-  if deploy_response.success {
-    info!(
-      "Deployment successful! Deploy ID: {}",
-      deploy_response.deploy_id
-    );
-    for log_line in &deploy_response.logs {
-      println!("{}", log_line);
-    }
+  // Determine which packages to deploy
+  let packages_to_deploy: Vec<_> = if let Some(names) = package_names {
+    // Deploy only specified packages
+    names
+      .into_iter()
+      .filter_map(|name| config.packages.get(&name).map(|pkg| (name, pkg)))
+      .collect()
   } else {
-    error!("Deployment failed: {}", deploy_response.message);
-    for log_line in &deploy_response.logs {
-      eprintln!("{}", log_line);
-    }
-    return Err(AdeployError::Deploy(deploy_response.message));
+    return Err(AdeployError::Config(
+      "No packages found to deploy".to_string(),
+    ));
+  };
+
+  if packages_to_deploy.is_empty() {
+    return Err(AdeployError::Config(
+      "No packages found to deploy".to_string(),
+    ));
   }
 
-  Ok(())
-}
+  // Deploy each package
+  for (package_name, package_config) in packages_to_deploy {
+    info!("Deploying package: {}", package_name);
 
-/// Check deployment status
-pub async fn check_status(host: &str, port: u16, deploy_id: &str) -> Result<()> {
-  // Connect to server
-  let endpoint = format!("http://{}:{}", host, port);
-  let channel = Channel::from_shared(endpoint)
-    .map_err(|e| AdeployError::Network(format!("Invalid endpoint: {}", e)))?
-    .connect()
-    .await
-    .map_err(|e| AdeployError::Network(format!("Failed to connect: {}", e)))?;
+    // Package files
+    let archive_data = deploy_manager.package_files(&package_name, package_config)?;
 
-  let mut client = DeployServiceClient::new(channel);
+    // Sign the data
+    let signature = ssh_auth.sign_data(&archive_data)?;
 
-  // Create status request
-  let request = tonic::Request::new(StatusRequest {
-    deploy_id: deploy_id.to_string(),
-  });
+    // Create deploy request
+    let request = tonic::Request::new(DeployRequest {
+      package_name: package_name.clone(),
+      version: "1.0.0".to_string(), // Default version, could be made configurable
+      file_data: archive_data,
+      ssh_signature: general_purpose::STANDARD.encode(&signature),
+      client_public_key: public_key.clone(),
+      metadata: std::collections::HashMap::new(),
+    });
 
-  // Send status request
-  let response = client
-    .get_status(request)
-    .await
-    .map_err(|e| AdeployError::Grpc(e))?;
+    // Send deploy request
+    info!("Sending deployment request for package: {}", package_name);
+    let response = client
+      .deploy(request)
+      .await
+      .map_err(|e| AdeployError::Grpc(e))?;
 
-  let status_response = response.into_inner();
+    let deploy_response = response.into_inner();
 
-  println!("Deploy ID: {}", deploy_id);
-  println!("Status: {:?}", status_response.status());
-  println!("Message: {}", status_response.message);
-
-  if !status_response.logs.is_empty() {
-    println!("\nLogs:");
-    for log_line in &status_response.logs {
-      println!("{}", log_line);
-    }
-  }
-
-  Ok(())
-}
-
-/// List packages on server
-pub async fn list_packages(host: &str, port: u16) -> Result<()> {
-  // Connect to server
-  let endpoint = format!("http://{}:{}", host, port);
-  let channel = Channel::from_shared(endpoint)
-    .map_err(|e| AdeployError::Network(format!("Invalid endpoint: {}", e)))?
-    .connect()
-    .await
-    .map_err(|e| AdeployError::Network(format!("Failed to connect: {}", e)))?;
-
-  let mut client = DeployServiceClient::new(channel);
-
-  // Create list request
-  let request = tonic::Request::new(ListPackagesRequest {});
-
-  // Send list request
-  let response = client
-    .list_packages(request)
-    .await
-    .map_err(|e| AdeployError::Grpc(e))?;
-
-  let list_response = response.into_inner();
-
-  if list_response.packages.is_empty() {
-    println!("No packages configured on server");
-  } else {
-    println!("Available packages:");
-    for package in &list_response.packages {
-      println!("  Name: {}", package.name);
-      println!("  Deploy Path: {}", package.deploy_path);
-      println!("  Backup Enabled: {}", package.backup_enabled);
-      println!("  Version: {}", package.version);
-      println!("  Last Deploy: {}", package.last_deploy_time);
-      println!();
+    if deploy_response.success {
+      info!(
+        "Deployment successful for package: {}! Deploy ID: {}",
+        package_name, deploy_response.deploy_id
+      );
+      for log_line in &deploy_response.logs {
+        info!("{}", log_line);
+      }
+    } else {
+      error!(
+        "Deployment failed for package {}: {}",
+        package_name, deploy_response.message
+      );
+      for log_line in &deploy_response.logs {
+        error!("{}", log_line);
+      }
+      return Err(AdeployError::Deploy(format!(
+        "Package {} deployment failed: {}",
+        package_name, deploy_response.message
+      )));
     }
   }
 

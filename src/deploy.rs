@@ -26,18 +26,29 @@ impl DeployManager {
   }
 
   /// Scan and package files for deployment
-  pub fn package_files(&self, config: &PackageConfig) -> Result<Vec<u8>> {
-    info!("Packaging files from: {}", config.path);
+  pub fn package_files(&self, package_name: &str, config: &PackageConfig) -> Result<Vec<u8>> {
+    info!("Packaging files from sources: {:?}", config.sources);
 
     let mut archive = Vec::new();
     {
       let encoder = GzEncoder::new(&mut archive, Compression::default());
       let mut tar = Builder::new(encoder);
 
-      // Add files to archive
-      tar
-        .append_dir_all(&config.name, &config.path)
-        .map_err(|e| AdeployError::FileSystem(format!("Failed to create archive: {}", e)))?;
+      // Add files from each source to archive
+      for (index, source_path) in config.sources.iter().enumerate() {
+        let source_name = if config.sources.len() == 1 {
+          package_name.to_string()
+        } else {
+          format!("{}/source_{}", package_name, index)
+        };
+
+        tar.append_dir_all(&source_name, source_path).map_err(|e| {
+          AdeployError::FileSystem(format!(
+            "Failed to add source '{}' to archive: {}",
+            source_path, e
+          ))
+        })?;
+      }
 
       tar
         .finish()

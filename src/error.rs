@@ -24,8 +24,8 @@ pub enum AdeployError {
   #[error("IO error: {0}")]
   Io(#[from] std::io::Error),
 
-  #[error("Rhai script error: {0}")]
-  Rhai(String),
+  #[error("TOML parsing error: {0}")]
+  Toml(#[from] toml::de::Error),
 
   #[error("Serialization error: {0}")]
   Serde(#[from] serde_json::Error),
@@ -35,10 +35,6 @@ pub enum AdeployError {
 unsafe impl Send for AdeployError {}
 unsafe impl Sync for AdeployError {}
 
-impl From<Box<rhai::EvalAltResult>> for AdeployError {
-  fn from(err: Box<rhai::EvalAltResult>) -> Self {
-    AdeployError::Rhai(err.to_string())
-  }
-}
+// TOML error handling is automatically implemented via #[from] attribute
 
 pub type Result<T> = std::result::Result<T, AdeployError>;
