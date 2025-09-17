@@ -1,79 +1,126 @@
-# adeploy
+# ADeploy - Universal Deployment Tool
 
-adeploy (any deploy) is a cross-platform application deployment tool. Custom deployment logic is implemented through Rhai scripts.
+ADeploy is a universal deployment tool developed in Rust, supporting cross-platform and cross-language application deployment. It provides a concise and secure deployment solution through gRPC communication and TOML configuration files.
 
-It is inspired by the `cros deploy` tool from Chromium OS.
+## Key Features
 
-## Features
+- Cross-platform support (Windows, Linux, macOS)
+- Language agnostic - can deploy applications written in any language
+- Simple TOML configuration files
+- SSH key-based authentication and encrypted transmission
+- Support for pre/post-deployment script execution
+- Backup functionality (with customizable backup paths)
 
-- Cross-platform
-- Customizable deployment logic through Rhai scripts
+## Configuration
 
-## Todo list
-- [x] Customizable deployment logic through Rhai scripts
-- [x] Support cross-platform client
-- [x] Support Windows Server
-- [ ] Support Linux Server
-- [ ] Support macOS Server
-- [ ] Support more built-in functions
-- [ ] Support server as a library to integrate with your program
+ADeploy uses TOML configuration files for both client and server setups. There are two main configuration files:
 
-## How to Use
+1. **Client Configuration** (`client_config.toml`) - Defines packages to deploy and server connection details
+2. **Server Configuration** (`server_config.toml`) - Defines server settings and package deployment parameters
 
-### Server Side
+### Client Configuration (client_config.toml)
 
-```
-# Start server
-> adeploy server
-```
+The client configuration file defines the packages to be deployed and server connection details.
 
-### Client Side
+```toml
+# Package configuration, key is the package name
+[packages.myapp1]
+sources = ["./dist/myapp1"]
 
-```
-# Deploy application (using default deploy.rhai in current directory)
-> adeploy <server_ip>
+[packages.myapp2]
+sources = ["./api-dist/myapp2"]
 
-# Deploy application (using a specific script file)
-> adeploy <server_ip> <path_to_your_script.rhai>
-```
+# Server configuration, key is the IP address
+[servers."192.168.50.11"]
+port = 6060
+timeout = 30
 
-### rhai script example
+[servers."192.168.50.12"]
+port = 8080
+timeout = 60
 
-```
-const source_path = "./target/debug/adeploy";
-const target_path = "./deploy/adeploy";
-
-// required
-fn get_source_path() {
-  global::source_path
-}
-
-// required
-fn get_target_path() {
-  global::target_path
-}
-
-// required
-fn deploy() {
-  // deploy logic goes here
-  // ...
-  stop_service("adeploy");
-  update_binary();
-  start_service("adeploy");
-}
+# Default server configuration
+[servers.default]
+port = 6060
+key_path = ".key/id_ed25519.pub"
+timeout = 30
 ```
 
-#### Built-in functions
+#### Package Configuration
 
+Each package is defined under `[packages.package-name]` with the following options:
+
+- `sources` - An array of file/directory paths to include in the deployment package. Supports both relative and absolute paths.
+
+#### Server Configuration
+
+Server configurations are defined under `[servers."IP-address"]` with the following options:
+
+- `port` - The port number for the server (default: 6060)
+- `timeout` - Connection timeout in seconds
+- `key_path` - Path to the SSH public key file
+
+### Server Configuration (server_config.toml)
+
+The server configuration file defines server settings and deployment parameters for each package.
+
+```toml
+[server]
+port = 6060
+max_file_size = 104857600  # 100MB in bytes
+allowed_keys = [
+    "AAAAC3NzaC1lZDI1NTE5AAAAI...",
+    "AAAAC3NzaC1lZDI1NTE5AAAAA..."
+]
+
+# Package configuration, key is the package name
+[packages.myapp1]
+deploy_path = "/opt/myapp1"
+pre_deploy_script = "./scripts/pre_deploy.sh"
+post_deploy_script = "./scripts/post_deploy.sh"
+backup_enabled = true
+# Optional: Specify custom backup path, otherwise uses default path
+backup_path = "/backup/myapp1"
+
+[packages.myapp2]
+deploy_path = "/opt/myapp2"
+pre_deploy_script = "./scripts/pre_deploy.sh"
+post_deploy_script = "./scripts/post_deploy.sh"
+backup_enabled = false
 ```
-// Stop process
-fn stop_process(process_name: String);
-// Stop Service
-fn stop_service(service_name: String);
-// Start Service
-fn start_service(service_name: String);
-// Update binary
-fn update_binary();
-// Get all file information under the specified path
-fn get_dir_entries(path: String);
+
+#### Server Settings
+
+- `port` - The port number for the server to listen on (default: 6060)
+- `max_file_size` - Maximum allowed file size in bytes (default: 100MB)
+- `allowed_keys` - List of authorized SSH public keys for client authentication
+
+#### Package Deployment Configuration
+
+Each package deployment is defined under `[packages.package-name]` with the following options:
+
+- `deploy_path` - The target directory where the package will be deployed
+- `pre_deploy_script` - Script to execute before deployment (optional)
+- `post_deploy_script` - Script to execute after deployment (optional)
+- `backup_enabled` - Whether to enable backup functionality (true/false)
+- `backup_path` - Optional custom backup path (if not specified, backups are stored in a default location)
+
+##### Backup Path Options
+
+- If `backup_path` is not specified, backups will be stored in a subdirectory named after the package within the executable's directory
+- If `backup_path` is specified, backups will be stored in the specified directory
+
+### Configuration Usage Examples
+
+```bash
+# Deploy to 192.168.50.11, using the configuration for that IP
+./adeploy 192.168.50.11
+
+# Deploy to 192.168.50.99, which will use the default configuration
+./adeploy 192.168.50.99
+
+# Deploy only the specified package
+./adeploy 192.168.50.11 --package my-web-app
+# or
+./adeploy 192.168.50.11 my-api-app
 ```
