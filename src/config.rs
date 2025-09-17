@@ -21,8 +21,8 @@ pub struct PackageConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
   pub port: u16,
-  pub ssh_key_path: String,
   pub timeout: u64,
+  pub key_path: Option<String>,
 }
 
 /// Server deployment configuration structure based on DESIGN.md
@@ -41,8 +41,6 @@ pub struct DeployPackageConfig {
   #[serde(default)]
   pub backup_enabled: bool,
   pub backup_path: Option<String>,
-  pub owner: Option<String>,
-  pub permissions: Option<String>,
 }
 
 /// Server settings configuration
@@ -50,16 +48,16 @@ pub struct DeployPackageConfig {
 pub struct ServerSettings {
   pub port: u16,
   pub max_file_size: u64,
-  pub allowed_ssh_keys: Vec<String>,
+  pub allowed_keys: Vec<String>,
 }
 
 /// Load client configuration from TOML file
 pub fn load_client_config<P: AsRef<Path>>(path: P) -> Result<ClientConfig> {
   let content = std::fs::read_to_string(path)
-    .map_err(|e| AdeployError::Config(format!("Failed to read config file: {}", e)))?;
+    .map_err(|e| Box::new(AdeployError::Config(format!("Failed to read config file: {}", e))))?;
 
   let config: ClientConfig = toml::from_str(&content)
-    .map_err(|e| AdeployError::Config(format!("Failed to parse TOML config: {}", e)))?;
+    .map_err(|e| Box::new(AdeployError::Config(format!("Failed to parse TOML config: {}", e))))?;
 
   Ok(config)
 }
@@ -67,10 +65,10 @@ pub fn load_client_config<P: AsRef<Path>>(path: P) -> Result<ClientConfig> {
 /// Load server configuration from TOML file
 pub fn load_server_config<P: AsRef<Path>>(path: P) -> Result<ServerDeployConfig> {
   let content = std::fs::read_to_string(path)
-    .map_err(|e| AdeployError::Config(format!("Failed to read config file: {}", e)))?;
+    .map_err(|e| Box::new(AdeployError::Config(format!("Failed to read config file: {}", e))))?;
 
   let config: ServerDeployConfig = toml::from_str(&content)
-    .map_err(|e| AdeployError::Config(format!("Failed to parse TOML config: {}", e)))?;
+    .map_err(|e| Box::new(AdeployError::Config(format!("Failed to parse TOML config: {}", e))))?;
 
   Ok(config)
 }

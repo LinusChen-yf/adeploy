@@ -25,6 +25,9 @@ tokio-stream = "0.1"
 anyhow = "1.0"
 thiserror = "1.0"
 base64 = "0.22"
+sha2 = "0.10"
+ed25519-dalek = { version = "2.0", features = ["rand_core"] }
+rand = "0.8"
 
 [build-dependencies]
 tonic-build = "0.12"

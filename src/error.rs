@@ -35,6 +35,13 @@ pub enum AdeployError {
 unsafe impl Send for AdeployError {}
 unsafe impl Sync for AdeployError {}
 
+// Implement From<std::io::Error> for Box<AdeployError> to fix the error conversion issue
+impl From<std::io::Error> for Box<AdeployError> {
+  fn from(error: std::io::Error) -> Self {
+    Box::new(AdeployError::Io(error))
+  }
+}
+
 // TOML error handling is automatically implemented via #[from] attribute
 
-pub type Result<T> = std::result::Result<T, AdeployError>;
+pub type Result<T> = std::result::Result<T, Box<AdeployError>>;
