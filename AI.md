@@ -40,7 +40,7 @@ ADeploy is a universal deployment tool developed in Rust, supporting cross-platf
 #### 2. Server Components
 - **gRPC Server**: Receives deployment requests
 - **Configuration Manager**: Manages the `server_config.toml` configuration file
-- **Deployment Executor**: Executes pre/post-deployment scripts
+- **Deployment Executor**: Executes before/after-deployment scripts
 - **Backup Manager**: Optional backup functionality
 - **Security Verifier**: Ed25519 key verification
 
@@ -88,16 +88,16 @@ allowed_keys = [
 # Package configuration, key is the package name
 [packages.myapp1]
 deploy_path = "/opt/myapp1"
-pre_deploy_script = "./scripts/pre_deploy.sh"
-post_deploy_script = "./scripts/post_deploy.sh"
+before_deploy_script = "./scripts/before_deploy.sh"
+after_deploy_script = "./scripts/after_deploy.sh"
 backup_enabled = true
 # Optional: Specify custom backup path, otherwise uses default path
 backup_path = "/backup/myapp1"
 
 [packages.myapp2]
 deploy_path = "/opt/myapp2"
-pre_deploy_script = "./scripts/pre_deploy.sh"
-post_deploy_script = "./scripts/post_deploy.sh"
+before_deploy_script = "./scripts/before_deploy.sh"
+after_deploy_script = "./scripts/after_deploy.sh"
 backup_enabled = false
 ```
 
@@ -215,10 +215,10 @@ message DeployResponse {
 2. Verify SHA256 hash of the file package
 3. Check package configuration
 4. Create backup (if enabled)
-5. Execute pre_deploy script
+5. Execute before_deploy script
 6. Extract and deploy files to specified deploy_path directory
 7. Set file permissions
-8. Execute post_deploy script
+8. Execute after_deploy script
 9. Return deployment results
 ```
 

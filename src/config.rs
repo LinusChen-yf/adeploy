@@ -36,8 +36,8 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerPackageConfig {
   pub deploy_path: String,
-  pub pre_deploy_script: Option<String>,
-  pub post_deploy_script: Option<String>,
+  pub before_deploy_script: Option<String>,
+  pub after_deploy_script: Option<String>,
   #[serde(default)]
   pub backup_enabled: bool,
   pub backup_path: Option<String>,
