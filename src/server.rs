@@ -166,16 +166,16 @@ impl AdeployService {
       deploy_manager.deploy_id
     ));
 
-    // Execute pre-deploy script
-    logs.push("Executing pre-deploy script...".to_string());
-    match deploy_manager.execute_pre_deploy_script(package_config) {
+    // Execute before-deploy script
+    logs.push("Executing before-deploy script...".to_string());
+    match deploy_manager.execute_before_deploy_script(package_config) {
       Ok(pre_logs) => {
         logs.extend(pre_logs);
-        logs.push("Pre-deploy script executed successfully".to_string());
+        logs.push("Before-deploy script executed successfully".to_string());
       }
       Err(e) => {
-        error!("Pre-deploy script failed: {}", e);
-        logs.push(format!("ERROR: Pre-deploy script failed: {}", e));
+        error!("Before-deploy script failed: {}", e);
+        logs.push(format!("ERROR: Before-deploy script failed: {}", e));
         return Err(e);
       }
     }
@@ -194,18 +194,18 @@ impl AdeployService {
       }
     }
 
-    // Execute post-deploy script
-    logs.push("Executing post-deploy script...".to_string());
-    match deploy_manager.execute_post_deploy_script(package_config) {
+    // Execute after-deploy script
+    logs.push("Executing after-deploy script...".to_string());
+    match deploy_manager.execute_after_deploy_script(package_config) {
       Ok(post_logs) => {
         logs.extend(post_logs);
-        logs.push("Post-deploy script executed successfully".to_string());
+        logs.push("After-deploy script executed successfully".to_string());
       }
       Err(e) => {
-        error!("Post-deploy script failed: {}", e);
-        logs.push(format!("ERROR: Post-deploy script failed: {}", e));
+        error!("After-deploy script failed: {}", e);
+        logs.push(format!("ERROR: After-deploy script failed: {}", e));
         // Note: We don't return an error here as the deployment itself was successful
-        // The post-deploy script failure is logged but doesn't fail the entire deployment
+        // The after-deploy script failure is logged but doesn't fail the entire deployment
       }
     }
 

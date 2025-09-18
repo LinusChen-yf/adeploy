@@ -76,16 +76,16 @@ allowed_keys = [
 # Package configuration, key is the package name
 [packages.myapp1]
 deploy_path = "/opt/myapp1"
-pre_deploy_script = "./scripts/pre_deploy.sh"
-post_deploy_script = "./scripts/post_deploy.sh"
+before_deploy_script = "./scripts/before_deploy.sh"
+after_deploy_script = "./scripts/after_deploy.sh"
 backup_enabled = true
 # Optional: Specify custom backup path, otherwise uses default path
 backup_path = "/backup/myapp1"
 
 [packages.myapp2]
 deploy_path = "/opt/myapp2"
-pre_deploy_script = "./scripts/pre_deploy.sh"
-post_deploy_script = "./scripts/post_deploy.sh"
+before_deploy_script = "./scripts/before_deploy.sh"
+after_deploy_script = "./scripts/after_deploy.sh"
 backup_enabled = false
 ```
 
@@ -100,8 +100,8 @@ backup_enabled = false
 Each package deployment is defined under `[packages.package-name]` with the following options:
 
 - `deploy_path` - The target directory where the package will be deployed
-- `pre_deploy_script` - Script to execute before deployment (optional)
-- `post_deploy_script` - Script to execute after deployment (optional)
+- `before_deploy_script` - Script to execute before deployment (optional)
+- `after_deploy_script` - Script to execute after deployment (optional)
 - `backup_enabled` - Whether to enable backup functionality (true/false)
 - `backup_path` - Optional custom backup path (if not specified, backups are stored in a default location)
 

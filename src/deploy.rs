@@ -166,42 +166,42 @@ impl DeployManager {
     Ok(())
   }
 
-  /// Execute pre-deployment script
-  pub fn execute_pre_deploy_script(&self, config: &ServerPackageConfig) -> Result<Vec<String>> {
-    if let Some(script_path) = &config.pre_deploy_script {
-      info!("Executing pre-deploy script: {}", script_path);
+  /// Execute before-deployment script
+  pub fn execute_before_deploy_script(&self, config: &ServerPackageConfig) -> Result<Vec<String>> {
+    if let Some(script_path) = &config.before_deploy_script {
+      info!("Executing before-deploy script: {}", script_path);
       match self.execute_script(script_path) {
         Ok(logs) => {
-          info!("Pre-deploy script executed successfully");
+          info!("Before-deploy script executed successfully");
           Ok(logs)
         }
         Err(e) => {
-          error!("Pre-deploy script failed: {}", e);
+          error!("Before-deploy script failed: {}", e);
           Err(e)
         }
       }
     } else {
-      info!("No pre-deploy script configured");
+      info!("No before-deploy script configured");
       Ok(vec![])
     }
   }
 
-  /// Execute post-deployment script
-  pub fn execute_post_deploy_script(&self, config: &ServerPackageConfig) -> Result<Vec<String>> {
-    if let Some(script_path) = &config.post_deploy_script {
-      info!("Executing post-deploy script: {}", script_path);
+  /// Execute after-deployment script
+  pub fn execute_after_deploy_script(&self, config: &ServerPackageConfig) -> Result<Vec<String>> {
+    if let Some(script_path) = &config.after_deploy_script {
+      info!("Executing after-deploy script: {}", script_path);
       match self.execute_script(script_path) {
         Ok(logs) => {
-          info!("Post-deploy script executed successfully");
+          info!("After-deploy script executed successfully");
           Ok(logs)
         }
         Err(e) => {
-          error!("Post-deploy script failed: {}", e);
+          error!("After-deploy script failed: {}", e);
           Err(e)
         }
       }
     } else {
-      info!("No post-deploy script configured");
+      info!("No after-deploy script configured");
       Ok(vec![])
     }
   }
