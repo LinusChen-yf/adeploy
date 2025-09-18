@@ -153,10 +153,12 @@ async fn run_comprehensive_deployment_test() -> Result<(), Box<dyn std::error::E
   let server_config_path =
     create_test_server_config_file(&server_dir, port, &public_key, &package_name);
 
+  // Load server configuration
+  let server_config = adeploy::config::load_server_config(&server_config_path)?;
+
   // Start server
   info!("Starting deployment server on port {}", port);
-  let server_handle =
-    tokio::spawn(async move { server::start_server(port, server_config_path).await });
+  let server_handle = tokio::spawn(async move { server::start_server(port, server_config).await });
 
   // Give server time to start
   sleep(Duration::from_millis(200)).await;
@@ -165,11 +167,14 @@ async fn run_comprehensive_deployment_test() -> Result<(), Box<dyn std::error::E
   let client_config_path =
     create_test_client_config(&client_dir, port, &public_key_path.to_string_lossy());
 
+  // Load client configuration
+  let client_config = adeploy::config::load_client_config(&client_config_path)?;
+
   // Comprehensive deployment with all features
   info!("Comprehensive deployment with backup and scripts");
   let deploy_result = timeout(
     Duration::from_secs(15),
-    client::deploy("127.0.0.1", client_config_path.clone(), &package_name),
+    client::deploy("127.0.0.1", client_config, &package_name),
   )
   .await;
 
@@ -265,8 +270,8 @@ allowed_keys = [
 deploy_path = "{}"
 backup_enabled = true
 backup_path = "{}"
-pre_deploy_script = "{}"
-post_deploy_script = "{}"
+before_deploy_script = "{}"
+after_deploy_script = "{}"
 "#,
     port,
     public_key,
