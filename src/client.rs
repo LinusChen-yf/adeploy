@@ -5,11 +5,9 @@ use log2::*;
 use tonic::transport::Channel;
 
 use crate::{
-  adeploy::{
-    deploy_service_client::DeployServiceClient, DeployRequest,
-  },
+  adeploy::{deploy_service_client::DeployServiceClient, DeployRequest},
   auth::Auth,
-  config::{get_server_config, load_client_config},
+  config::{get_remote_config, load_client_config},
   deploy::DeployManager,
   error::{AdeployError, Result},
 };
@@ -29,8 +27,11 @@ pub async fn deploy_packages(
   let config = load_client_config(config_path)?;
 
   // Get server configuration for the target host
-  let server_config = get_server_config(&config, host).ok_or_else(|| {
-    Box::new(AdeployError::Config(format!("No server configuration found for host: {}", host)))
+  let server_config = get_remote_config(&config, host).ok_or_else(|| {
+    Box::new(AdeployError::Config(format!(
+      "No server configuration found for host: {}",
+      host
+    )))
   })?;
 
   // Use port from config
@@ -45,7 +46,7 @@ pub async fn deploy_packages(
     .map_err(|e| Box::new(AdeployError::Network(format!("Failed to connect: {}", e))))?;
 
   let mut client = DeployServiceClient::new(channel)
-    .max_decoding_message_size(100 * 1024 * 1024)  // 100MB
+    .max_decoding_message_size(100 * 1024 * 1024) // 100MB
     .max_encoding_message_size(100 * 1024 * 1024); // 100MB
 
   // Create deployment manager
@@ -56,67 +57,79 @@ pub async fn deploy_packages(
   let (private_key_path, public_key_path) = if let Some(custom_key_path) = &server_config.key_path {
     // Use custom key path if specified
     let public_key_path = PathBuf::from(custom_key_path);
-    
+
     // Check if the custom key file exists
     if !public_key_path.exists() {
       return Err(Box::new(AdeployError::FileSystem(format!(
-        "Custom key file not found at specified path: {}", 
+        "Custom key file not found at specified path: {}",
         custom_key_path
       ))));
     }
-    
+
     // Derive private key path from public key path
     let private_key_path = if custom_key_path.ends_with(".pub") {
       PathBuf::from(&custom_key_path[..custom_key_path.len() - 4])
     } else {
       return Err(Box::new(AdeployError::Config(format!(
-        "Custom key_path should point to a .pub file: {}", 
+        "Custom key_path should point to a .pub file: {}",
         custom_key_path
       ))));
     };
-    
+
     // Check if private key exists
     if !private_key_path.exists() {
       return Err(Box::new(AdeployError::FileSystem(format!(
-        "Private key file not found at: {}", 
+        "Private key file not found at: {}",
         private_key_path.display()
       ))));
     }
-    
+
     (private_key_path, public_key_path)
   } else {
     // Use default key paths
     let key_dir = PathBuf::from(".key");
     let private_key_path = key_dir.join("id_ed25519");
     let public_key_path = key_dir.join("id_ed25519.pub");
-    
+
     // Check if key directory exists, create if not
     if !key_dir.exists() {
-      std::fs::create_dir_all(&key_dir)
-        .map_err(|e| Box::new(AdeployError::FileSystem(format!("Failed to create key directory: {}", e))))?;
+      std::fs::create_dir_all(&key_dir).map_err(|e| {
+        Box::new(AdeployError::FileSystem(format!(
+          "Failed to create key directory: {}",
+          e
+        )))
+      })?;
     }
-    
+
     // Check if key files exist, generate if not
     if !private_key_path.exists() || !public_key_path.exists() {
       info!("Generating new Ed25519 key pair...");
       Auth::generate_key_pair(
         &public_key_path.to_string_lossy(),
-        &private_key_path.to_string_lossy()
+        &private_key_path.to_string_lossy(),
       )?;
       info!("Key pair generated successfully at: {:?}", key_dir);
     }
-    
+
     (private_key_path, public_key_path)
   };
-  
+
   // Load the keypair
-  let keypair = Auth::load_key_pair(&private_key_path.to_string_lossy())
-    .map_err(|e| Box::new(AdeployError::Auth(format!("Failed to load SSH key pair: {}", e))))?;
+  let keypair = Auth::load_key_pair(&private_key_path.to_string_lossy()).map_err(|e| {
+    Box::new(AdeployError::Auth(format!(
+      "Failed to load SSH key pair: {}",
+      e
+    )))
+  })?;
   let ssh_auth = Auth::with_key_pair(keypair);
-  
+
   // Load public key
-  let public_key = Auth::load_public_key(&public_key_path)
-    .map_err(|e| Box::new(AdeployError::FileSystem(format!("Failed to load public key: {}", e))))?;
+  let public_key = Auth::load_public_key(&public_key_path).map_err(|e| {
+    Box::new(AdeployError::FileSystem(format!(
+      "Failed to load public key: {}",
+      e
+    )))
+  })?;
 
   // Determine which packages to deploy
   let packages_to_deploy: Vec<_> = if let Some(names) = package_names {
@@ -145,7 +158,8 @@ pub async fn deploy_packages(
     let (archive_data, file_hash) = deploy_manager.package_files(&package_name, package_config)?;
 
     // Sign the data
-    let signature = ssh_auth.sign_data(&archive_data)
+    let signature = ssh_auth
+      .sign_data(&archive_data)
       .map_err(|e| Box::new(AdeployError::Auth(format!("Failed to sign data: {}", e))))?;
 
     // Create deploy request

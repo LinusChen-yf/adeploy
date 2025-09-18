@@ -1,6 +1,9 @@
 //! End-to-end integration tests
 
-use std::{path::{Path, PathBuf}, time::Duration};
+use std::{
+  path::{Path, PathBuf},
+  time::Duration,
+};
 
 use adeploy::{client, server};
 use log2::*;
@@ -12,7 +15,7 @@ mod common;
 #[tokio::test]
 async fn test_comprehensive_deployment_flow() {
   let _log2 = log2::start();
-  
+
   // Run the comprehensive deployment test
   if let Err(e) = run_comprehensive_deployment_test().await {
     panic!("Test failed with error: {}", e);
@@ -36,15 +39,15 @@ async fn setup_test() -> TestSetup {
   let package_name = "test-app";
   let port = common::find_available_port().await;
   let temp_dir = common::create_temp_dir();
-  
+
   let server_dir = temp_dir.path().join("server");
   std::fs::create_dir_all(&server_dir).unwrap();
   let client_dir = temp_dir.path().join("client");
   std::fs::create_dir_all(&client_dir).unwrap();
-  
+
   let private_key_path = server_dir.as_path().join("test_key");
   let public_key_path = server_dir.as_path().join("test_key.pub");
-  
+
   TestSetup {
     package_name: package_name.to_string(),
     port,
@@ -60,7 +63,7 @@ async fn setup_test() -> TestSetup {
 fn generate_test_keys(public_key_path: &Path, private_key_path: &Path) {
   let key_result = adeploy::auth::Auth::generate_key_pair(
     &public_key_path.to_string_lossy(),
-    &private_key_path.to_string_lossy()
+    &private_key_path.to_string_lossy(),
   );
   assert!(key_result.is_ok(), "Failed to generate key pair");
 }
@@ -69,27 +72,45 @@ fn generate_test_keys(public_key_path: &Path, private_key_path: &Path) {
 fn verify_deployed_files(deploy_path: &Path) {
   // Verify test1.txt exists and has correct content
   let test1_path = deploy_path.join("test1.txt");
-  assert!(test1_path.exists(), "test1.txt should exist in deploy directory");
+  assert!(
+    test1_path.exists(),
+    "test1.txt should exist in deploy directory"
+  );
   let test1_content = std::fs::read_to_string(&test1_path).expect("Failed to read test1.txt");
-  assert_eq!(test1_content, "test1 content", "test1.txt should have correct content");
-  
+  assert_eq!(
+    test1_content, "test1 content",
+    "test1.txt should have correct content"
+  );
+
   // Verify test2.txt exists and has correct content
   let test2_path = deploy_path.join("test2.txt");
-  assert!(test2_path.exists(), "test2.txt should exist in deploy directory");
+  assert!(
+    test2_path.exists(),
+    "test2.txt should exist in deploy directory"
+  );
   let test2_content = std::fs::read_to_string(&test2_path).expect("Failed to read test2.txt");
-  assert_eq!(test2_content, "test2 content", "test2.txt should have correct content");
+  assert_eq!(
+    test2_content, "test2 content",
+    "test2.txt should have correct content"
+  );
 }
 
 /// Verify script execution by checking marker files
 fn verify_script_execution(deploy_path: &Path) {
   // Verify pre-deploy script was executed by checking marker file
   let pre_marker_path = deploy_path.join("pre_deploy_executed.marker");
-  assert!(pre_marker_path.exists(), "Pre-deploy script marker file should exist, indicating script was executed");
+  assert!(
+    pre_marker_path.exists(),
+    "Pre-deploy script marker file should exist, indicating script was executed"
+  );
   info!("✅ Pre-deploy script execution verified");
-  
+
   // Verify post-deploy script was executed by checking marker file
   let post_marker_path = deploy_path.join("post_deploy_executed.marker");
-  assert!(post_marker_path.exists(), "Post-deploy script marker file should exist, indicating script was executed");
+  assert!(
+    post_marker_path.exists(),
+    "Post-deploy script marker file should exist, indicating script was executed"
+  );
   info!("✅ Post-deploy script execution verified");
 }
 
@@ -100,13 +121,16 @@ fn verify_backup_feature(backup_path: &Path) {
     .unwrap()
     .filter_map(|entry| entry.ok())
     .find(|entry| {
-      entry.file_name().to_string_lossy().starts_with("backup_") 
-      && entry.file_type().unwrap().is_dir()
+      entry.file_name().to_string_lossy().starts_with("backup_")
+        && entry.file_type().unwrap().is_dir()
     })
     .expect("Should find a backup directory starting with 'backup_'");
 
   let backup_file_path = backup_dir.path().join("backup.txt");
-  assert!(backup_file_path.exists(), "backup.txt should exist in backup directory");
+  assert!(
+    backup_file_path.exists(),
+    "backup.txt should exist in backup directory"
+  );
 }
 
 /// Run comprehensive deployment test with all features enabled
@@ -119,27 +143,28 @@ async fn run_comprehensive_deployment_test() -> Result<(), Box<dyn std::error::E
   let client_dir = test_setup.client_dir;
   let public_key_path = test_setup.public_key_path;
   let private_key_path = test_setup.private_key_path;
-  
+
   // Generate a key pair for all tests
   generate_test_keys(&public_key_path, &private_key_path);
-  
+
   // Create server configuration with backup enabled and scripts
   info!("Setting up server configuration with backup and scripts");
   let public_key = std::fs::read_to_string(&public_key_path)?;
-  let server_config_path = create_test_server_config_file(&server_dir, port, &public_key, &package_name);
-  
+  let server_config_path =
+    create_test_server_config_file(&server_dir, port, &public_key, &package_name);
+
   // Start server
   info!("Starting deployment server on port {}", port);
-  let server_handle = tokio::spawn(async move {
-    server::start_server(port, server_config_path).await
-  });
+  let server_handle =
+    tokio::spawn(async move { server::start_server(port, server_config_path).await });
 
   // Give server time to start
   sleep(Duration::from_millis(200)).await;
 
   // Create client configuration and test files
-  let client_config_path = create_test_client_config(&client_dir, port, &public_key_path.to_string_lossy());
-  
+  let client_config_path =
+    create_test_client_config(&client_dir, port, &public_key_path.to_string_lossy());
+
   // Comprehensive deployment with all features
   info!("Comprehensive deployment with backup and scripts");
   let deploy_result = timeout(
@@ -154,7 +179,7 @@ async fn run_comprehensive_deployment_test() -> Result<(), Box<dyn std::error::E
 
       // Verify deployment results
       info!("Verifying deployment results...");
-      
+
       // Check if files were deployed correctly
       let deploy_path = server_dir.join("deploy");
       let backup_path = server_dir.join("backup");
@@ -177,9 +202,13 @@ async fn run_comprehensive_deployment_test() -> Result<(), Box<dyn std::error::E
   Ok(())
 }
 
-
 /// Helper function to create server configuration file for testing
-fn create_test_server_config_file(server_path: &PathBuf, port: u16, public_key: &str, package_name: &str) -> PathBuf {
+fn create_test_server_config_file(
+  server_path: &PathBuf,
+  port: u16,
+  public_key: &str,
+  package_name: &str,
+) -> PathBuf {
   let deploy_path = server_path.join("deploy");
   let deploy_path_str = deploy_path.to_string_lossy().to_string();
   std::fs::create_dir_all(&deploy_path).expect("Failed to create deploy directory");
@@ -193,16 +222,17 @@ fn create_test_server_config_file(server_path: &PathBuf, port: u16, public_key: 
   // Create simple test scripts
   let scripts_dir = server_path.join("scripts");
   std::fs::create_dir_all(&scripts_dir).expect("Failed to create scripts directory");
-  
+
   // Create test scripts that touch marker files for verification
   let create_script = |script_name: &str, marker_name: &str| {
     let script_path = scripts_dir.join(script_name);
     let marker_file = format!("{}/{}", deploy_path_str, marker_name);
     let script_content = format!("#!/bin/sh\ntouch '{}'\n", marker_file);
-    std::fs::write(&script_path, script_content).expect(&format!("Failed to write {}", script_name));
+    std::fs::write(&script_path, script_content)
+      .expect(&format!("Failed to write {}", script_name));
     script_path
   };
-  
+
   let pre_script_path = create_script("pre_deploy.sh", "pre_deploy_executed.marker");
   let post_script_path = create_script("post_deploy.sh", "post_deploy_executed.marker");
 
@@ -212,11 +242,13 @@ fn create_test_server_config_file(server_path: &PathBuf, port: u16, public_key: 
     use std::os::unix::fs::PermissionsExt;
     let mut perms = std::fs::metadata(&pre_script_path).unwrap().permissions();
     perms.set_mode(0o755);
-    std::fs::set_permissions(&pre_script_path, perms).expect("Failed to set pre-deploy script permissions");
-    
+    std::fs::set_permissions(&pre_script_path, perms)
+      .expect("Failed to set pre-deploy script permissions");
+
     let mut perms = std::fs::metadata(&post_script_path).unwrap().permissions();
     perms.set_mode(0o755);
-    std::fs::set_permissions(&post_script_path, perms).expect("Failed to set post-deploy script permissions");
+    std::fs::set_permissions(&post_script_path, perms)
+      .expect("Failed to set post-deploy script permissions");
   }
 
   let config_content = format!(
@@ -236,8 +268,8 @@ backup_path = "{}"
 pre_deploy_script = "{}"
 post_deploy_script = "{}"
 "#,
-    port, 
-    public_key, 
+    port,
+    public_key,
     package_name,
     deploy_path_str,
     backup_path,
@@ -278,7 +310,12 @@ port = {}
 timeout = 30
 key_path = "{}"
 "#,
-    test1.to_string_lossy(), test2.to_string_lossy(), port, key_path, port, key_path
+    test1.to_string_lossy(),
+    test2.to_string_lossy(),
+    port,
+    key_path,
+    port,
+    key_path
   );
 
   let config_path = client_dir.join("client_config.toml");

@@ -21,11 +21,11 @@ pub mod adeploy {
 struct Cli {
   #[command(subcommand)]
   command: Option<Commands>,
-  
+
   /// Server host (when using default client mode)
   #[arg(value_name = "HOST")]
   host: Option<String>,
-  
+
   /// Package name (when using default client mode)
   #[arg(value_name = "PACKAGE")]
   package: Option<String>,
@@ -61,29 +61,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
       std::fs::create_dir_all("./logs").ok();
       let _log = log2::open("./logs/server.log")
         .size(10 * 1024 * 1024) // 10MB per log file
-        .rotate(5)              // Keep 5 backup files
-        .level("info")          // Log level
-        .tee(true)              // Also output to stdout
+        .rotate(5) // Keep 5 backup files
+        .level("info") // Log level
+        .tee(true) // Also output to stdout
         .start();
-      
+
       // Load server configuration to get port
       let server_config = config::load_server_config(&config)?;
       let port = server_config.server.port;
-      
+
       info!("========================================");
       info!("Starting ADeploy server on port {}", port);
       info!("Configuration file: {:?}", config);
       info!("========================================");
       server::start_server(port, config).await?
     }
-    Some(Commands::Client { host, package, config }) => {
+    Some(Commands::Client {
+      host,
+      package,
+      config,
+    }) => {
       let _log2 = log2::start();
-      
+
       // Load client configuration to get port
       let client_config = config::load_client_config(&config)?;
-      let server_config = config::get_server_config(&client_config, &host).ok_or_else(|| "No server configuration found")?;
+      let server_config = config::get_remote_config(&client_config, &host)
+        .ok_or_else(|| "No server configuration found")?;
       let port = server_config.port;
-      
+
       info!("========================================");
       info!("Deploying {} to {}:{}", package, host, port);
       info!("Configuration file: {:?}", config);
@@ -96,9 +101,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
       if let (Some(host), Some(package)) = (cli.host, cli.package) {
         let config_path = PathBuf::from("client_config.toml");
         let client_config = config::load_client_config(&config_path)?;
-        let server_config = config::get_server_config(&client_config, &host).ok_or_else(|| "No server configuration found")?;
+        let server_config = config::get_remote_config(&client_config, &host)
+          .ok_or_else(|| "No server configuration found")?;
         let port = server_config.port;
-        
+
         info!("========================================");
         info!("Deploying {} to {}:{}", package, host, port);
         info!("Using default configuration file: client_config.toml");

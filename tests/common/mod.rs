@@ -2,7 +2,6 @@
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
-
 /// Create a temporary directory for testing
 pub fn create_temp_dir() -> TempDir {
   tempfile::tempdir().expect("Failed to create temp directory")

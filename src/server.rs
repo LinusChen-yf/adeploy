@@ -10,24 +10,20 @@ use crate::{
     DeployRequest, DeployResponse,
   },
   auth::Auth,
-  config::{load_server_config, ServerDeployConfig},
+  config::{load_server_config, ServerConfig},
   deploy::DeployManager,
   error::{AdeployError, Result},
 };
 
-
-
 /// ADeploy gRPC service implementation
 #[derive(Clone)]
 pub struct AdeployService {
-  config: ServerDeployConfig,
+  config: ServerConfig,
 }
 
 impl AdeployService {
-  pub fn new(config: ServerDeployConfig) -> Self {
-    Self {
-      config,
-    }
+  pub fn new(config: ServerConfig) -> Self {
+    Self { config }
   }
 }
 
@@ -46,24 +42,36 @@ impl DeployService for AdeployService {
       Ok(sig) => sig,
       Err(e) => {
         error!("Invalid signature format: {}", e);
-        return Err(Status::invalid_argument(format!("Invalid signature: {}", e)));
+        return Err(Status::invalid_argument(format!(
+          "Invalid signature: {}",
+          e
+        )));
       }
     };
 
     // Check if the provided public key is in the allowed keys list
-    let is_allowed = self.config.server.allowed_keys.iter().any(|allowed_key| {
-      allowed_key == &req.public_key
-    });
+    let is_allowed = self
+      .config
+      .server
+      .allowed_keys
+      .iter()
+      .any(|allowed_key| allowed_key == &req.public_key);
 
     if !is_allowed {
-      error!("Client public key is not in allowed keys list for package: {}", req.package_name);
+      error!(
+        "Client public key is not in allowed keys list for package: {}",
+        req.package_name
+      );
       return Err(Status::unauthenticated("Client public key not allowed"));
     }
 
     match Auth::verify_signature(&req.public_key, &req.file_data, &signature) {
       Ok(valid) => {
         if !valid {
-          error!("Ed25519 signature verification failed for package: {}", req.package_name);
+          error!(
+            "Ed25519 signature verification failed for package: {}",
+            req.package_name
+          );
           return Err(Status::unauthenticated("Invalid Ed25519 signature"));
         }
       }
@@ -78,7 +86,10 @@ impl DeployService for AdeployService {
       Some(config) => config,
       None => {
         error!("Package '{}' not configured", req.package_name);
-        return Err(Status::not_found(format!("Package '{}' not configured", req.package_name)));
+        return Err(Status::not_found(format!(
+          "Package '{}' not configured",
+          req.package_name
+        )));
       }
     };
 
@@ -87,13 +98,27 @@ impl DeployService for AdeployService {
     let deploy_id = deploy_manager.deploy_id.clone();
 
     // Log deployment start
-    info!("Starting deployment [{}] for package: {}", deploy_id, req.package_name);
+    info!(
+      "Starting deployment [{}] for package: {}",
+      deploy_id, req.package_name
+    );
 
     // Execute deployment synchronously for now
     // TODO: Implement proper async deployment with Send-safe types
-    match Self::execute_deployment(&deploy_manager, package_config, &req.file_data, &req.file_hash, &req.package_name).await {
+    match Self::execute_deployment(
+      &deploy_manager,
+      package_config,
+      &req.file_data,
+      &req.file_hash,
+      &req.package_name,
+    )
+    .await
+    {
       Ok(logs) => {
-        info!("Deployment [{}] completed successfully for package: {}", deploy_id, req.package_name);
+        info!(
+          "Deployment [{}] completed successfully for package: {}",
+          deploy_id, req.package_name
+        );
 
         Ok(Response::new(DeployResponse {
           success: true,
@@ -103,14 +128,17 @@ impl DeployService for AdeployService {
         }))
       }
       Err(e) => {
-        error!("Deployment [{}] failed for package {}: {}", deploy_id, req.package_name, e);
+        error!(
+          "Deployment [{}] failed for package {}: {}",
+          deploy_id, req.package_name, e
+        );
 
         // Collect logs even in case of failure
         let mut logs = vec![format!("ERROR: Deployment failed: {}", e)];
-        
+
         // Try to get more detailed logs if available
         if let AdeployError::Deploy(msg) = e.as_ref() {
-            logs.push(format!("Details: {}", msg));
+          logs.push(format!("Details: {}", msg));
         }
 
         Ok(Response::new(DeployResponse {
@@ -127,13 +155,16 @@ impl DeployService for AdeployService {
 impl AdeployService {
   async fn execute_deployment(
     deploy_manager: &DeployManager,
-    package_config: &crate::config::DeployPackageConfig,
+    package_config: &crate::config::ServerPackageConfig,
     file_data: &[u8],
     file_hash: &str,
     package_name: &str,
   ) -> Result<Vec<String>> {
     let mut logs = Vec::new();
-    logs.push(format!("[{}] Starting deployment execution", deploy_manager.deploy_id));
+    logs.push(format!(
+      "[{}] Starting deployment execution",
+      deploy_manager.deploy_id
+    ));
 
     // Execute pre-deploy script
     logs.push("Executing pre-deploy script...".to_string());
@@ -149,7 +180,7 @@ impl AdeployService {
       }
     }
 
-    tokio::time::sleep(Duration::from_secs(1).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
     // Extract and deploy files with hash verification
     logs.push("Extracting and deploying files...".to_string());
     match deploy_manager.extract_files(file_data, file_hash, package_config, package_name) {
@@ -178,7 +209,10 @@ impl AdeployService {
       }
     }
 
-    logs.push(format!("[{}] Deployment completed successfully", deploy_manager.deploy_id));
+    logs.push(format!(
+      "[{}] Deployment completed successfully",
+      deploy_manager.deploy_id
+    ));
     Ok(logs)
   }
 }
@@ -197,9 +231,11 @@ pub async fn start_server(port: u16, config_path: PathBuf) -> Result<()> {
   info!("Starting ADeploy server on {}", addr);
 
   Server::builder()
-    .add_service(DeployServiceServer::new(adeploy_service)
-      .max_decoding_message_size(100 * 1024 * 1024)  // 100MB
-      .max_encoding_message_size(100 * 1024 * 1024)) // 100MB
+    .add_service(
+      DeployServiceServer::new(adeploy_service)
+        .max_decoding_message_size(100 * 1024 * 1024) // 100MB
+        .max_encoding_message_size(100 * 1024 * 1024),
+    ) // 100MB
     .serve(addr)
     .await
     .map_err(|e| Box::new(AdeployError::Network(format!("Server error: {}", e))))?;
