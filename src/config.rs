@@ -7,19 +7,19 @@ use crate::error::{AdeployError, Result};
 /// Client configuration structure based on DESIGN.md
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
-  pub packages: HashMap<String, PackageConfig>,
-  pub servers: HashMap<String, ServerConfig>,
+  pub packages: HashMap<String, ClientPackageConfig>,
+  pub servers: HashMap<String, RemoteConfig>,
 }
 
 /// Package configuration for client
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PackageConfig {
+pub struct ClientPackageConfig {
   pub sources: Vec<String>,
 }
 
-/// Server configuration for client
+/// Remote server configuration for client
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServerConfig {
+pub struct RemoteConfig {
   pub port: u16,
   pub timeout: u64,
   pub key_path: Option<String>,
@@ -27,14 +27,14 @@ pub struct ServerConfig {
 
 /// Server deployment configuration structure based on DESIGN.md
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServerDeployConfig {
-  pub packages: HashMap<String, DeployPackageConfig>,
+pub struct ServerConfig {
+  pub packages: HashMap<String, ServerPackageConfig>,
   pub server: ServerSettings,
 }
 
 /// Package deployment configuration for server
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeployPackageConfig {
+pub struct ServerPackageConfig {
   pub deploy_path: String,
   pub pre_deploy_script: Option<String>,
   pub post_deploy_script: Option<String>,
@@ -53,31 +53,47 @@ pub struct ServerSettings {
 
 /// Load client configuration from TOML file
 pub fn load_client_config<P: AsRef<Path>>(path: P) -> Result<ClientConfig> {
-  let content = std::fs::read_to_string(path)
-    .map_err(|e| Box::new(AdeployError::Config(format!("Failed to read config file: {}", e))))?;
+  let content = std::fs::read_to_string(path).map_err(|e| {
+    Box::new(AdeployError::Config(format!(
+      "Failed to read config file: {}",
+      e
+    )))
+  })?;
 
-  let config: ClientConfig = toml::from_str(&content)
-    .map_err(|e| Box::new(AdeployError::Config(format!("Failed to parse TOML config: {}", e))))?;
+  let config: ClientConfig = toml::from_str(&content).map_err(|e| {
+    Box::new(AdeployError::Config(format!(
+      "Failed to parse TOML config: {}",
+      e
+    )))
+  })?;
 
   Ok(config)
 }
 
 /// Load server configuration from TOML file
-pub fn load_server_config<P: AsRef<Path>>(path: P) -> Result<ServerDeployConfig> {
-  let content = std::fs::read_to_string(path)
-    .map_err(|e| Box::new(AdeployError::Config(format!("Failed to read config file: {}", e))))?;
+pub fn load_server_config<P: AsRef<Path>>(path: P) -> Result<ServerConfig> {
+  let content = std::fs::read_to_string(path).map_err(|e| {
+    Box::new(AdeployError::Config(format!(
+      "Failed to read config file: {}",
+      e
+    )))
+  })?;
 
-  let config: ServerDeployConfig = toml::from_str(&content)
-    .map_err(|e| Box::new(AdeployError::Config(format!("Failed to parse TOML config: {}", e))))?;
+  let config: ServerConfig = toml::from_str(&content).map_err(|e| {
+    Box::new(AdeployError::Config(format!(
+      "Failed to parse TOML config: {}",
+      e
+    )))
+  })?;
 
   Ok(config)
 }
 
 /// Get server configuration by IP address, fallback to default if not found
-pub fn get_server_config<'a>(
+pub fn get_remote_config<'a>(
   client_config: &'a ClientConfig,
   ip: &str,
-) -> Option<&'a ServerConfig> {
+) -> Option<&'a RemoteConfig> {
   client_config
     .servers
     .get(ip)
