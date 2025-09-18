@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::time::Duration;
 
 use base64::{engine::general_purpose, Engine as _};
 use log2::*;
@@ -10,7 +10,7 @@ use crate::{
     DeployRequest, DeployResponse,
   },
   auth::Auth,
-  config::{load_server_config, ServerConfig},
+  config::ServerConfig,
   deploy::DeployManager,
   error::{AdeployError, Result},
 };
@@ -218,10 +218,7 @@ impl AdeployService {
 }
 
 /// Start the gRPC server
-pub async fn start_server(port: u16, config_path: PathBuf) -> Result<()> {
-  // Load server configuration
-  let config = load_server_config(config_path)?;
-
+pub async fn start_server(port: u16, config: ServerConfig) -> Result<()> {
   let addr = format!("0.0.0.0:{}", port)
     .parse()
     .map_err(|e| Box::new(AdeployError::Network(format!("Invalid address: {}", e))))?;

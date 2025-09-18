@@ -60,17 +60,17 @@ sources = ["./api-dist/myapp2"]
 [servers."192.168.50.11"]
 port = 6060
 timeout = 30
-key_path = ".key/id_ed25519.pub"
+key_path = ".key/id_ed25519.pub"  # Relative to executable directory
 
 [servers."192.168.50.12"]
 port = 8080
 timeout = 60
-key_path = ".key/id_ed25519.pub"
+key_path = ".key/id_ed25519.pub"  # Relative to executable directory
 
 # Default server configuration
 [servers.default]
 port = 6060
-key_path = ".key/id_ed25519.pub"
+key_path = ".key/id_ed25519.pub"  # Relative to executable directory
 timeout = 30
 ```
 
@@ -110,6 +110,8 @@ Configuration files use TOML's hierarchical structure with dot-separated key nam
 - **Packages configuration**: Uses `[packages.name]` syntax, with each package's key being its `name`
 - **Servers configuration**: Uses `[servers."IP address"]` syntax, with each server's key being its `IP address`
 
+Note: Configuration files (`client_config.toml` and `server_config.toml`) are by default located in the same directory as the executable. The `.key` directory for SSH keys is also located in the executable's directory by default.
+
 #### Package Configuration
 
 Package configurations are defined using the `[packages.package-name]` syntax:
@@ -138,8 +140,8 @@ Server configurations are defined using the `[servers."IP address"]` syntax:
 # Deploy to 192.168.50.99, which will use the default configuration since no specific configuration exists
 ./adeploy 192.168.50.99 myapp1
 
-# Specify configuration file (only available in explicit client mode)
-./adeploy client 192.168.50.11 myapp1 -c ./custom_client_config.toml
+# Explicit client mode
+./adeploy client 192.168.50.11 myapp1
 ```
 
 ## gRPC Service Interface Design
@@ -180,7 +182,7 @@ message DeployResponse {
 
 ### Ed25519 Key Authentication Process
 
-1. **Key Generation**: The client automatically generates an Ed25519 key pair on first run, stored by default in `.key/id_ed25519` (private key) and `.key/id_ed25519.pub` (public key)
+1. **Key Generation**: The client automatically generates an Ed25519 key pair on first run, stored by default in the executable's directory under `.key/id_ed25519` (private key) and `.key/id_ed25519.pub` (public key)
 2. **Public Key Registration**: The client's Ed25519 public key is added to the server configuration file's `allowed_keys` list
 3. **Signature Verification**: The client signs requests using the private key
 4. **Server Verification**: The server verifies signatures using registered public keys
@@ -232,9 +234,6 @@ message DeployResponse {
 
 # Explicit client mode
 ./adeploy client 192.168.50.11 myapp1
-
-# Specify configuration file
-./adeploy client 192.168.50.11 myapp1 -c ./custom_client_config.toml
 ```
 
 ### Server Usage
@@ -242,9 +241,6 @@ message DeployResponse {
 ```bash
 # Start server
 ./adeploy server
-
-# Specify configuration file
-./adeploy server -c ./custom_server_config.toml
 ```
 
 ## Error Handling and Logging

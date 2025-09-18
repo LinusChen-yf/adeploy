@@ -15,8 +15,8 @@ ADeploy is a universal deployment tool developed in Rust, supporting cross-platf
 
 ADeploy uses TOML configuration files for both client and server setups. There are two main configuration files:
 
-1. **Client Configuration** (`client_config.toml`) - Defines packages to deploy and server connection details
-2. **Server Configuration** (`server_config.toml`) - Defines server settings and package deployment parameters
+1. **Client Configuration** (`client_config.toml`) - Defines packages to deploy and server connection details (by default located in the executable's directory)
+2. **Server Configuration** (`server_config.toml`) - Defines server settings and package deployment parameters (by default located in the executable's directory)
 
 ### Client Configuration (client_config.toml)
 
@@ -42,7 +42,7 @@ timeout = 60
 # Default server configuration
 [servers.default]
 port = 6060
-key_path = ".key/id_ed25519.pub"
+key_path = ".key/id_ed25519.pub"  # Relative to executable directory
 timeout = 30
 ```
 
@@ -58,7 +58,7 @@ Server configurations are defined under `[servers."IP-address"]` with the follow
 
 - `port` - The port number for the server (default: 6060)
 - `timeout` - Connection timeout in seconds
-- `key_path` - Path to the SSH public key file
+- `key_path` - Path to the SSH public key file (by default located in the executable's directory under `.key/id_ed25519.pub`)
 
 ### Server Configuration (server_config.toml)
 
@@ -110,17 +110,20 @@ Each package deployment is defined under `[packages.package-name]` with the foll
 - If `backup_path` is not specified, backups will be stored in a subdirectory named after the package within the executable's directory
 - If `backup_path` is specified, backups will be stored in the specified directory
 
+By default, both client and server will look for their configuration files (`client_config.toml` and `server_config.toml` respectively) in the same directory as the executable. If not found there, they will use the files from the current working directory.
+
 ### Configuration Usage Examples
 
 ```bash
 # Deploy to 192.168.50.11, using the configuration for that IP
-./adeploy 192.168.50.11
+./adeploy 192.168.50.11 myapp1
 
 # Deploy to 192.168.50.99, which will use the default configuration
-./adeploy 192.168.50.99
+./adeploy 192.168.50.99 myapp1
 
-# Deploy only the specified package
-./adeploy 192.168.50.11 --package my-web-app
-# or
-./adeploy 192.168.50.11 my-api-app
+# Explicit client mode
+./adeploy client 192.168.50.11 myapp1
+
+# Start the deployment server
+./adeploy server
 ```

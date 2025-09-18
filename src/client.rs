@@ -7,25 +7,40 @@ use tonic::transport::Channel;
 use crate::{
   adeploy::{deploy_service_client::DeployServiceClient, DeployRequest},
   auth::Auth,
-  config::{get_remote_config, load_client_config},
+  config::{get_remote_config, ClientConfig},
   deploy::DeployManager,
   error::{AdeployError, Result},
 };
 
+/// Get the directory where the executable is located
+fn get_executable_dir() -> Result<PathBuf> {
+  let current_exe = std::env::current_exe().map_err(|e| {
+    Box::new(AdeployError::FileSystem(format!(
+      "Failed to get current executable path: {}",
+      e
+    )))
+  })?;
+
+  let current_dir = current_exe.parent().ok_or_else(|| {
+    Box::new(AdeployError::FileSystem(
+      "Failed to get parent directory of executable".to_string(),
+    ))
+  })?;
+
+  Ok(current_dir.to_path_buf())
+}
+
 /// Deploy to a remote server
-pub async fn deploy(host: &str, config_path: PathBuf, package_name: &str) -> Result<()> {
-  deploy_packages(host, config_path, Some(vec![package_name.to_string()])).await
+pub async fn deploy(host: &str, config: ClientConfig, package_name: &str) -> Result<()> {
+  deploy_packages(host, config, Some(vec![package_name.to_string()])).await
 }
 
 /// Deploy specific packages to a remote server
 pub async fn deploy_packages(
   host: &str,
-  config_path: PathBuf,
+  config: ClientConfig,
   package_names: Option<Vec<String>>,
 ) -> Result<()> {
-  // Load client configuration
-  let config = load_client_config(config_path)?;
-
   // Get server configuration for the target host
   let server_config = get_remote_config(&config, host).ok_or_else(|| {
     Box::new(AdeployError::Config(format!(
@@ -86,8 +101,9 @@ pub async fn deploy_packages(
 
     (private_key_path, public_key_path)
   } else {
-    // Use default key paths
-    let key_dir = PathBuf::from(".key");
+    // Use default key paths in executable directory
+    let exe_dir = get_executable_dir()?;
+    let key_dir = exe_dir.join(".key");
     let private_key_path = key_dir.join("id_ed25519");
     let public_key_path = key_dir.join("id_ed25519.pub");
 
