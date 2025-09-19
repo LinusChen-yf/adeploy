@@ -32,14 +32,14 @@ impl DeployManager {
     _package_name: &str,
     config: &ClientPackageConfig,
   ) -> Result<(Vec<u8>, String)> {
-    info!("Packaging files from sources: {:?}", config.sources);
+    info!("Packaging sources: {:?}", config.sources);
 
     let mut archive = Vec::new();
     {
       let encoder = GzEncoder::new(&mut archive, Compression::default());
       let mut tar = Builder::new(encoder);
 
-      // Process each source path in the sources list
+      // Iterate over configured paths
       for source_path in &config.sources {
         let path = Path::new(source_path);
 
@@ -51,7 +51,7 @@ impl DeployManager {
         }
 
         if path.is_file() {
-          // Add single file to archive
+          // Archive a single file
           let file_name = path
             .file_name()
             .ok_or_else(|| Box::new(AdeployError::FileSystem("Invalid file name".to_string())))?
@@ -64,10 +64,9 @@ impl DeployManager {
               source_path, e
             )))
           })?;
-
-          info!("Added file: {}", source_path);
+          info!("Archived file {}", source_path);
         } else if path.is_dir() {
-          // Add entire directory to archive
+          // Archive a directory tree
           tar.append_dir_all("", path).map_err(|e| {
             Box::new(AdeployError::FileSystem(format!(
               "Failed to add directory '{}' to archive: {}",
@@ -75,7 +74,7 @@ impl DeployManager {
             )))
           })?;
 
-          info!("Added directory: {}", source_path);
+          info!("Archived directory {}", source_path);
         }
       }
 
@@ -87,16 +86,12 @@ impl DeployManager {
       })?;
     }
 
-    // Calculate SHA256 hash of the archive
+    // Compute SHA256 for the archive
     let mut hasher = Sha256::new();
     hasher.update(&archive);
     let hash = format!("{:x}", hasher.finalize());
 
-    info!(
-      "Package created, size: {} bytes, hash: {}",
-      archive.len(),
-      hash
-    );
+    info!("Created package ({} bytes, hash {})", archive.len(), hash);
     Ok((archive, hash))
   }
 
@@ -108,21 +103,18 @@ impl DeployManager {
     config: &ServerPackageConfig,
     package_name: &str,
   ) -> Result<()> {
-    info!(
-      "Starting file extraction process to: {}",
-      config.deploy_path
-    );
+    info!("Extracting files into {}", config.deploy_path);
     info!("Archive size: {} bytes", archive_data.len());
 
     // Verify hash before extraction
-    info!("Verifying file hash...");
+    info!("Verifying archive hash");
     let mut hasher = Sha256::new();
     hasher.update(archive_data);
     let actual_hash = format!("{:x}", hasher.finalize());
 
     if actual_hash != expected_hash {
       error!(
-        "Hash verification failed. Expected: {}, Actual: {}",
+        "Hash mismatch: expected {}, actual {}",
         expected_hash, actual_hash
       );
       return Err(Box::new(AdeployError::Deploy(format!(
@@ -131,16 +123,16 @@ impl DeployManager {
       ))));
     }
 
-    info!("Hash verification successful: {}", actual_hash);
+    info!("Hash verified: {}", actual_hash);
 
     // Create backup if enabled
     if config.backup_enabled {
-      info!("Backup is enabled, creating backup...");
+      info!("Creating backup snapshot");
       self.create_backup(config, package_name)?;
     }
 
     // Ensure deploy path exists
-    info!("Ensuring deploy directory exists: {}", config.deploy_path);
+    info!("Ensuring deploy directory {}", config.deploy_path);
     fs::create_dir_all(&config.deploy_path).map_err(|e| {
       error!("Failed to create deploy directory: {}", e);
       Box::new(AdeployError::FileSystem(format!(
@@ -150,7 +142,7 @@ impl DeployManager {
     })?;
 
     // Extract archive
-    info!("Extracting archive...");
+    info!("Extracting archive");
     let decoder = flate2::read::GzDecoder::new(archive_data);
     let mut archive = tar::Archive::new(decoder);
 
@@ -162,26 +154,26 @@ impl DeployManager {
       )))
     })?;
 
-    info!("Files extracted successfully to: {}", config.deploy_path);
+    info!("Extraction complete: {}", config.deploy_path);
     Ok(())
   }
 
   /// Execute before-deployment script
   pub fn execute_before_deploy_script(&self, config: &ServerPackageConfig) -> Result<Vec<String>> {
     if let Some(script_path) = &config.before_deploy_script {
-      info!("Executing before-deploy script: {}", script_path);
+      info!("Running pre-deploy script {}", script_path);
       match self.execute_script(script_path) {
         Ok(logs) => {
-          info!("Before-deploy script executed successfully");
+          info!("Pre-deploy script succeeded");
           Ok(logs)
         }
         Err(e) => {
-          error!("Before-deploy script failed: {}", e);
+          error!("Pre-deploy script failed: {}", e);
           Err(e)
         }
       }
     } else {
-      info!("No before-deploy script configured");
+      info!("No pre-deploy script configured");
       Ok(vec![])
     }
   }
@@ -189,26 +181,26 @@ impl DeployManager {
   /// Execute after-deployment script
   pub fn execute_after_deploy_script(&self, config: &ServerPackageConfig) -> Result<Vec<String>> {
     if let Some(script_path) = &config.after_deploy_script {
-      info!("Executing after-deploy script: {}", script_path);
+      info!("Running post-deploy script {}", script_path);
       match self.execute_script(script_path) {
         Ok(logs) => {
-          info!("After-deploy script executed successfully");
+          info!("Post-deploy script succeeded");
           Ok(logs)
         }
         Err(e) => {
-          error!("After-deploy script failed: {}", e);
+          error!("Post-deploy script failed: {}", e);
           Err(e)
         }
       }
     } else {
-      info!("No after-deploy script configured");
+      info!("No post-deploy script configured");
       Ok(vec![])
     }
   }
 
   /// Execute a shell script
   fn execute_script(&self, script_path: &str) -> Result<Vec<String>> {
-    info!("Executing script: {}", script_path);
+    info!("Running script {}", script_path);
 
     let output = Command::new("sh")
       .arg("-c")
@@ -226,45 +218,42 @@ impl DeployManager {
 
     let mut logs = vec![];
     if !stdout.is_empty() {
-      info!("Script stdout: {}", stdout);
+      info!("Script stdout: {}", stdout.trim_end());
       logs.extend(stdout.lines().map(|s| s.to_string()));
     }
     if !stderr.is_empty() {
-      warn!("Script stderr: {}", stderr);
+      warn!("Script stderr: {}", stderr.trim_end());
       logs.extend(stderr.lines().map(|s| format!("STDERR: {}", s)));
     }
 
     if !output.status.success() {
       let exit_code = output.status.code().unwrap_or(-1);
-      error!(
-        "Script '{}' failed with exit code: {}",
-        script_path, exit_code
-      );
+      error!("Script {} failed with exit code {}", script_path, exit_code);
       return Err(Box::new(AdeployError::Deploy(format!(
         "Script '{}' execution failed with exit code: {}",
         script_path, exit_code
       ))));
     }
 
-    info!("Script '{}' executed successfully", script_path);
+    info!("Script {} completed", script_path);
     Ok(logs)
   }
 
   /// Create backup of existing deployment
   fn create_backup(&self, config: &ServerPackageConfig, package_name: &str) -> Result<()> {
     if !config.backup_enabled {
-      error!("Backup is disabled for package: {}", package_name);
+      warn!("Backup disabled for {}", package_name);
       return Ok(());
     }
 
-    // Determine backup directory path
+    // Choose backup directory
     let backup_dir_path = match &config.backup_path {
       Some(path) => {
-        info!("Using custom backup path: {}", path);
+        info!("Using custom backup path {}", path);
         Path::new(path).to_path_buf()
       }
       None => {
-        // Get current executable directory
+        // Use executable directory as base
         let current_exe = std::env::current_exe().map_err(|e| {
           Box::new(AdeployError::FileSystem(format!(
             "Failed to get current executable path: {}",
@@ -278,7 +267,7 @@ impl DeployManager {
           ))
         })?;
 
-        // Create backup directory with package name
+        // Append package name to backup path
         current_dir.join(package_name)
       }
     };
@@ -290,21 +279,18 @@ impl DeployManager {
       )))
     })?;
 
-    info!("Creating backup at: {}", backup_dir_path.display());
+    info!("Creating backup at {}", backup_dir_path.display());
 
-    // Copy current deployment to backup with timestamp
+    // Copy deployment into timestamped folder
     let backup_name = format!("backup_{}", self.start_time.format("%Y%m%d_%H%M%S"));
     let backup_full_path = backup_dir_path.join(backup_name);
 
     if Path::new(&config.deploy_path).exists() {
       self.copy_directory(&config.deploy_path, &backup_full_path.to_string_lossy())?;
-      info!(
-        "Backup created successfully at: {}",
-        backup_full_path.display()
-      );
+      info!("Backup stored at {}", backup_full_path.display());
     } else {
       info!(
-        "No existing deployment found at: {}, skipping backup",
+        "No existing deployment at {}; skipping backup",
         config.deploy_path
       );
     }
@@ -312,7 +298,7 @@ impl DeployManager {
     if backup_full_path.exists() {
       for entry in backup_full_path.read_dir()? {
         let entry = entry?;
-        info!("Backup file: {}", entry.file_name().to_string_lossy());
+        info!("Backup item: {}", entry.file_name().to_string_lossy());
       }
     }
     Ok(())
@@ -320,7 +306,7 @@ impl DeployManager {
 
   /// Copy directory recursively
   fn copy_directory(&self, src: &str, dst: &str) -> Result<()> {
-    info!("Copying directory from {} to {}", src, dst);
+    info!("Copying {} -> {}", src, dst);
 
     let output = Command::new("cp")
       .arg("-r")
@@ -342,7 +328,7 @@ impl DeployManager {
       ))));
     }
 
-    info!("Directory copied successfully from {} to {}", src, dst);
+    info!("Copied {} -> {}", src, dst);
     Ok(())
   }
 }

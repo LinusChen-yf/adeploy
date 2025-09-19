@@ -8,7 +8,7 @@ use crate::error::{AdeployError, Result};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
   pub packages: HashMap<String, ClientPackageConfig>,
-  pub servers: HashMap<String, RemoteConfig>,
+  pub remotes: HashMap<String, RemoteConfig>,
 }
 
 /// Package configuration for client
@@ -95,7 +95,7 @@ pub fn get_remote_config<'a>(
   ip: &str,
 ) -> Option<&'a RemoteConfig> {
   client_config
-    .servers
+    .remotes
     .get(ip)
-    .or_else(|| client_config.servers.get("default"))
+    .or_else(|| client_config.remotes.get("default"))
 }

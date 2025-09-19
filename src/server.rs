@@ -35,9 +35,9 @@ impl DeployService for AdeployService {
   ) -> std::result::Result<Response<DeployResponse>, Status> {
     let req = request.into_inner();
 
-    info!("Received deploy request for package: {}", req.package_name);
+    info!("Received deploy request for {}", req.package_name);
 
-    // Verify SSH signature against allowed keys
+    // Verify signature against allowlist
     let signature = match general_purpose::STANDARD.decode(&req.signature) {
       Ok(sig) => sig,
       Err(e) => {
@@ -49,7 +49,7 @@ impl DeployService for AdeployService {
       }
     };
 
-    // Check if the provided public key is in the allowed keys list
+    // Ensure the provided public key is allowed
     let is_allowed = self
       .config
       .server
@@ -58,20 +58,14 @@ impl DeployService for AdeployService {
       .any(|allowed_key| allowed_key == &req.public_key);
 
     if !is_allowed {
-      error!(
-        "Client public key is not in allowed keys list for package: {}",
-        req.package_name
-      );
+      error!("Public key not allowed for {}", req.package_name);
       return Err(Status::unauthenticated("Client public key not allowed"));
     }
 
     match Auth::verify_signature(&req.public_key, &req.file_data, &signature) {
       Ok(valid) => {
         if !valid {
-          error!(
-            "Ed25519 signature verification failed for package: {}",
-            req.package_name
-          );
+          error!("Signature verification failed for {}", req.package_name);
           return Err(Status::unauthenticated("Invalid Ed25519 signature"));
         }
       }
@@ -81,11 +75,11 @@ impl DeployService for AdeployService {
       }
     }
 
-    // Check if package is configured
+    // Ensure package configuration exists
     let package_config = match self.config.packages.get(&req.package_name) {
       Some(config) => config,
       None => {
-        error!("Package '{}' not configured", req.package_name);
+        error!("Package {} is not configured", req.package_name);
         return Err(Status::not_found(format!(
           "Package '{}' not configured",
           req.package_name
@@ -93,15 +87,11 @@ impl DeployService for AdeployService {
       }
     };
 
-    // Create deployment manager
+    // Initialize deployment manager
     let deploy_manager = DeployManager::new();
     let deploy_id = deploy_manager.deploy_id.clone();
 
-    // Log deployment start
-    info!(
-      "Starting deployment [{}] for package: {}",
-      deploy_id, req.package_name
-    );
+    info!("Starting deployment {} for {}", deploy_id, req.package_name);
 
     // Execute deployment synchronously for now
     // TODO: Implement proper async deployment with Send-safe types
@@ -116,7 +106,7 @@ impl DeployService for AdeployService {
     {
       Ok(logs) => {
         info!(
-          "Deployment [{}] completed successfully for package: {}",
+          "Deployment {} completed for {}",
           deploy_id, req.package_name
         );
 
@@ -129,14 +119,14 @@ impl DeployService for AdeployService {
       }
       Err(e) => {
         error!(
-          "Deployment [{}] failed for package {}: {}",
+          "Deployment {} failed for {}: {}",
           deploy_id, req.package_name, e
         );
 
-        // Collect logs even in case of failure
+        // Always collect logs on failure
         let mut logs = vec![format!("ERROR: Deployment failed: {}", e)];
 
-        // Try to get more detailed logs if available
+        // Include additional details when available
         if let AdeployError::Deploy(msg) = e.as_ref() {
           logs.push(format!("Details: {}", msg));
         }
@@ -166,12 +156,12 @@ impl AdeployService {
       deploy_manager.deploy_id
     ));
 
-    // Execute before-deploy script
-    logs.push("Executing before-deploy script...".to_string());
+    // Run before-deploy hook
+    logs.push("Running pre-deploy script...".to_string());
     match deploy_manager.execute_before_deploy_script(package_config) {
       Ok(pre_logs) => {
         logs.extend(pre_logs);
-        logs.push("Before-deploy script executed successfully".to_string());
+        logs.push("Pre-deploy script succeeded".to_string());
       }
       Err(e) => {
         error!("Before-deploy script failed: {}", e);
@@ -181,8 +171,8 @@ impl AdeployService {
     }
 
     tokio::time::sleep(Duration::from_secs(1)).await;
-    // Extract and deploy files with hash verification
-    logs.push("Extracting and deploying files...".to_string());
+    // Extract archive and verify hash
+    logs.push("Extracting files...".to_string());
     match deploy_manager.extract_files(file_data, file_hash, package_config, package_name) {
       Ok(()) => {
         logs.push("Files extracted and deployed successfully".to_string());
@@ -194,18 +184,17 @@ impl AdeployService {
       }
     }
 
-    // Execute after-deploy script
-    logs.push("Executing after-deploy script...".to_string());
+    // Run after-deploy hook
+    logs.push("Running post-deploy script...".to_string());
     match deploy_manager.execute_after_deploy_script(package_config) {
       Ok(post_logs) => {
         logs.extend(post_logs);
-        logs.push("After-deploy script executed successfully".to_string());
+        logs.push("Post-deploy script succeeded".to_string());
       }
       Err(e) => {
         error!("After-deploy script failed: {}", e);
         logs.push(format!("ERROR: After-deploy script failed: {}", e));
-        // Note: We don't return an error here as the deployment itself was successful
-        // The after-deploy script failure is logged but doesn't fail the entire deployment
+        // Deployment succeeds even if the post-deploy script fails
       }
     }
 
@@ -225,14 +214,14 @@ pub async fn start_server(port: u16, config: ServerConfig) -> Result<()> {
 
   let adeploy_service = AdeployService::new(config);
 
-  info!("Starting ADeploy server on {}", addr);
+  info!("Binding ADeploy server on {}", addr);
 
   Server::builder()
     .add_service(
       DeployServiceServer::new(adeploy_service)
-        .max_decoding_message_size(100 * 1024 * 1024) // 100MB
+        .max_decoding_message_size(100 * 1024 * 1024) // 100 MB
         .max_encoding_message_size(100 * 1024 * 1024),
-    ) // 100MB
+    ) // 100 MB
     .serve(addr)
     .await
     .map_err(|e| Box::new(AdeployError::Network(format!("Server error: {}", e))))?;

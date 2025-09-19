@@ -7,7 +7,7 @@ use rand::rngs::OsRng;
 
 use crate::error::{AdeployError, Result};
 
-/// Ed25519 authentication handler
+/// Ed25519 authentication helper
 pub struct Auth {
   keypair: Option<SigningKey>,
 }
@@ -17,12 +17,12 @@ impl Auth {
     Self { keypair: None }
   }
 
-  /// Generate Ed25519 key pair and save to files
+  /// Generate an Ed25519 key pair and save it to disk
   pub fn generate_key_pair(public_key_path: &str, private_key_path: &str) -> Result<()> {
     let mut csprng = OsRng;
     let signing_key = SigningKey::generate(&mut csprng);
 
-    // Save private key
+    // Write private key
     std::fs::write(private_key_path, signing_key.to_bytes()).map_err(|e| {
       Box::new(AdeployError::FileSystem(format!(
         "Failed to write private key: {}",
@@ -30,7 +30,7 @@ impl Auth {
       )))
     })?;
 
-    // Save public key as base64 encoded bytes
+    // Write public key as base64
     let verifying_key = signing_key.verifying_key();
     let public_key_str = base64::engine::general_purpose::STANDARD.encode(verifying_key.to_bytes());
     std::fs::write(public_key_path, public_key_str).map_err(|e| {
@@ -41,7 +41,7 @@ impl Auth {
     })?;
 
     info!(
-      "Generated Ed25519 key pair at: {} and {}",
+      "Generated Ed25519 key pair at {} and {}",
       private_key_path, public_key_path
     );
     Ok(())
@@ -107,7 +107,7 @@ impl Auth {
     data: &[u8],
     signature_bytes: &[u8],
   ) -> Result<bool> {
-    // Decode the base64 public key directly
+    // Decode the base64 public key
     let public_key_bytes = base64::engine::general_purpose::STANDARD
       .decode(public_key_str.trim())
       .map_err(|e| {
@@ -117,7 +117,7 @@ impl Auth {
         )))
       })?;
 
-    // Create verifying key object
+    // Build verifying key
     let verifying_key = VerifyingKey::from_bytes(&public_key_bytes.try_into().map_err(|_| {
       Box::new(AdeployError::Auth(
         "Failed to convert public key bytes".to_string(),
@@ -130,7 +130,7 @@ impl Auth {
       )))
     })?;
 
-    // Create signature object
+    // Build signature
     let signature = Signature::from_bytes(signature_bytes.try_into().map_err(|_| {
       Box::new(AdeployError::Auth(
         "Failed to convert signature bytes".to_string(),

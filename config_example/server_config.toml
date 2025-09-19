@@ -1,0 +1,19 @@
+[server]
+# Port the gRPC deployment service listens on
+port = 6060
+# Maximum allowed archive size in bytes; larger uploads are rejected
+max_file_size = 104857600
+# Base64-encoded Ed25519 public keys permitted to deploy
+allowed_keys = ["AAAAC3NzaC1lZDI1NTE5AAAAdemoKey=="]
+
+[packages.demo]
+# Absolute path where the package contents are unpacked
+deploy_path = "/opt/demo/"
+# Enable automatic backup of the existing directory prior to deployment
+backup_enabled = true
+# Directory receiving timestamped backups when backup_enabled is true
+backup_path = "/var/backups/demo"
+# Executed via `sh -c` before unpacking; non-zero exit aborts the deploy
+before_deploy_script = "/usr/local/bin/pre_demo.sh"
+# Executed via `sh -c` after unpacking completes successfully
+after_deploy_script = "/usr/local/bin/post_demo.sh"

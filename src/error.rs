@@ -31,17 +31,17 @@ pub enum AdeployError {
   Serde(#[from] serde_json::Error),
 }
 
-// Implement Send and Sync for AdeployError
+// Allow AdeployError to cross thread boundaries
 unsafe impl Send for AdeployError {}
 unsafe impl Sync for AdeployError {}
 
-// Implement From<std::io::Error> for Box<AdeployError> to fix the error conversion issue
+// Support converting std::io::Error into Box<AdeployError>
 impl From<std::io::Error> for Box<AdeployError> {
   fn from(error: std::io::Error) -> Self {
     Box::new(AdeployError::Io(error))
   }
 }
 
-// TOML error handling is automatically implemented via #[from] attribute
+// TOML errors flow via the #[from] attribute
 
 pub type Result<T> = std::result::Result<T, Box<AdeployError>>;
