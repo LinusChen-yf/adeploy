@@ -1,129 +1,29 @@
-# ADeploy - Universal Deployment Tool
+# ADeploy
 
-ADeploy is a universal deployment tool developed in Rust, supporting cross-platform and cross-language application deployment. It provides a concise and secure deployment solution through gRPC communication and TOML configuration files.
+ADeploy is a lightweight Rust tool for deploying applications across platforms through a gRPC-driven client/server workflow. Use it to push versioned artifacts, run pre/post hooks, and manage rollbacks with predictable TOML configuration.
 
-## Key Features
+## Highlights
+- Cross-platform deployment (Linux, macOS, Windows)
+- Language-agnostic packaging with tar/flate2
+- Secure SSH key authentication and configurable timeouts
+- Optional pre/post deployment scripts and backups
 
-- Cross-platform support (Windows, Linux, macOS)
-- Language agnostic - can deploy applications written in any language
-- Simple TOML configuration files
-- SSH key-based authentication and encrypted transmission
-- Support for pre/post-deployment script execution
-- Backup functionality (with customizable backup paths)
-
-## Configuration
-
-ADeploy uses TOML configuration files for both client and server setups. There are two main configuration files:
-
-1. **Client Configuration** (`client_config.toml`) - Defines packages to deploy and server connection details (by default located in the executable's directory)
-2. **Server Configuration** (`server_config.toml`) - Defines server settings and package deployment parameters (by default located in the executable's directory)
-
-### Client Configuration (client_config.toml)
-
-The client configuration file defines the packages to be deployed and server connection details.
-
-```toml
-# Package configuration, key is the package name
-[packages.myapp1]
-sources = ["./dist/myapp1"]
-
-[packages.myapp2]
-sources = ["./api-dist/myapp2"]
-
-# Server configuration, key is the IP address
-[servers."192.168.50.11"]
-port = 6060
-timeout = 30
-
-[servers."192.168.50.12"]
-port = 8080
-timeout = 60
-
-# Default server configuration
-[servers.default]
-port = 6060
-key_path = ".key/id_ed25519.pub"  # Relative to executable directory
-timeout = 30
-```
-
-#### Package Configuration
-
-Each package is defined under `[packages.package-name]` with the following options:
-
-- `sources` - An array of file/directory paths to include in the deployment package. Supports both relative and absolute paths.
-
-#### Server Configuration
-
-Server configurations are defined under `[servers."IP-address"]` with the following options:
-
-- `port` - The port number for the server (default: 6060)
-- `timeout` - Connection timeout in seconds
-- `key_path` - Path to the SSH public key file (by default located in the executable's directory under `.key/id_ed25519.pub`)
-
-### Server Configuration (server_config.toml)
-
-The server configuration file defines server settings and deployment parameters for each package.
-
-```toml
-[server]
-port = 6060
-max_file_size = 104857600  # 100MB in bytes
-allowed_keys = [
-    "AAAAC3NzaC1lZDI1NTE5AAAAI...",
-    "AAAAC3NzaC1lZDI1NTE5AAAAA..."
-]
-
-# Package configuration, key is the package name
-[packages.myapp1]
-deploy_path = "/opt/myapp1"
-before_deploy_script = "./scripts/before_deploy.sh"
-after_deploy_script = "./scripts/after_deploy.sh"
-backup_enabled = true
-# Optional: Specify custom backup path, otherwise uses default path
-backup_path = "/backup/myapp1"
-
-[packages.myapp2]
-deploy_path = "/opt/myapp2"
-before_deploy_script = "./scripts/before_deploy.sh"
-after_deploy_script = "./scripts/after_deploy.sh"
-backup_enabled = false
-```
-
-#### Server Settings
-
-- `port` - The port number for the server to listen on (default: 6060)
-- `max_file_size` - Maximum allowed file size in bytes (default: 100MB)
-- `allowed_keys` - List of authorized SSH public keys for client authentication
-
-#### Package Deployment Configuration
-
-Each package deployment is defined under `[packages.package-name]` with the following options:
-
-- `deploy_path` - The target directory where the package will be deployed
-- `before_deploy_script` - Script to execute before deployment (optional)
-- `after_deploy_script` - Script to execute after deployment (optional)
-- `backup_enabled` - Whether to enable backup functionality (true/false)
-- `backup_path` - Optional custom backup path (if not specified, backups are stored in a default location)
-
-##### Backup Path Options
-
-- If `backup_path` is not specified, backups will be stored in a subdirectory named after the package within the executable's directory
-- If `backup_path` is specified, backups will be stored in the specified directory
-
-By default, both client and server will look for their configuration files (`client_config.toml` and `server_config.toml` respectively) in the same directory as the executable. If not found there, they will use the files from the current working directory.
-
-### Configuration Usage Examples
-
+## Quick Start
 ```bash
-# Deploy to 192.168.50.11, using the configuration for that IP
-./adeploy 192.168.50.11 myapp1
-
-# Deploy to 192.168.50.99, which will use the default configuration
-./adeploy 192.168.50.99 myapp1
-
-# Explicit client mode
-./adeploy client 192.168.50.11 myapp1
-
-# Start the deployment server
-./adeploy server
+./adeploy server                # start the gRPC server with server_config.toml
+./adeploy client <host> <pkg>    # deploy a package defined in client_config.toml
+./adeploy client 192.168.50.11 myapp
+./adeploy --help                 # list available subcommands and flags
 ```
+Build with `cargo build` first if you do not already have the binary.
+
+## Configuration Basics
+Sample templates live in `config_example/`. Copy the appropriate template into the same directory as the `adeploy` binary and name it `client_config.toml` (for client runs) or `server_config.toml` (for server runs). The executable automatically loads the config file from its own directory.
+
+### Client ([`config_example/client_config.toml`](config_example/client_config.toml))
+The template covers package sources, per-host overrides, and a fallback block. Each field is documented inline so you can mirror the structure while tweaking values for your environment.
+
+### Server ([`config_example/server_config.toml`](config_example/server_config.toml))
+This template walks through listener settings, allowed deploy keys, hook scripts, and backup controls. Refer to the embedded comments for the exact behavior of every knob.
+
+Use `./adeploy server` with the sample server config, then run `./adeploy client 192.168.50.11 demo` to push the demo package defined in the client template.

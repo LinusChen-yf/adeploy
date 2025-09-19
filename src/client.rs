@@ -12,7 +12,7 @@ use crate::{
   error::{AdeployError, Result},
 };
 
-/// Get the directory where the executable is located
+/// Locate the executable directory
 fn get_executable_dir() -> Result<PathBuf> {
   let current_exe = std::env::current_exe().map_err(|e| {
     Box::new(AdeployError::FileSystem(format!(
@@ -41,7 +41,7 @@ pub async fn deploy_packages(
   config: ClientConfig,
   package_names: Option<Vec<String>>,
 ) -> Result<()> {
-  // Get server configuration for the target host
+  // Look up server config for host
   let server_config = get_remote_config(&config, host).ok_or_else(|| {
     Box::new(AdeployError::Config(format!(
       "No server configuration found for host: {}",
@@ -49,10 +49,10 @@ pub async fn deploy_packages(
     )))
   })?;
 
-  // Use port from config
+  // Use configured port
   let actual_port = server_config.port;
 
-  // Connect to server
+  // Build gRPC channel
   let endpoint = format!("http://{}:{}", host, actual_port);
   let channel = Channel::from_shared(endpoint)
     .map_err(|e| Box::new(AdeployError::Network(format!("Invalid endpoint: {}", e))))?
@@ -64,16 +64,16 @@ pub async fn deploy_packages(
     .max_decoding_message_size(100 * 1024 * 1024) // 100MB
     .max_encoding_message_size(100 * 1024 * 1024); // 100MB
 
-  // Create deployment manager
+  // Initialize deployment manager
   let deploy_manager = DeployManager::new();
 
-  // Setup SSH authentication with key pair
+  // Prepare SSH authentication
   // Determine key paths based on server configuration
   let (private_key_path, public_key_path) = if let Some(custom_key_path) = &server_config.key_path {
-    // Use custom key path if specified
+    // Respect custom key path
     let public_key_path = PathBuf::from(custom_key_path);
 
-    // Check if the custom key file exists
+    // Ensure the custom key exists
     if !public_key_path.exists() {
       return Err(Box::new(AdeployError::FileSystem(format!(
         "Custom key file not found at specified path: {}",
@@ -91,7 +91,7 @@ pub async fn deploy_packages(
       ))));
     };
 
-    // Check if private key exists
+    // Verify private key exists
     if !private_key_path.exists() {
       return Err(Box::new(AdeployError::FileSystem(format!(
         "Private key file not found at: {}",
@@ -101,13 +101,13 @@ pub async fn deploy_packages(
 
     (private_key_path, public_key_path)
   } else {
-    // Use default key paths in executable directory
+    // Default to executable-relative key pair
     let exe_dir = get_executable_dir()?;
     let key_dir = exe_dir.join(".key");
     let private_key_path = key_dir.join("id_ed25519");
     let public_key_path = key_dir.join("id_ed25519.pub");
 
-    // Check if key directory exists, create if not
+    // Ensure key directory exists
     if !key_dir.exists() {
       std::fs::create_dir_all(&key_dir).map_err(|e| {
         Box::new(AdeployError::FileSystem(format!(
@@ -117,14 +117,14 @@ pub async fn deploy_packages(
       })?;
     }
 
-    // Check if key files exist, generate if not
+    // Generate key pair if missing
     if !private_key_path.exists() || !public_key_path.exists() {
-      info!("Generating new Ed25519 key pair...");
+      info!("Generating Ed25519 key pair");
       Auth::generate_key_pair(
         &public_key_path.to_string_lossy(),
         &private_key_path.to_string_lossy(),
       )?;
-      info!("Key pair generated successfully at: {:?}", key_dir);
+      info!("Stored key pair in {:?}", key_dir);
     }
 
     (private_key_path, public_key_path)
@@ -147,9 +147,9 @@ pub async fn deploy_packages(
     )))
   })?;
 
-  // Determine which packages to deploy
+  // Pick packages for deployment
   let packages_to_deploy: Vec<_> = if let Some(names) = package_names {
-    // Deploy only specified packages
+    // Filter to requested packages
     names
       .into_iter()
       .filter_map(|name| config.packages.get(&name).map(|pkg| (name, pkg)))
@@ -168,17 +168,17 @@ pub async fn deploy_packages(
 
   // Deploy each package
   for (package_name, package_config) in packages_to_deploy {
-    info!("Deploying package: {}", package_name);
+    info!("Deploying {}", package_name);
 
-    // Package files
+    // Bundle files
     let (archive_data, file_hash) = deploy_manager.package_files(&package_name, package_config)?;
 
-    // Sign the data
+    // Sign the archive
     let signature = ssh_auth
       .sign_data(&archive_data)
       .map_err(|e| Box::new(AdeployError::Auth(format!("Failed to sign data: {}", e))))?;
 
-    // Create deploy request
+    // Build deploy request
     let request = tonic::Request::new(DeployRequest {
       package_name: package_name.clone(),
       version: "1.0.0".to_string(), // Default version, could be made configurable
@@ -189,8 +189,8 @@ pub async fn deploy_packages(
       metadata: std::collections::HashMap::new(),
     });
 
-    // Send deploy request
-    info!("Sending deployment request for package: {}", package_name);
+    // Invoke gRPC deploy
+    info!("Sending deploy request for {}", package_name);
     let response = client
       .deploy(request)
       .await
@@ -200,7 +200,7 @@ pub async fn deploy_packages(
 
     if deploy_response.success {
       info!(
-        "Deployment successful for package: {}! Deploy ID: {}",
+        "Deployment succeeded for {} (ID: {})",
         package_name, deploy_response.deploy_id
       );
       for log_line in &deploy_response.logs {
@@ -208,7 +208,7 @@ pub async fn deploy_packages(
       }
     } else {
       error!(
-        "Deployment failed for package {}: {}",
+        "Deployment failed for {}: {}",
         package_name, deploy_response.message
       );
       for log_line in &deploy_response.logs {

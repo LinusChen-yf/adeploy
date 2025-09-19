@@ -303,14 +303,14 @@ fn create_test_client_config(client_dir: &PathBuf, port: u16, key_path: &str) ->
 [packages.test-app]
 sources = ["{}", "{}"]
 
-# Server configurations - key is the IP address
-[servers."127.0.0.1"]
+# Remote host configurations - key is the IP address
+[remotes."127.0.0.1"]
 port = {}
 timeout = 30
 key_path = "{}"
 
-# Default server configuration
-[servers.default]
+# Default remote configuration
+[remotes.default]
 port = {}
 timeout = 30
 key_path = "{}"
