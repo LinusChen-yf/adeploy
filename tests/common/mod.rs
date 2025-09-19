@@ -1,4 +1,5 @@
 //! Common test utilities and helpers
+
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
@@ -8,6 +9,7 @@ pub fn create_temp_dir() -> TempDir {
 }
 
 /// Find an available port for testing
+#[allow(dead_code)]
 pub async fn find_available_port() -> u16 {
   let listener = TcpListener::bind("127.0.0.1:0")
     .await
