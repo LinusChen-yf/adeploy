@@ -191,10 +191,18 @@ pub async fn deploy_packages(
 
     // Invoke gRPC deploy
     info!("Sending deploy request for {}", package_name);
-    let response = client
-      .deploy(request)
-      .await
-      .map_err(|e| Box::new(AdeployError::Grpc(e)))?;
+    let response = match client.deploy(request).await {
+      Ok(resp) => resp,
+      Err(status) => {
+        if status.code() == tonic::Code::Unauthenticated {
+          error!(
+            "Deployment rejected (unauthenticated). Add this public key to the server's `allowed_keys`: {}",
+            public_key.trim()
+          );
+        }
+        return Err(Box::new(AdeployError::Grpc(status)));
+      }
+    };
 
     let deploy_response = response.into_inner();
 
