@@ -10,6 +10,8 @@ mod deploy;
 mod error;
 mod server;
 
+use error::{AdeployError, Result as AdeResult};
+
 // Generated gRPC bindings
 pub mod adeploy {
   tonic::include_proto!("adeploy");
@@ -62,13 +64,55 @@ fn get_default_config_path(config_name: &str) -> PathBuf {
   }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-  let cli = Cli::parse();
+async fn start_server_command() -> AdeResult<()> {
+  let config_path = get_default_config_path("server_config.toml");
+  let server_config = config::load_server_config(&config_path)?;
+  let port = server_config.server.port;
 
-  match cli.command {
+  info!(
+    "Starting ADeploy server on port {} (config: {})",
+    port,
+    config_path.display()
+  );
+
+  server::start_server(port, server_config).await
+}
+
+async fn start_client_command(host: &str, package: &str) -> AdeResult<()> {
+  let config_path = get_default_config_path("client_config.toml");
+  let client_config = config::load_client_config(&config_path)?;
+  let port = {
+    let remote_config = config::get_remote_config(&client_config, host).ok_or_else(|| {
+      Box::new(AdeployError::Config(format!(
+        "No server configuration found for host: {}",
+        host
+      )))
+    })?;
+    remote_config.port
+  };
+
+  info!(
+    "Deploying {} to {}:{} (config: {})",
+    package,
+    host,
+    port,
+    config_path.display()
+  );
+
+  client::deploy(host, client_config, package).await
+}
+
+#[tokio::main]
+async fn main() {
+  let cli = Cli::parse();
+  let Cli {
+    command,
+    host: default_host,
+    package: default_package,
+  } = cli;
+
+  match command {
     Some(Commands::Server) => {
-      // Initialize server logger
       std::fs::create_dir_all("./logs").ok();
       let _log = log2::open("./logs/server.log")
         .size(10 * 1024 * 1024) // 10MB per log file
@@ -77,68 +121,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .tee(true) // Also output to stdout
         .start();
 
-      // Resolve default server config
-      let config_path = get_default_config_path("server_config.toml");
-
-      // Load server configuration to get port
-      let server_config = config::load_server_config(&config_path)?;
-      let port = server_config.server.port;
-
-      info!(
-        "Starting ADeploy server on port {} (config: {})",
-        port,
-        config_path.display()
-      );
-      server::start_server(port, server_config).await?
-    }
-    Some(Commands::Client { host, package }) => {
-      let _log2 = log2::start();
-
-      // Resolve default client config
-      let config_path = get_default_config_path("client_config.toml");
-
-      // Load client configuration to get port
-      let client_config = config::load_client_config(&config_path)?;
-      let server_config = config::get_remote_config(&client_config, &host)
-        .ok_or_else(|| "No server configuration found")?;
-      let port = server_config.port;
-
-      info!(
-        "Deploying {} to {}:{} (config: {})",
-        package,
-        host,
-        port,
-        config_path.display()
-      );
-      client::deploy(&host, client_config, &package).await?
-    }
-    None => {
-      let _log2 = log2::start();
-      // Default client mode uses positional arguments
-      if let (Some(host), Some(package)) = (cli.host, cli.package) {
-        let config_path = get_default_config_path("client_config.toml");
-        let client_config = config::load_client_config(&config_path)?;
-        let server_config = config::get_remote_config(&client_config, &host)
-          .ok_or_else(|| "No server configuration found")?;
-        let port = server_config.port;
-
-        info!(
-          "Deploying {} to {}:{} (config: {})",
-          package,
-          host,
-          port,
-          config_path.display()
-        );
-        client::deploy(&host, client_config, &package).await?
-      } else {
-        error!("Host and package are required when not using subcommands");
-        error!("Usage: adeploy <HOST> <PACKAGE>");
-        error!("   or: adeploy client <HOST> <PACKAGE>");
-        error!("   or: adeploy server");
+      if let Err(e) = start_server_command().await {
+        error!("{}", e);
         std::process::exit(1);
       }
     }
-  }
-
-  Ok(())
+    Some(Commands::Client { host, package }) => {
+      let _log2 = log2::start();
+      if let Err(e) = start_client_command(&host, &package).await {
+        error!("{}", e);
+        std::process::exit(1);
+      }
+    }
+    None => {
+      let _log2 = log2::start();
+      match (default_host, default_package) {
+        (Some(host), Some(package)) => {
+          if let Err(e) = start_client_command(&host, &package).await {
+            error!("{}", e);
+            std::process::exit(1);
+          }
+        }
+        _ => {
+          let message = "Host and package are required when not using subcommands";
+          error!("{message}");
+          error!("Usage: adeploy <HOST> <PACKAGE>");
+          error!("   or: adeploy client <HOST> <PACKAGE>");
+          error!("   or: adeploy server");
+          std::process::exit(1);
+        }
+      }
+    }
+  };
 }

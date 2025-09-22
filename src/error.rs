@@ -18,7 +18,11 @@ pub enum AdeployError {
   #[error("File system error: {0}")]
   FileSystem(String),
 
-  #[error("gRPC error: {0}")]
+  #[error(
+    "gRPC error (code: {code:?}, message: {message})",
+    code = .0.code(),
+    message = .0.message()
+  )]
   Grpc(#[from] tonic::Status),
 
   #[error("IO error: {0}")]
