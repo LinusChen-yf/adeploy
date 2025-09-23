@@ -1,16 +1,18 @@
-use std::path::PathBuf;
+use std::{convert::TryInto, path::PathBuf, time::Duration};
 
 use base64::{engine::general_purpose, Engine as _};
 use log2::*;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Endpoint};
 
 use crate::{
   adeploy::{deploy_service_client::DeployServiceClient, DeployRequest},
   auth::Auth,
-  config::{get_remote_config, ClientConfig},
+  config::{get_remote_config, ClientConfig, RemoteConfig},
   deploy::DeployManager,
   error::{AdeployError, Result},
 };
+
+const DEFAULT_MAX_MESSAGE_SIZE: u64 = 100 * 1024 * 1024;
 
 /// Locate the executable directory
 fn get_executable_dir() -> Result<PathBuf> {
@@ -66,7 +68,7 @@ pub async fn deploy_packages(
   package_names: Option<Vec<String>>,
 ) -> Result<()> {
   // Look up server config for host
-  let server_config = get_remote_config(&config, host).ok_or_else(|| {
+  let remote_config = get_remote_config(&config, host).ok_or_else(|| {
     Box::new(AdeployError::Config(format!(
       "No server configuration found for host: {}",
       host
@@ -74,27 +76,31 @@ pub async fn deploy_packages(
   })?;
 
   // Use configured port
-  let actual_port = server_config.port;
+  let actual_port = remote_config.port;
   info!("Connecting to {}:{} for deployment", host, actual_port);
 
   // Build gRPC channel
-  let endpoint = format!("http://{}:{}", host, actual_port);
-  let channel = Channel::from_shared(endpoint)
-    .map_err(|e| Box::new(AdeployError::Network(format!("Invalid endpoint: {}", e))))?
+  let endpoint_uri = format!("http://{}:{}", host, actual_port);
+  let endpoint = Channel::from_shared(endpoint_uri)
+    .map_err(|e| Box::new(AdeployError::Network(format!("Invalid endpoint: {}", e))))?;
+  let endpoint = configure_endpoint(endpoint, remote_config.timeout);
+  let channel = endpoint
     .connect()
     .await
     .map_err(|e| Box::new(AdeployError::Network(format!("Failed to connect: {}", e))))?;
 
+  let max_file_size = resolved_max_file_size(remote_config);
+  let message_limit = clamp_message_limit(max_file_size);
   let mut client = DeployServiceClient::new(channel)
-    .max_decoding_message_size(100 * 1024 * 1024) // 100MB
-    .max_encoding_message_size(100 * 1024 * 1024); // 100MB
+    .max_decoding_message_size(message_limit)
+    .max_encoding_message_size(message_limit);
 
   // Initialize deployment manager
   let deploy_manager = DeployManager::new();
 
   // Prepare SSH authentication
   // Determine key paths based on server configuration
-  let (private_key_path, public_key_path) = if let Some(custom_key_path) = &server_config.key_path {
+  let (private_key_path, public_key_path) = if let Some(custom_key_path) = &remote_config.key_path {
     // Respect custom key path
     let public_key_path = PathBuf::from(custom_key_path);
 
@@ -196,7 +202,11 @@ pub async fn deploy_packages(
     info!("Deploying {}", package_name);
 
     // Bundle files
-    let (archive_data, file_hash) = deploy_manager.package_files(&package_name, package_config)?;
+    let (archive_data, file_hash) = deploy_manager
+      .package_files(&package_name, package_config)
+      .await?;
+
+    enforce_client_archive_size(&archive_data, max_file_size)?;
 
     // Sign the archive
     let signature = ssh_auth
@@ -253,5 +263,41 @@ pub async fn deploy_packages(
     }
   }
 
+  Ok(())
+}
+
+fn configure_endpoint(endpoint: Endpoint, timeout_secs: u64) -> Endpoint {
+  if timeout_secs == 0 {
+    endpoint
+  } else {
+    let timeout = Duration::from_secs(timeout_secs);
+    endpoint.connect_timeout(timeout).timeout(timeout)
+  }
+}
+
+fn resolved_max_file_size(config: &RemoteConfig) -> u64 {
+  config
+    .max_file_size
+    .filter(|value| *value > 0)
+    .unwrap_or(DEFAULT_MAX_MESSAGE_SIZE)
+}
+
+fn clamp_message_limit(limit: u64) -> usize {
+  limit
+    .min(usize::MAX as u64)
+    .try_into()
+    .unwrap_or(usize::MAX)
+}
+
+fn enforce_client_archive_size(data: &[u8], limit: u64) -> Result<()> {
+  if limit > 0 {
+    let archive_size = data.len() as u64;
+    if archive_size > limit {
+      return Err(Box::new(AdeployError::Deploy(format!(
+        "Archive size {} exceeds configured max_file_size {}",
+        archive_size, limit
+      ))));
+    }
+  }
   Ok(())
 }

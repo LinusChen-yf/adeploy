@@ -1,11 +1,14 @@
-use std::{fs, path::Path};
+use std::{
+  fs, io,
+  path::{Path, PathBuf},
+};
 
 use chrono::{DateTime, Utc};
 use flate2::{write::GzEncoder, Compression};
 use log2::*;
 use sha2::{Digest, Sha256};
 use tar::Builder;
-use tokio::process::Command;
+use tokio::{process::Command, task::spawn_blocking};
 use uuid::Uuid;
 
 use crate::{
@@ -28,19 +31,34 @@ impl DeployManager {
   }
 
   /// Package files from sources with hash verification
-  pub fn package_files(
+  pub async fn package_files(
     &self,
-    _package_name: &str,
+    package_name: &str,
     config: &ClientPackageConfig,
   ) -> Result<(Vec<u8>, String)> {
-    info!("Packaging sources: {:?}", config.sources);
+    let package_name = package_name.to_string();
+    let config = config.clone();
+    spawn_blocking(move || Self::package_files_blocking(&package_name, &config))
+      .await
+      .map_err(|e| {
+        Box::new(AdeployError::Deploy(format!(
+          "Packaging task failed: {}",
+          e
+        )))
+      })?
+  }
+
+  fn package_files_blocking(
+    package_name: &str,
+    config: &ClientPackageConfig,
+  ) -> Result<(Vec<u8>, String)> {
+    info!("Packaging {} sources: {:?}", package_name, config.sources);
 
     let mut archive = Vec::new();
     {
       let encoder = GzEncoder::new(&mut archive, Compression::default());
       let mut tar = Builder::new(encoder);
 
-      // Iterate over configured paths
       for source_path in &config.sources {
         let path = Path::new(source_path);
 
@@ -52,7 +70,6 @@ impl DeployManager {
         }
 
         if path.is_file() {
-          // Archive a single file
           let file_name = path
             .file_name()
             .ok_or_else(|| Box::new(AdeployError::FileSystem("Invalid file name".to_string())))?
@@ -67,7 +84,6 @@ impl DeployManager {
           })?;
           info!("Archived file {}", source_path);
         } else if path.is_dir() {
-          // Archive a directory tree
           tar.append_dir_all("", path).map_err(|e| {
             Box::new(AdeployError::FileSystem(format!(
               "Failed to add directory '{}' to archive: {}",
@@ -87,19 +103,23 @@ impl DeployManager {
       })?;
     }
 
-    // Compute SHA256 for the archive
     let mut hasher = Sha256::new();
     hasher.update(&archive);
     let hash = format!("{:x}", hasher.finalize());
 
-    info!("Created package ({} bytes, hash {})", archive.len(), hash);
+    info!(
+      "Created package {} ({} bytes, hash {})",
+      package_name,
+      archive.len(),
+      hash
+    );
     Ok((archive, hash))
   }
 
   /// Extract and deploy files with hash verification
   pub async fn extract_files(
     &self,
-    archive_data: &[u8],
+    archive_data: Vec<u8>,
     expected_hash: &str,
     config: &ServerPackageConfig,
     package_name: &str,
@@ -107,10 +127,20 @@ impl DeployManager {
     info!("Extracting files into {}", config.deploy_path);
     info!("Archive size: {} bytes", archive_data.len());
 
-    // Verify hash before extraction
-    let mut hasher = Sha256::new();
-    hasher.update(archive_data);
-    let actual_hash = format!("{:x}", hasher.finalize());
+    let expected_hash = expected_hash.to_string();
+    let (archive_data, actual_hash) = spawn_blocking(move || -> Result<(Vec<u8>, String)> {
+      let mut hasher = Sha256::new();
+      hasher.update(&archive_data);
+      let actual_hash = format!("{:x}", hasher.finalize());
+      Ok((archive_data, actual_hash))
+    })
+    .await
+    .map_err(|e| {
+      Box::new(AdeployError::Deploy(format!(
+        "Hash computation task failed: {}",
+        e
+      )))
+    })??;
 
     if actual_hash != expected_hash {
       error!(
@@ -123,32 +153,47 @@ impl DeployManager {
       ))));
     }
 
-    // Create backup if enabled
     if config.backup_enabled {
       info!("Creating backup snapshot");
       self.create_backup(config, package_name).await?;
     }
 
-    // Ensure deploy path exists
-    fs::create_dir_all(&config.deploy_path).map_err(|e| {
-      error!("Failed to create deploy directory: {}", e);
-      Box::new(AdeployError::FileSystem(format!(
-        "Failed to create deploy directory: {}",
-        e
-      )))
-    })?;
+    let deploy_path = config.deploy_path.clone();
+    spawn_blocking(move || fs::create_dir_all(&deploy_path))
+      .await
+      .map_err(|e| {
+        Box::new(AdeployError::FileSystem(format!(
+          "Deploy directory task failed: {}",
+          e
+        )))
+      })?
+      .map_err(|e| {
+        error!("Failed to create deploy directory: {}", e);
+        Box::new(AdeployError::FileSystem(format!(
+          "Failed to create deploy directory: {}",
+          e
+        )))
+      })?;
 
-    // Extract archive
-    let decoder = flate2::read::GzDecoder::new(archive_data);
-    let mut archive = tar::Archive::new(decoder);
-
-    archive.unpack(&config.deploy_path).map_err(|e| {
-      error!("Failed to extract archive: {}", e);
+    let deploy_path = config.deploy_path.clone();
+    spawn_blocking(move || -> Result<()> {
+      let decoder = flate2::read::GzDecoder::new(&archive_data[..]);
+      let mut archive = tar::Archive::new(decoder);
+      archive.unpack(&deploy_path).map_err(|e| {
+        Box::new(AdeployError::Deploy(format!(
+          "Failed to extract archive: {}",
+          e
+        )))
+      })?;
+      Ok(())
+    })
+    .await
+    .map_err(|e| {
       Box::new(AdeployError::Deploy(format!(
-        "Failed to extract archive: {}",
+        "Archive extraction task failed: {}",
         e
       )))
-    })?;
+    })??;
 
     info!("Extraction complete: {}", config.deploy_path);
     Ok(())
@@ -316,30 +361,52 @@ impl DeployManager {
   async fn copy_directory(&self, src: &str, dst: &str) -> Result<()> {
     info!("Copying {} -> {}", src, dst);
 
-    let output = Command::new("cp")
-      .arg("-r")
-      .arg(src)
-      .arg(dst)
-      .output()
-      .await
-      .map_err(|e| {
+    let src_path = PathBuf::from(src);
+    let dst_path = PathBuf::from(dst);
+
+    spawn_blocking(move || -> Result<()> {
+      copy_dir_recursive(&src_path, &dst_path).map_err(|e| {
         Box::new(AdeployError::FileSystem(format!(
-          "Failed to copy directory: {}",
+          "Directory copy failed: {}",
           e
         )))
       })?;
-
-    if !output.status.success() {
-      let stderr = String::from_utf8_lossy(&output.stderr);
-      return Err(Box::new(AdeployError::FileSystem(format!(
-        "Directory copy failed: {}",
-        stderr
-      ))));
-    }
+      Ok(())
+    })
+    .await
+    .map_err(|e| {
+      Box::new(AdeployError::FileSystem(format!(
+        "Directory copy task failed: {}",
+        e
+      )))
+    })??;
 
     info!("Copied {} -> {}", src, dst);
     Ok(())
   }
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
+  if !dst.exists() {
+    fs::create_dir_all(dst)?;
+  }
+
+  for entry in fs::read_dir(src)? {
+    let entry = entry?;
+    let file_type = entry.file_type()?;
+    let target = dst.join(entry.file_name());
+
+    if file_type.is_dir() {
+      copy_dir_recursive(&entry.path(), &target)?;
+    } else {
+      if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+      }
+      fs::copy(entry.path(), &target)?;
+    }
+  }
+
+  Ok(())
 }
 
 impl Default for DeployManager {

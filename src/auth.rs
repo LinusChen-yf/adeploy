@@ -1,4 +1,8 @@
-use std::path::Path;
+use std::{
+  fs::{self, OpenOptions},
+  io::Write,
+  path::Path,
+};
 
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -22,18 +26,44 @@ impl Auth {
     let mut csprng = OsRng;
     let signing_key = SigningKey::generate(&mut csprng);
 
-    // Write private key
-    std::fs::write(private_key_path, signing_key.to_bytes()).map_err(|e| {
-      Box::new(AdeployError::FileSystem(format!(
-        "Failed to write private key: {}",
-        e
-      )))
-    })?;
+    let private_path = Path::new(private_key_path);
+    let mut private_file = OpenOptions::new()
+      .write(true)
+      .create(true)
+      .truncate(true)
+      .open(private_path)
+      .map_err(|e| {
+        Box::new(AdeployError::FileSystem(format!(
+          "Failed to open private key for writing: {}",
+          e
+        )))
+      })?;
+
+    private_file
+      .write_all(&signing_key.to_bytes())
+      .map_err(|e| {
+        Box::new(AdeployError::FileSystem(format!(
+          "Failed to write private key: {}",
+          e
+        )))
+      })?;
+
+    #[cfg(unix)]
+    {
+      use std::os::unix::fs::PermissionsExt;
+      let perms = fs::Permissions::from_mode(0o600);
+      fs::set_permissions(private_path, perms).map_err(|e| {
+        Box::new(AdeployError::FileSystem(format!(
+          "Failed to set private key permissions: {}",
+          e
+        )))
+      })?;
+    }
 
     // Write public key as base64
     let verifying_key = signing_key.verifying_key();
     let public_key_str = base64::engine::general_purpose::STANDARD.encode(verifying_key.to_bytes());
-    std::fs::write(public_key_path, public_key_str).map_err(|e| {
+    fs::write(public_key_path, public_key_str).map_err(|e| {
       Box::new(AdeployError::FileSystem(format!(
         "Failed to write public key: {}",
         e
