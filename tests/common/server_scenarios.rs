@@ -114,7 +114,7 @@ touch '{}'
       pre_marker.display()
     ),
   };
-  fs::write(&pre_script_path, pre_script_content).expect("Failed to write pre-deploy script");
+  fs::write(&pre_script_path, pre_script_content).expect("Failed to write Before-deploy script");
 
   let post_script_path = scripts_dir.join("post_deploy.sh");
   let post_script_content = match scenario {
@@ -130,7 +130,7 @@ touch '{}'
       post_marker.display()
     ),
   };
-  fs::write(&post_script_path, post_script_content).expect("Failed to write post-deploy script");
+  fs::write(&post_script_path, post_script_content).expect("Failed to write After-deploy script");
 
   #[cfg(unix)]
   {

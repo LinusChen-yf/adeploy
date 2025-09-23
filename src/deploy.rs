@@ -107,7 +107,6 @@ impl DeployManager {
     info!("Archive size: {} bytes", archive_data.len());
 
     // Verify hash before extraction
-    info!("Verifying archive hash");
     let mut hasher = Sha256::new();
     hasher.update(archive_data);
     let actual_hash = format!("{:x}", hasher.finalize());
@@ -123,8 +122,6 @@ impl DeployManager {
       ))));
     }
 
-    info!("Hash verified: {}", actual_hash);
-
     // Create backup if enabled
     if config.backup_enabled {
       info!("Creating backup snapshot");
@@ -132,7 +129,6 @@ impl DeployManager {
     }
 
     // Ensure deploy path exists
-    info!("Ensuring deploy directory {}", config.deploy_path);
     fs::create_dir_all(&config.deploy_path).map_err(|e| {
       error!("Failed to create deploy directory: {}", e);
       Box::new(AdeployError::FileSystem(format!(
@@ -142,7 +138,6 @@ impl DeployManager {
     })?;
 
     // Extract archive
-    info!("Extracting archive");
     let decoder = flate2::read::GzDecoder::new(archive_data);
     let mut archive = tar::Archive::new(decoder);
 
@@ -161,19 +156,19 @@ impl DeployManager {
   /// Execute before-deployment script
   pub fn execute_before_deploy_script(&self, config: &ServerPackageConfig) -> Result<Vec<String>> {
     if let Some(script_path) = &config.before_deploy_script {
-      info!("Running pre-deploy script {}", script_path);
+      info!("Running Before-deploy script {}", script_path);
       match self.execute_script(script_path) {
         Ok(logs) => {
-          info!("Pre-deploy script succeeded");
+          info!("Before-deploy script succeeded");
           Ok(logs)
         }
         Err(e) => {
-          error!("Pre-deploy script failed: {}", e);
+          error!("Before-deploy script failed: {}", e);
           Err(e)
         }
       }
     } else {
-      info!("No pre-deploy script configured");
+      info!("No Before-deploy script configured");
       Ok(vec![])
     }
   }
@@ -181,27 +176,25 @@ impl DeployManager {
   /// Execute after-deployment script
   pub fn execute_after_deploy_script(&self, config: &ServerPackageConfig) -> Result<Vec<String>> {
     if let Some(script_path) = &config.after_deploy_script {
-      info!("Running post-deploy script {}", script_path);
+      info!("Running After-deploy script {}", script_path);
       match self.execute_script(script_path) {
         Ok(logs) => {
-          info!("Post-deploy script succeeded");
+          info!("After-deploy script succeeded");
           Ok(logs)
         }
         Err(e) => {
-          error!("Post-deploy script failed: {}", e);
+          error!("After-deploy script failed: {}", e);
           Err(e)
         }
       }
     } else {
-      info!("No post-deploy script configured");
+      info!("No After-deploy script configured");
       Ok(vec![])
     }
   }
 
   /// Execute a shell script
   fn execute_script(&self, script_path: &str) -> Result<Vec<String>> {
-    info!("Running script {}", script_path);
-
     let output = Command::new("sh")
       .arg("-c")
       .arg(script_path)

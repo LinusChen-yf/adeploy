@@ -1,4 +1,8 @@
-use std::{collections::HashMap, path::Path};
+use std::{
+  collections::HashMap,
+  env,
+  path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -98,4 +102,12 @@ pub fn get_remote_config<'a>(
     .remotes
     .get(ip)
     .or_else(|| client_config.remotes.get("default"))
+}
+
+/// Resolve a configuration file path next to the running executable
+pub fn resolve_default_config_path(config_name: &str) -> PathBuf {
+  env::current_exe()
+    .ok()
+    .and_then(|exe| exe.parent().map(|dir| dir.join(config_name)))
+    .unwrap_or_else(|| PathBuf::from(config_name))
 }
