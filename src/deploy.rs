@@ -1,10 +1,11 @@
-use std::{fs, path::Path, process::Command};
+use std::{fs, path::Path};
 
 use chrono::{DateTime, Utc};
 use flate2::{write::GzEncoder, Compression};
 use log2::*;
 use sha2::{Digest, Sha256};
 use tar::Builder;
+use tokio::process::Command;
 use uuid::Uuid;
 
 use crate::{
@@ -96,7 +97,7 @@ impl DeployManager {
   }
 
   /// Extract and deploy files with hash verification
-  pub fn extract_files(
+  pub async fn extract_files(
     &self,
     archive_data: &[u8],
     expected_hash: &str,
@@ -125,7 +126,7 @@ impl DeployManager {
     // Create backup if enabled
     if config.backup_enabled {
       info!("Creating backup snapshot");
-      self.create_backup(config, package_name)?;
+      self.create_backup(config, package_name).await?;
     }
 
     // Ensure deploy path exists
@@ -154,10 +155,13 @@ impl DeployManager {
   }
 
   /// Execute before-deployment script
-  pub fn execute_before_deploy_script(&self, config: &ServerPackageConfig) -> Result<Vec<String>> {
+  pub async fn execute_before_deploy_script(
+    &self,
+    config: &ServerPackageConfig,
+  ) -> Result<Vec<String>> {
     if let Some(script_path) = &config.before_deploy_script {
       info!("Running Before-deploy script {}", script_path);
-      match self.execute_script(script_path) {
+      match self.execute_script(script_path).await {
         Ok(logs) => {
           info!("Before-deploy script succeeded");
           Ok(logs)
@@ -174,10 +178,13 @@ impl DeployManager {
   }
 
   /// Execute after-deployment script
-  pub fn execute_after_deploy_script(&self, config: &ServerPackageConfig) -> Result<Vec<String>> {
+  pub async fn execute_after_deploy_script(
+    &self,
+    config: &ServerPackageConfig,
+  ) -> Result<Vec<String>> {
     if let Some(script_path) = &config.after_deploy_script {
       info!("Running After-deploy script {}", script_path);
-      match self.execute_script(script_path) {
+      match self.execute_script(script_path).await {
         Ok(logs) => {
           info!("After-deploy script succeeded");
           Ok(logs)
@@ -194,17 +201,23 @@ impl DeployManager {
   }
 
   /// Execute a shell script
-  fn execute_script(&self, script_path: &str) -> Result<Vec<String>> {
-    let output = Command::new("sh")
-      .arg("-c")
-      .arg(script_path)
-      .output()
-      .map_err(|e| {
-        Box::new(AdeployError::Deploy(format!(
-          "Failed to execute script '{}': {}",
-          script_path, e
-        )))
-      })?;
+  async fn execute_script(&self, script_path: &str) -> Result<Vec<String>> {
+    let mut command = if cfg!(target_os = "windows") {
+      let mut cmd = Command::new("cmd");
+      cmd.arg("/C").arg(script_path);
+      cmd
+    } else {
+      let mut cmd = Command::new("sh");
+      cmd.arg("-c").arg(script_path);
+      cmd
+    };
+
+    let output = command.output().await.map_err(|e| {
+      Box::new(AdeployError::Deploy(format!(
+        "Failed to execute script '{}': {}",
+        script_path, e
+      )))
+    })?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -233,7 +246,7 @@ impl DeployManager {
   }
 
   /// Create backup of existing deployment
-  fn create_backup(&self, config: &ServerPackageConfig, package_name: &str) -> Result<()> {
+  async fn create_backup(&self, config: &ServerPackageConfig, package_name: &str) -> Result<()> {
     if !config.backup_enabled {
       warn!("Backup disabled for {}", package_name);
       return Ok(());
@@ -279,7 +292,9 @@ impl DeployManager {
     let backup_full_path = backup_dir_path.join(backup_name);
 
     if Path::new(&config.deploy_path).exists() {
-      self.copy_directory(&config.deploy_path, &backup_full_path.to_string_lossy())?;
+      self
+        .copy_directory(&config.deploy_path, &backup_full_path.to_string_lossy())
+        .await?;
       info!("Backup stored at {}", backup_full_path.display());
     } else {
       info!(
@@ -298,7 +313,7 @@ impl DeployManager {
   }
 
   /// Copy directory recursively
-  fn copy_directory(&self, src: &str, dst: &str) -> Result<()> {
+  async fn copy_directory(&self, src: &str, dst: &str) -> Result<()> {
     info!("Copying {} -> {}", src, dst);
 
     let output = Command::new("cp")
@@ -306,6 +321,7 @@ impl DeployManager {
       .arg(src)
       .arg(dst)
       .output()
+      .await
       .map_err(|e| {
         Box::new(AdeployError::FileSystem(format!(
           "Failed to copy directory: {}",
