@@ -181,7 +181,10 @@ impl AdeployService {
     tokio::time::sleep(Duration::from_secs(1)).await;
     // Extract archive and verify hash
     logs.push("Extracting files...".to_string());
-    match deploy_manager.extract_files(file_data, file_hash, package_config, package_name) {
+    match deploy_manager
+      .extract_files(file_data, file_hash, package_config, package_name)
+      .await
+    {
       Ok(()) => {
         logs.push("Files extracted and deployed successfully".to_string());
       }

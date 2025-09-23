@@ -1,4 +1,4 @@
-use std::{fs, path::Path, process::Command as StdCommand};
+use std::{fs, path::Path};
 
 use chrono::{DateTime, Utc};
 use flate2::{write::GzEncoder, Compression};
@@ -97,7 +97,7 @@ impl DeployManager {
   }
 
   /// Extract and deploy files with hash verification
-  pub fn extract_files(
+  pub async fn extract_files(
     &self,
     archive_data: &[u8],
     expected_hash: &str,
@@ -126,7 +126,7 @@ impl DeployManager {
     // Create backup if enabled
     if config.backup_enabled {
       info!("Creating backup snapshot");
-      self.create_backup(config, package_name)?;
+      self.create_backup(config, package_name).await?;
     }
 
     // Ensure deploy path exists
@@ -246,7 +246,7 @@ impl DeployManager {
   }
 
   /// Create backup of existing deployment
-  fn create_backup(&self, config: &ServerPackageConfig, package_name: &str) -> Result<()> {
+  async fn create_backup(&self, config: &ServerPackageConfig, package_name: &str) -> Result<()> {
     if !config.backup_enabled {
       warn!("Backup disabled for {}", package_name);
       return Ok(());
@@ -292,7 +292,9 @@ impl DeployManager {
     let backup_full_path = backup_dir_path.join(backup_name);
 
     if Path::new(&config.deploy_path).exists() {
-      self.copy_directory(&config.deploy_path, &backup_full_path.to_string_lossy())?;
+      self
+        .copy_directory(&config.deploy_path, &backup_full_path.to_string_lossy())
+        .await?;
       info!("Backup stored at {}", backup_full_path.display());
     } else {
       info!(
@@ -311,14 +313,15 @@ impl DeployManager {
   }
 
   /// Copy directory recursively
-  fn copy_directory(&self, src: &str, dst: &str) -> Result<()> {
+  async fn copy_directory(&self, src: &str, dst: &str) -> Result<()> {
     info!("Copying {} -> {}", src, dst);
 
-    let output = StdCommand::new("cp")
+    let output = Command::new("cp")
       .arg("-r")
       .arg(src)
       .arg(dst)
       .output()
+      .await
       .map_err(|e| {
         Box::new(AdeployError::FileSystem(format!(
           "Failed to copy directory: {}",
