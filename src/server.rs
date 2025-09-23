@@ -163,7 +163,10 @@ impl AdeployService {
 
     // Run before-deploy hook
     logs.push("Running Before-deploy script...".to_string());
-    match deploy_manager.execute_before_deploy_script(package_config) {
+    match deploy_manager
+      .execute_before_deploy_script(package_config)
+      .await
+    {
       Ok(pre_logs) => {
         logs.extend(pre_logs);
         logs.push("Before-deploy script succeeded".to_string());
@@ -191,7 +194,10 @@ impl AdeployService {
 
     // Run after-deploy hook
     logs.push("Running After-deploy script...".to_string());
-    match deploy_manager.execute_after_deploy_script(package_config) {
+    match deploy_manager
+      .execute_after_deploy_script(package_config)
+      .await
+    {
       Ok(post_logs) => {
         logs.extend(post_logs);
         logs.push("After-deploy script succeeded".to_string());
