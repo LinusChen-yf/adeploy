@@ -35,6 +35,30 @@ pub async fn deploy(host: &str, config: ClientConfig, package_name: &str) -> Res
   deploy_packages(host, config, Some(vec![package_name.to_string()])).await
 }
 
+/// Deploy to a remote server using the default configuration path
+pub async fn deploy_with_default_config(host: &str, package_name: &str) -> Result<()> {
+  let config_path = crate::config::resolve_default_config_path("client_config.toml");
+  deploy_from_config_path(host, config_path, package_name).await
+}
+
+/// Deploy to a remote server loading configuration from a specific path
+pub async fn deploy_from_config_path<P>(
+  host: &str,
+  config_path: P,
+  package_name: &str,
+) -> Result<()>
+where
+  P: Into<PathBuf>,
+{
+  let config_path = config_path.into();
+  info!(
+    "Loading client configuration from {}",
+    config_path.display()
+  );
+  let client_config = crate::config::load_client_config(&config_path)?;
+  deploy(host, client_config, package_name).await
+}
+
 /// Deploy specific packages to a remote server
 pub async fn deploy_packages(
   host: &str,
@@ -51,6 +75,7 @@ pub async fn deploy_packages(
 
   // Use configured port
   let actual_port = server_config.port;
+  info!("Connecting to {}:{} for deployment", host, actual_port);
 
   // Build gRPC channel
   let endpoint = format!("http://{}:{}", host, actual_port);
@@ -190,7 +215,6 @@ pub async fn deploy_packages(
     });
 
     // Invoke gRPC deploy
-    info!("Sending deploy request for {}", package_name);
     let response = match client.deploy(request).await {
       Ok(resp) => resp,
       Err(status) => {

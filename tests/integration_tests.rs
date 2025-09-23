@@ -170,12 +170,9 @@ async fn run_case(case: &ScenarioCase) -> Result<(), String> {
 
   let mut server_handle = None;
   if should_start_server {
-    let server_config = adeploy::config::load_server_config(&server_config_path)
-      .map_err(|e| format!("Failed to load server config: {}", e))?;
-
-    let server_future_port = port;
+    let server_future_config_path = server_config_path.clone();
     server_handle = Some(tokio::spawn(async move {
-      server::start_server(server_future_port, server_config).await
+      server::start_server_from_config_path(server_future_config_path).await
     }));
 
     sleep(Duration::from_millis(200)).await;
