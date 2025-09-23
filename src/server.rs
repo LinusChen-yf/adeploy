@@ -178,7 +178,6 @@ impl AdeployService {
       }
     }
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
     // Extract archive and verify hash
     logs.push("Extracting files...".to_string());
     match deploy_manager
