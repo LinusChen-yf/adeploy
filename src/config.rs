@@ -27,6 +27,8 @@ pub struct RemoteConfig {
   pub port: u16,
   pub timeout: u64,
   pub key_path: Option<String>,
+  #[serde(default)]
+  pub max_file_size: Option<u64>,
 }
 
 /// Server deployment configuration structure based on DESIGN.md

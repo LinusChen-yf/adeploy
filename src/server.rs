@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{convert::TryInto, path::PathBuf, sync::Arc, time::Duration};
 
 use base64::{engine::general_purpose, Engine as _};
 use log2::*;
@@ -15,6 +15,8 @@ use crate::{
   deploy::DeployManager,
   error::{AdeployError, Result},
 };
+
+const DEFAULT_MAX_MESSAGE_SIZE: u64 = 100 * 1024 * 1024;
 
 /// ADeploy gRPC service implementation
 #[derive(Clone)]
@@ -34,7 +36,7 @@ impl DeployService for AdeployService {
     &self,
     request: Request<DeployRequest>,
   ) -> std::result::Result<Response<DeployResponse>, Status> {
-    let req = request.into_inner();
+    let mut req = request.into_inner();
 
     info!("Received deploy request for {}", req.package_name);
 
@@ -50,11 +52,11 @@ impl DeployService for AdeployService {
       }
     };
 
-    let (allowed_keys, package_config) = {
+    let (allowed_keys, package_config, max_file_size) = {
       let config = self.config.read().await;
       let allowed_keys = config.server.allowed_keys.clone();
       let package_config = config.packages.get(&req.package_name).cloned();
-      (allowed_keys, package_config)
+      (allowed_keys, package_config, config.server.max_file_size)
     };
 
     // Ensure the provided public key is allowed
@@ -92,28 +94,40 @@ impl DeployService for AdeployService {
       }
     };
 
+    if max_file_size > 0 && req.file_data.len() as u64 > max_file_size {
+      error!(
+        "Payload for {} exceeds configured max_file_size {}",
+        req.package_name, max_file_size
+      );
+      return Err(Status::resource_exhausted(format!(
+        "Archive size exceeds configured max_file_size ({} bytes)",
+        max_file_size
+      )));
+    }
+
+    let package_name = req.package_name.clone();
+    let file_hash = req.file_hash.clone();
+    let file_data = std::mem::take(&mut req.file_data);
+
     // Initialize deployment manager
     let deploy_manager = DeployManager::new();
     let deploy_id = deploy_manager.deploy_id.clone();
 
-    info!("Starting deployment {} for {}", deploy_id, req.package_name);
+    info!("Starting deployment {} for {}", deploy_id, package_name);
 
     // Execute deployment synchronously for now
     // TODO: Implement proper async deployment with Send-safe types
     match Self::execute_deployment(
       &deploy_manager,
       &package_config,
-      &req.file_data,
-      &req.file_hash,
-      &req.package_name,
+      file_data,
+      file_hash,
+      &package_name,
     )
     .await
     {
       Ok(logs) => {
-        info!(
-          "Deployment {} completed for {}",
-          deploy_id, req.package_name
-        );
+        info!("Deployment {} completed for {}", deploy_id, package_name);
 
         Ok(Response::new(DeployResponse {
           success: true,
@@ -125,7 +139,7 @@ impl DeployService for AdeployService {
       Err(e) => {
         error!(
           "Deployment {} failed for {}: {}",
-          deploy_id, req.package_name, e
+          deploy_id, package_name, e
         );
 
         // Always collect logs on failure
@@ -151,8 +165,8 @@ impl AdeployService {
   async fn execute_deployment(
     deploy_manager: &DeployManager,
     package_config: &crate::config::ServerPackageConfig,
-    file_data: &[u8],
-    file_hash: &str,
+    file_data: Vec<u8>,
+    file_hash: String,
     package_name: &str,
   ) -> Result<Vec<String>> {
     let mut logs = Vec::new();
@@ -181,7 +195,7 @@ impl AdeployService {
     // Extract archive and verify hash
     logs.push("Extracting files...".to_string());
     match deploy_manager
-      .extract_files(file_data, file_hash, package_config, package_name)
+      .extract_files(file_data, &file_hash, package_config, package_name)
       .await
     {
       Ok(()) => {
@@ -250,6 +264,7 @@ async fn start_server_inner(config_path: PathBuf, initial_config: ServerConfig) 
     .parse()
     .map_err(|e| Box::new(AdeployError::Network(format!("Invalid address: {}", e))))?;
 
+  let message_limit = resolve_message_limit(initial_config.server.max_file_size);
   let shared_config = Arc::new(RwLock::new(initial_config));
   let (shutdown_tx, shutdown_rx) = watch::channel(false);
   let _watcher_guard = WatcherGuard {
@@ -264,14 +279,26 @@ async fn start_server_inner(config_path: PathBuf, initial_config: ServerConfig) 
   Server::builder()
     .add_service(
       DeployServiceServer::new(adeploy_service)
-        .max_decoding_message_size(100 * 1024 * 1024) // 100 MB
-        .max_encoding_message_size(100 * 1024 * 1024),
+        .max_decoding_message_size(message_limit)
+        .max_encoding_message_size(message_limit),
     ) // 100 MB
     .serve(addr)
     .await
     .map_err(|e| Box::new(AdeployError::Network(format!("Server error: {}", e))))?;
 
   Ok(())
+}
+
+fn resolve_message_limit(limit: u64) -> usize {
+  let limit = if limit == 0 {
+    DEFAULT_MAX_MESSAGE_SIZE
+  } else {
+    limit
+  };
+  limit
+    .min(usize::MAX as u64)
+    .try_into()
+    .unwrap_or(usize::MAX)
 }
 
 fn spawn_config_watcher(

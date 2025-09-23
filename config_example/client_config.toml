@@ -10,6 +10,8 @@ port = 6060
 timeout = 30
 # Optional path to the SSH public key authorizing deployments
 key_path = ".key/id_ed25519.pub"
+# Optional upper bound for deploy archives (bytes); defaults to 100MB when omitted
+max_file_size = 104857600
 
 [remotes.default]
 # Fallback settings when a remote entry is missing
@@ -19,3 +21,5 @@ port = 6060
 timeout = 30
 # Shared key path used when a dedicated key is not supplied
 key_path = ".key/id_ed25519.pub"
+# Optional upper bound for deploy archives (bytes); defaults to 100MB when omitted
+max_file_size = 104857600
