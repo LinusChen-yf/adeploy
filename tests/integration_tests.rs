@@ -6,10 +6,29 @@ use std::{
   time::Duration,
 };
 
-use adeploy::{client, server};
+use adeploy::{
+  client,
+  config::{
+    self, ClientConfig, ConfigProvider, FileConfigProvider, KeyPairPaths, RemoteConfig,
+    ServerConfig,
+  },
+  error::Result as AdeployResult,
+  server,
+};
 use log2::*;
+use mockall::mock;
 use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
+
+mock! {
+  pub TestConfigProvider {}
+
+  impl ConfigProvider for TestConfigProvider {
+    fn load_client_config(&self, path: &Path) -> AdeployResult<ClientConfig>;
+    fn load_server_config(&self, path: &Path) -> AdeployResult<ServerConfig>;
+    fn resolve_key_paths(&self, remote_config: &RemoteConfig) -> AdeployResult<KeyPairPaths>;
+  }
+}
 
 #[path = "common/client_scenarios.rs"]
 mod client_scenarios;
@@ -121,8 +140,8 @@ fn resolve_expected_outcome(
       "No server configuration found for host",
     )),
     (MissingSourceFile, StandardSuccess) => Some(CombinedOutcome::ClientError("Source path")),
-    (InvalidCustomKeyPath, StandardSuccess) => {
-      Some(CombinedOutcome::ClientError("Custom key file not found"))
+    (MissingKeyMaterial, StandardSuccess) => {
+      Some(CombinedOutcome::ClientError("Failed to load SSH key pair"))
     }
     (UnknownPackageName, StandardSuccess) => {
       Some(CombinedOutcome::ClientError("No packages found to deploy"))
@@ -143,6 +162,8 @@ async fn run_case(case: &ScenarioCase) -> Result<(), String> {
 
   generate_test_keys(&test_setup.public_key_path, &test_setup.private_key_path);
 
+  let config_provider = build_config_provider(case.client_kind, &test_setup);
+
   let public_key = fs::read_to_string(&test_setup.public_key_path)
     .map_err(|e| format!("Failed to read public key: {}", e))?
     .trim()
@@ -159,7 +180,7 @@ async fn run_case(case: &ScenarioCase) -> Result<(), String> {
   let requires_server_for_client_error = matches!(
     case.client_kind,
     ClientScenarioKind::MissingSourceFile
-      | ClientScenarioKind::InvalidCustomKeyPath
+      | ClientScenarioKind::MissingKeyMaterial
       | ClientScenarioKind::UnknownPackageName
   );
 
@@ -178,17 +199,15 @@ async fn run_case(case: &ScenarioCase) -> Result<(), String> {
     sleep(Duration::from_millis(200)).await;
   }
 
-  let client_config_path = client_scenarios::write_client_config(
-    case.client_kind,
-    &test_setup.client_dir,
-    port,
-    &test_setup.public_key_path,
-  );
+  let client_config_path =
+    client_scenarios::write_client_config(case.client_kind, &test_setup.client_dir, port);
 
-  let client_config = adeploy::config::load_client_config(&client_config_path)
-    .map_err(|e| format!("Failed to load client config: {}", e))?;
+  let client_config =
+    config::load_client_config_with_provider(&config_provider, &client_config_path)
+      .map_err(|e| format!("Failed to load client config: {}", e))?;
 
-  let deploy_future = client::deploy("127.0.0.1", client_config, package_name);
+  let deploy_future =
+    client::deploy_with_provider("127.0.0.1", client_config, package_name, &config_provider);
   let deploy_result = timeout(DEPLOY_TIMEOUT, deploy_future)
     .await
     .map_err(|_| "Deployment timed out".to_string())?;
@@ -234,6 +253,49 @@ async fn run_case(case: &ScenarioCase) -> Result<(), String> {
   }
 
   result
+}
+
+fn build_config_provider(
+  client_kind: ClientScenarioKind,
+  test_setup: &TestSetup,
+) -> MockTestConfigProvider {
+  let mut mock = MockTestConfigProvider::new();
+
+  mock
+    .expect_load_client_config()
+    .times(..)
+    .returning(|path| FileConfigProvider::default().load_client_config(path));
+
+  match client_kind {
+    ClientScenarioKind::MissingKeyMaterial => {
+      let missing_private = test_setup.client_dir.join("missing_key");
+      let missing_public = test_setup.client_dir.join("missing_key.pub");
+      mock
+        .expect_resolve_key_paths()
+        .times(..)
+        .returning(move |_| {
+          Ok(KeyPairPaths::new(
+            missing_private.clone(),
+            missing_public.clone(),
+          ))
+        });
+    }
+    _ => {
+      let private_key_path = test_setup.private_key_path.clone();
+      let public_key_path = test_setup.public_key_path.clone();
+      mock
+        .expect_resolve_key_paths()
+        .times(..)
+        .returning(move |_| {
+          Ok(KeyPairPaths::new(
+            private_key_path.clone(),
+            public_key_path.clone(),
+          ))
+        });
+    }
+  }
+
+  mock
 }
 
 /// Test setup structure to hold all test resources
