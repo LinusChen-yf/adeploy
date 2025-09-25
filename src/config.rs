@@ -4,9 +4,6 @@ use std::{
   path::{Path, PathBuf},
 };
 
-#[cfg(test)]
-use mockall::automock;
-
 use log2::*;
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +11,11 @@ use crate::{
   auth::Auth,
   error::{AdeployError, Result},
 };
+
+pub enum ConfigType {
+  Client,
+  Server,
+}
 
 /// Absolute paths to the client's signing key pair.
 #[derive(Clone, Debug)]
@@ -32,28 +34,92 @@ impl KeyPairPaths {
 }
 
 /// Abstraction over how configuration and key material are discovered.
-#[cfg_attr(test, automock)]
 pub trait ConfigProvider: Send + Sync {
+  fn get_config_path(&self, config_type: ConfigType) -> Result<PathBuf>;
+
   fn load_client_config(&self, path: &Path) -> Result<ClientConfig>;
   fn load_server_config(&self, path: &Path) -> Result<ServerConfig>;
-  fn resolve_key_paths(&self, remote_config: &RemoteConfig) -> Result<KeyPairPaths>;
+
+  fn get_key_paths(&self) -> Result<KeyPairPaths>;
 }
 
 /// Default provider that reads TOML files from disk and stores keys next to the binary.
-#[derive(Default)]
-pub struct FileConfigProvider;
+#[derive(Default, Clone)]
+pub struct ConfigProviderImpl;
 
-impl ConfigProvider for FileConfigProvider {
+impl ConfigProvider for ConfigProviderImpl {
+  fn get_config_path(&self, config_type: ConfigType) -> Result<PathBuf> {
+    let config_name = match config_type {
+      ConfigType::Client => "client_config.toml",
+      ConfigType::Server => "server_config.toml",
+    };
+
+    let Ok(exe_path) = env::current_exe() else {
+      return Err(Box::new(AdeployError::FileSystem(
+        "Failed to get current executable path".to_string(),
+      )));
+    };
+
+    Ok(exe_path.join(config_name))
+  }
+
   fn load_client_config(&self, path: &Path) -> Result<ClientConfig> {
-    read_client_config(path)
+    let content = fs::read_to_string(path).map_err(|e| {
+      Box::new(AdeployError::Config(format!(
+        "Failed to read config file: {}",
+        e
+      )))
+    })?;
+
+    toml::from_str(&content).map_err(|e| {
+      Box::new(AdeployError::Config(format!(
+        "Failed to parse TOML config: {}",
+        e
+      )))
+    })
   }
 
   fn load_server_config(&self, path: &Path) -> Result<ServerConfig> {
-    read_server_config(path)
+    let content = fs::read_to_string(path).map_err(|e| {
+      Box::new(AdeployError::Config(format!(
+        "Failed to read config file: {}",
+        e
+      )))
+    })?;
+
+    toml::from_str(&content).map_err(|e| {
+      Box::new(AdeployError::Config(format!(
+        "Failed to parse TOML config: {}",
+        e
+      )))
+    })
   }
 
-  fn resolve_key_paths(&self, _remote_config: &RemoteConfig) -> Result<KeyPairPaths> {
-    default_key_paths()
+  fn get_key_paths(&self) -> Result<KeyPairPaths> {
+    let exe_dir = executable_dir()?;
+    let key_dir = exe_dir.join(".key");
+    let private_key_path = key_dir.join("id_ed25519");
+    let public_key_path = key_dir.join("id_ed25519.pub");
+
+    if !key_dir.exists() {
+      fs::create_dir_all(&key_dir).map_err(|e| {
+        Box::new(AdeployError::FileSystem(format!(
+          "Failed to create key directory: {}",
+          e
+        )))
+      })?;
+    }
+
+    if !private_key_path.exists() || !public_key_path.exists() {
+      info!("Generating Ed25519 key pair");
+      Auth::generate_key_pair(
+        &public_key_path.to_string_lossy(),
+        &private_key_path.to_string_lossy(),
+      )?;
+      info!("Stored key pair in {:?}", key_dir);
+    }
+
+    Ok(KeyPairPaths::new(private_key_path, public_key_path))
   }
 }
 
@@ -105,52 +171,6 @@ pub struct ServerSettings {
   pub allowed_keys: Vec<String>,
 }
 
-/// Load client configuration using the active provider
-pub fn load_client_config<P: AsRef<Path>>(path: P) -> Result<ClientConfig> {
-  let provider = FileConfigProvider::default();
-  load_client_config_with_provider(&provider, path.as_ref())
-}
-
-/// Load server configuration using the active provider
-pub fn load_server_config<P: AsRef<Path>>(path: P) -> Result<ServerConfig> {
-  let provider = FileConfigProvider::default();
-  load_server_config_with_provider(&provider, path.as_ref())
-}
-
-/// Locate key material for a remote using the active provider
-#[allow(dead_code)]
-pub fn resolve_key_paths(remote_config: &RemoteConfig) -> Result<KeyPairPaths> {
-  let provider = FileConfigProvider::default();
-  resolve_key_paths_with_provider(&provider, remote_config)
-}
-
-/// Load client configuration with an explicit provider
-pub fn load_client_config_with_provider<P>(provider: &P, path: &Path) -> Result<ClientConfig>
-where
-  P: ConfigProvider + ?Sized,
-{
-  provider.load_client_config(path)
-}
-
-/// Load server configuration with an explicit provider
-pub fn load_server_config_with_provider<P>(provider: &P, path: &Path) -> Result<ServerConfig>
-where
-  P: ConfigProvider + ?Sized,
-{
-  provider.load_server_config(path)
-}
-
-/// Resolve key paths with an explicit provider
-pub fn resolve_key_paths_with_provider<P>(
-  provider: &P,
-  remote_config: &RemoteConfig,
-) -> Result<KeyPairPaths>
-where
-  P: ConfigProvider + ?Sized,
-{
-  provider.resolve_key_paths(remote_config)
-}
-
 /// Get server configuration by IP address, fallback to default if not found
 pub fn get_remote_config<'a>(
   client_config: &'a ClientConfig,
@@ -160,73 +180,6 @@ pub fn get_remote_config<'a>(
     .remotes
     .get(ip)
     .or_else(|| client_config.remotes.get("default"))
-}
-
-/// Resolve a configuration file path next to the running executable
-pub fn resolve_default_config_path(config_name: &str) -> PathBuf {
-  env::current_exe()
-    .ok()
-    .and_then(|exe| exe.parent().map(|dir| dir.join(config_name)))
-    .unwrap_or_else(|| PathBuf::from(config_name))
-}
-
-fn read_client_config(path: &Path) -> Result<ClientConfig> {
-  let content = fs::read_to_string(path).map_err(|e| {
-    Box::new(AdeployError::Config(format!(
-      "Failed to read config file: {}",
-      e
-    )))
-  })?;
-
-  toml::from_str(&content).map_err(|e| {
-    Box::new(AdeployError::Config(format!(
-      "Failed to parse TOML config: {}",
-      e
-    )))
-  })
-}
-
-fn read_server_config(path: &Path) -> Result<ServerConfig> {
-  let content = fs::read_to_string(path).map_err(|e| {
-    Box::new(AdeployError::Config(format!(
-      "Failed to read config file: {}",
-      e
-    )))
-  })?;
-
-  toml::from_str(&content).map_err(|e| {
-    Box::new(AdeployError::Config(format!(
-      "Failed to parse TOML config: {}",
-      e
-    )))
-  })
-}
-
-fn default_key_paths() -> Result<KeyPairPaths> {
-  let exe_dir = executable_dir()?;
-  let key_dir = exe_dir.join(".key");
-  let private_key_path = key_dir.join("id_ed25519");
-  let public_key_path = key_dir.join("id_ed25519.pub");
-
-  if !key_dir.exists() {
-    fs::create_dir_all(&key_dir).map_err(|e| {
-      Box::new(AdeployError::FileSystem(format!(
-        "Failed to create key directory: {}",
-        e
-      )))
-    })?;
-  }
-
-  if !private_key_path.exists() || !public_key_path.exists() {
-    info!("Generating Ed25519 key pair");
-    Auth::generate_key_pair(
-      &public_key_path.to_string_lossy(),
-      &private_key_path.to_string_lossy(),
-    )?;
-    info!("Stored key pair in {:?}", key_dir);
-  }
-
-  Ok(KeyPairPaths::new(private_key_path, public_key_path))
 }
 
 fn executable_dir() -> Result<PathBuf> {

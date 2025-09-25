@@ -1,4 +1,4 @@
-use std::{convert::TryInto, path::PathBuf, time::Duration};
+use std::{convert::TryInto, time::Duration};
 
 use base64::{engine::general_purpose, Engine as _};
 use log2::*;
@@ -7,73 +7,26 @@ use tonic::transport::{Channel, Endpoint};
 use crate::{
   adeploy::{deploy_service_client::DeployServiceClient, DeployRequest},
   auth::Auth,
-  config::{
-    get_remote_config, resolve_key_paths_with_provider, ClientConfig, ConfigProvider,
-    FileConfigProvider, RemoteConfig,
-  },
+  config::{get_remote_config, ConfigProvider, ConfigType, RemoteConfig},
   deploy::DeployManager,
   error::{AdeployError, Result},
 };
 
 const DEFAULT_MAX_MESSAGE_SIZE: u64 = 100 * 1024 * 1024;
 
-/// Deploy to a remote server
-pub async fn deploy(host: &str, config: ClientConfig, package_name: &str) -> Result<()> {
-  deploy_packages(host, config, Some(vec![package_name.to_string()])).await
-}
-
-/// Deploy to a remote server using the default configuration path
-pub async fn deploy_with_default_config(host: &str, package_name: &str) -> Result<()> {
-  let config_path = crate::config::resolve_default_config_path("client_config.toml");
-  deploy_from_config_path(host, config_path, package_name).await
-}
-
-/// Deploy to a remote server loading configuration from a specific path
-pub async fn deploy_from_config_path<P>(
+/// Deploy specific packages using an explicit provider
+pub async fn deploy(
   host: &str,
-  config_path: P,
-  package_name: &str,
-) -> Result<()>
-where
-  P: Into<PathBuf>,
-{
-  let config_path = config_path.into();
+  package_names: Option<Vec<String>>,
+  provider: &dyn ConfigProvider,
+) -> Result<()> {
+  let config_path = provider.get_config_path(ConfigType::Client)?;
+  let config = provider.load_client_config(config_path.as_path())?;
   info!(
     "Loading client configuration from {}",
     config_path.display()
   );
-  let client_config = crate::config::load_client_config(&config_path)?;
-  deploy(host, client_config, package_name).await
-}
 
-/// Deploy to a remote server with an explicit provider
-#[allow(dead_code)]
-pub async fn deploy_with_provider(
-  host: &str,
-  config: ClientConfig,
-  package_name: &str,
-  provider: &dyn ConfigProvider,
-) -> Result<()> {
-  deploy_packages_with_provider(host, config, Some(vec![package_name.to_string()]), provider).await
-}
-
-/// Deploy specific packages to a remote server
-pub async fn deploy_packages(
-  host: &str,
-  config: ClientConfig,
-  package_names: Option<Vec<String>>,
-) -> Result<()> {
-  let provider = FileConfigProvider::default();
-  deploy_packages_with_provider(host, config, package_names, &provider).await
-}
-
-/// Deploy specific packages using an explicit provider
-pub async fn deploy_packages_with_provider(
-  host: &str,
-  config: ClientConfig,
-  package_names: Option<Vec<String>>,
-  provider: &dyn ConfigProvider,
-) -> Result<()> {
   // Look up server config for host
   let remote_config = get_remote_config(&config, host).ok_or_else(|| {
     Box::new(AdeployError::Config(format!(
@@ -106,7 +59,7 @@ pub async fn deploy_packages_with_provider(
   let deploy_manager = DeployManager::new();
 
   // Prepare SSH authentication
-  let key_paths = resolve_key_paths_with_provider(provider, remote_config)?;
+  let key_paths = provider.get_key_paths()?;
   let private_key_path = key_paths.private_key;
   let public_key_path = key_paths.public_key;
 

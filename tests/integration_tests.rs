@@ -3,30 +3,61 @@
 use std::{
   fs,
   path::{Path, PathBuf},
+  sync::Arc,
   time::Duration,
 };
 
 use adeploy::{
   client,
   config::{
-    self, ClientConfig, ConfigProvider, FileConfigProvider, KeyPairPaths, RemoteConfig,
-    ServerConfig,
+    ClientConfig, ConfigProvider, ConfigProviderImpl, ConfigType, KeyPairPaths, ServerConfig,
   },
   error::Result as AdeployResult,
   server,
 };
 use log2::*;
-use mockall::mock;
 use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
 
-mock! {
-  pub TestConfigProvider {}
+#[derive(Clone)]
+struct ConfigProviderMock {
+  client_config_path: PathBuf,
+  server_config_path: PathBuf,
+  key_paths: KeyPairPaths,
+}
 
-  impl ConfigProvider for TestConfigProvider {
-    fn load_client_config(&self, path: &Path) -> AdeployResult<ClientConfig>;
-    fn load_server_config(&self, path: &Path) -> AdeployResult<ServerConfig>;
-    fn resolve_key_paths(&self, remote_config: &RemoteConfig) -> AdeployResult<KeyPairPaths>;
+impl ConfigProviderMock {
+  fn new(
+    client_config_path: PathBuf,
+    server_config_path: PathBuf,
+    key_paths: KeyPairPaths,
+  ) -> Self {
+    Self {
+      client_config_path,
+      server_config_path,
+      key_paths,
+    }
+  }
+}
+
+impl ConfigProvider for ConfigProviderMock {
+  fn get_config_path(&self, config_type: ConfigType) -> AdeployResult<PathBuf> {
+    match config_type {
+      ConfigType::Client => Ok(self.client_config_path.clone()),
+      ConfigType::Server => Ok(self.server_config_path.clone()),
+    }
+  }
+
+  fn load_client_config(&self, path: &Path) -> AdeployResult<ClientConfig> {
+    ConfigProviderImpl.load_client_config(path)
+  }
+
+  fn load_server_config(&self, path: &Path) -> AdeployResult<ServerConfig> {
+    ConfigProviderImpl.load_server_config(path)
+  }
+
+  fn get_key_paths(&self) -> AdeployResult<KeyPairPaths> {
+    Ok(self.key_paths.clone())
   }
 }
 
@@ -162,8 +193,6 @@ async fn run_case(case: &ScenarioCase) -> Result<(), String> {
 
   generate_test_keys(&test_setup.public_key_path, &test_setup.private_key_path);
 
-  let config_provider = build_config_provider(case.client_kind, &test_setup);
-
   let public_key = fs::read_to_string(&test_setup.public_key_path)
     .map_err(|e| format!("Failed to read public key: {}", e))?
     .trim()
@@ -175,6 +204,16 @@ async fn run_case(case: &ScenarioCase) -> Result<(), String> {
     port,
     &public_key,
     package_name,
+  );
+
+  let client_config_path =
+    client_scenarios::write_client_config(case.client_kind, &test_setup.client_dir, port);
+
+  let config_provider = build_config_provider(
+    case.client_kind,
+    &test_setup,
+    client_config_path,
+    server_config_path.clone(),
   );
 
   let requires_server_for_client_error = matches!(
@@ -191,23 +230,19 @@ async fn run_case(case: &ScenarioCase) -> Result<(), String> {
 
   let mut server_handle = None;
   if should_start_server {
-    let server_future_config_path = server_config_path.clone();
+    let server_provider = config_provider.clone();
     server_handle = Some(tokio::spawn(async move {
-      server::start_server_from_config_path(server_future_config_path).await
+      let _ = server::start_server(server_provider).await;
     }));
 
     sleep(Duration::from_millis(200)).await;
   }
 
-  let client_config_path =
-    client_scenarios::write_client_config(case.client_kind, &test_setup.client_dir, port);
-
-  let client_config =
-    config::load_client_config_with_provider(&config_provider, &client_config_path)
-      .map_err(|e| format!("Failed to load client config: {}", e))?;
-
-  let deploy_future =
-    client::deploy_with_provider("127.0.0.1", client_config, package_name, &config_provider);
+  let deploy_future = client::deploy(
+    "127.0.0.1",
+    Some(vec![package_name.to_string()]),
+    config_provider.as_ref(),
+  );
   let deploy_result = timeout(DEPLOY_TIMEOUT, deploy_future)
     .await
     .map_err(|_| "Deployment timed out".to_string())?;
@@ -250,6 +285,7 @@ async fn run_case(case: &ScenarioCase) -> Result<(), String> {
 
   if let Some(handle) = server_handle {
     handle.abort();
+    let _ = handle.await;
   }
 
   result
@@ -258,44 +294,25 @@ async fn run_case(case: &ScenarioCase) -> Result<(), String> {
 fn build_config_provider(
   client_kind: ClientScenarioKind,
   test_setup: &TestSetup,
-) -> MockTestConfigProvider {
-  let mut mock = MockTestConfigProvider::new();
+  client_config_path: PathBuf,
+  server_config_path: PathBuf,
+) -> Arc<dyn ConfigProvider> {
+  let key_paths = match client_kind {
+    ClientScenarioKind::MissingKeyMaterial => KeyPairPaths::new(
+      test_setup.client_dir.join("missing_key"),
+      test_setup.client_dir.join("missing_key.pub"),
+    ),
+    _ => KeyPairPaths::new(
+      test_setup.private_key_path.clone(),
+      test_setup.public_key_path.clone(),
+    ),
+  };
 
-  mock
-    .expect_load_client_config()
-    .times(..)
-    .returning(|path| FileConfigProvider::default().load_client_config(path));
-
-  match client_kind {
-    ClientScenarioKind::MissingKeyMaterial => {
-      let missing_private = test_setup.client_dir.join("missing_key");
-      let missing_public = test_setup.client_dir.join("missing_key.pub");
-      mock
-        .expect_resolve_key_paths()
-        .times(..)
-        .returning(move |_| {
-          Ok(KeyPairPaths::new(
-            missing_private.clone(),
-            missing_public.clone(),
-          ))
-        });
-    }
-    _ => {
-      let private_key_path = test_setup.private_key_path.clone();
-      let public_key_path = test_setup.public_key_path.clone();
-      mock
-        .expect_resolve_key_paths()
-        .times(..)
-        .returning(move |_| {
-          Ok(KeyPairPaths::new(
-            private_key_path.clone(),
-            public_key_path.clone(),
-          ))
-        });
-    }
-  }
-
-  mock
+  Arc::new(ConfigProviderMock::new(
+    client_config_path,
+    server_config_path,
+    key_paths,
+  ))
 }
 
 /// Test setup structure to hold all test resources
