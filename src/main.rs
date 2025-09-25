@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use clap::{Parser, Subcommand};
 use log2::*;
 
@@ -61,14 +63,16 @@ async fn main() {
         .tee(true) // Also output to stdout
         .start();
 
-      if let Err(e) = server::start_server_with_default_config().await {
+      let provider: Arc<dyn config::ConfigProvider> = Arc::new(config::ConfigProviderImpl);
+      if let Err(e) = server::start_server(provider.clone()).await {
         error!("{}", e);
         std::process::exit(1);
       }
     }
     Some(Commands::Client { host, package }) => {
       let _log2 = log2::start();
-      if let Err(e) = client::deploy_with_default_config(&host, &package).await {
+      let provider: Arc<dyn config::ConfigProvider> = Arc::new(config::ConfigProviderImpl);
+      if let Err(e) = client::deploy(&host, Some(vec![package]), provider.as_ref()).await {
         error!("{}", e);
         std::process::exit(1);
       }
@@ -77,7 +81,8 @@ async fn main() {
       let _log2 = log2::start();
       match (default_host, default_package) {
         (Some(host), Some(package)) => {
-          if let Err(e) = client::deploy_with_default_config(&host, &package).await {
+          let provider: Arc<dyn config::ConfigProvider> = Arc::new(config::ConfigProviderImpl);
+          if let Err(e) = client::deploy(&host, Some(vec![package]), provider.as_ref()).await {
             error!("{}", e);
             std::process::exit(1);
           }

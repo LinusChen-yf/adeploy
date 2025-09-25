@@ -11,7 +11,7 @@ use crate::{
     DeployRequest, DeployResponse,
   },
   auth::Auth,
-  config::ServerConfig,
+  config::{ConfigProvider, ConfigType, ServerConfig},
   deploy::DeployManager,
   error::{AdeployError, Result},
 };
@@ -233,44 +233,32 @@ impl AdeployService {
   }
 }
 
-/// Start the gRPC server using the default configuration path next to the binary
-pub async fn start_server_with_default_config() -> Result<()> {
-  let config_path = crate::config::resolve_default_config_path("server_config.toml");
-  start_server_from_config_path(config_path).await
-}
+pub async fn start_server(provider: Arc<dyn ConfigProvider>) -> Result<()> {
+  let config_path = provider.get_config_path(ConfigType::Server)?;
+  let config = provider.load_server_config(config_path.as_path())?;
 
-/// Start the gRPC server using a specific configuration path
-pub async fn start_server_from_config_path<P>(config_path: P) -> Result<()>
-where
-  P: Into<PathBuf>,
-{
-  let config_path = config_path.into();
-  info!(
-    "Loading server configuration from {}",
-    config_path.display()
-  );
-  let initial_config = crate::config::load_server_config(&config_path)?;
+  let port = config.server.port;
   info!(
     "Loaded server configuration; configured port {}",
-    initial_config.server.port
+    config.server.port
   );
-  start_server_inner(config_path, initial_config).await
-}
 
-/// Start the gRPC server using a resolved configuration
-async fn start_server_inner(config_path: PathBuf, initial_config: ServerConfig) -> Result<()> {
-  let port = initial_config.server.port;
   let addr = format!("0.0.0.0:{}", port)
     .parse()
     .map_err(|e| Box::new(AdeployError::Network(format!("Invalid address: {}", e))))?;
 
-  let message_limit = resolve_message_limit(initial_config.server.max_file_size);
-  let shared_config = Arc::new(RwLock::new(initial_config));
+  let message_limit = resolve_message_limit(config.server.max_file_size);
+  let shared_config = Arc::new(RwLock::new(config));
   let (shutdown_tx, shutdown_rx) = watch::channel(false);
   let _watcher_guard = WatcherGuard {
     sender: shutdown_tx,
   };
-  spawn_config_watcher(config_path.clone(), shared_config.clone(), shutdown_rx);
+  spawn_config_watcher(
+    provider.clone(),
+    config_path,
+    shared_config.clone(),
+    shutdown_rx,
+  );
 
   let adeploy_service = AdeployService::new(shared_config);
 
@@ -302,6 +290,7 @@ fn resolve_message_limit(limit: u64) -> usize {
 }
 
 fn spawn_config_watcher(
+  provider: Arc<dyn ConfigProvider>,
   config_path: PathBuf,
   shared_config: Arc<RwLock<ServerConfig>>,
   mut shutdown_rx: watch::Receiver<bool>,
@@ -376,7 +365,7 @@ fn spawn_config_watcher(
         }
       }
 
-      match crate::config::load_server_config(&config_path) {
+      match provider.load_server_config(config_path.as_path()) {
         Ok(mut new_config) => {
           last_error = None;
 

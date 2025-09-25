@@ -13,8 +13,8 @@ pub enum ClientScenarioKind {
   MissingRemoteConfig,
   /// Package references a missing source file.
   MissingSourceFile,
-  /// Remote uses a custom key path that does not exist.
-  InvalidCustomKeyPath,
+  /// Client fails because signing keys are unavailable.
+  MissingKeyMaterial,
   /// Deployment is requested for a package not declared in the config.
   UnknownPackageName,
 }
@@ -54,9 +54,9 @@ const CLIENT_SCENARIOS: &[ClientScenario] = &[
     description: "One of the declared source files is absent",
   },
   ClientScenario {
-    kind: ClientScenarioKind::InvalidCustomKeyPath,
-    name: "client_invalid_custom_key_path",
-    description: "Custom key path points to a non-existent .pub file",
+    kind: ClientScenarioKind::MissingKeyMaterial,
+    name: "client_missing_key_material",
+    description: "Client cannot locate the required signing keys",
   },
   ClientScenario {
     kind: ClientScenarioKind::UnknownPackageName,
@@ -79,65 +79,34 @@ pub fn get(kind: ClientScenarioKind) -> &'static ClientScenario {
 }
 
 /// Create a client configuration tailored to the provided scenario.
-pub fn write_client_config(
-  scenario: ClientScenarioKind,
-  client_dir: &Path,
-  port: u16,
-  public_key_path: &Path,
-) -> PathBuf {
+pub fn write_client_config(scenario: ClientScenarioKind, client_dir: &Path, port: u16) -> PathBuf {
   let test1_path = client_dir.join("test1.txt");
   let test2_path = client_dir.join("test2.txt");
 
   fs::write(&test1_path, "test1 content").expect("Failed to write test1 file");
   fs::write(&test2_path, "test2 content").expect("Failed to write test2 file");
 
-  let missing_key_path = client_dir.join("missing_custom_key.pub");
-
   let host_remote_block = match scenario {
     ClientScenarioKind::MissingRemoteConfig => String::new(),
-    ClientScenarioKind::InvalidCustomKeyPath => format!(
-      r#"[remotes."127.0.0.1"]
-port = {port}
-timeout = 30
-key_path = "{missing_key}"
-
-"#,
-      port = port,
-      missing_key = missing_key_path.display()
-    ),
     _ => format!(
       r#"[remotes."127.0.0.1"]
 port = {port}
 timeout = 30
-key_path = "{key}"
 
 "#,
-      port = port,
-      key = public_key_path.display()
+      port = port
     ),
   };
 
   let default_remote_block = match scenario {
     ClientScenarioKind::MissingRemoteConfig => String::new(),
-    ClientScenarioKind::InvalidCustomKeyPath => format!(
-      r#"[remotes.default]
-port = {port}
-timeout = 30
-key_path = "{missing_key}"
-
-"#,
-      port = port,
-      missing_key = missing_key_path.display()
-    ),
     _ => format!(
       r#"[remotes.default]
 port = {port}
 timeout = 30
-key_path = "{key}"
 
 "#,
-      port = port,
-      key = public_key_path.display()
+      port = port
     ),
   };
 

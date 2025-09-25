@@ -8,8 +8,7 @@ sources = ["./dist/demo"]
 port = 6060
 # Reserved RPC timeout (seconds) for client operations
 timeout = 30
-# Optional path to the SSH public key authorizing deployments
-key_path = ".key/id_ed25519.pub"
+# Signing keys are discovered automatically from the executable's .key directory
 # Optional upper bound for deploy archives (bytes); defaults to 100MB when omitted
 max_file_size = 104857600
 
@@ -19,7 +18,6 @@ max_file_size = 104857600
 port = 6060
 # Timeout override applied to hosts without their own entry
 timeout = 30
-# Shared key path used when a dedicated key is not supplied
-key_path = ".key/id_ed25519.pub"
+# Signing keys are discovered automatically from the executable's .key directory
 # Optional upper bound for deploy archives (bytes); defaults to 100MB when omitted
 max_file_size = 104857600
