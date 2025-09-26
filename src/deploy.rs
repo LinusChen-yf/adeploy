@@ -127,73 +127,20 @@ impl DeployManager {
     info!("Extracting files into {}", config.deploy_path);
     info!("Archive size: {} bytes", archive_data.len());
 
-    let expected_hash = expected_hash.to_string();
-    let (archive_data, actual_hash) = spawn_blocking(move || -> Result<(Vec<u8>, String)> {
-      let mut hasher = Sha256::new();
-      hasher.update(&archive_data);
-      let actual_hash = format!("{:x}", hasher.finalize());
-      Ok((archive_data, actual_hash))
-    })
-    .await
-    .map_err(|e| {
-      Box::new(AdeployError::Deploy(format!(
-        "Hash computation task failed: {}",
-        e
-      )))
-    })??;
-
-    if actual_hash != expected_hash {
-      error!(
-        "Hash mismatch: expected {}, actual {}",
-        expected_hash, actual_hash
-      );
-      return Err(Box::new(AdeployError::Deploy(format!(
-        "Hash verification failed. Expected: {}, Actual: {}",
-        expected_hash, actual_hash
-      ))));
-    }
+    let archive_data = self
+      .verify_archive_hash(archive_data, expected_hash)
+      .await?;
 
     if config.backup_enabled {
       info!("Creating backup snapshot");
       self.create_backup(config, package_name).await?;
     }
 
-    let deploy_path = config.deploy_path.clone();
-    spawn_blocking(move || fs::create_dir_all(&deploy_path))
-      .await
-      .map_err(|e| {
-        Box::new(AdeployError::FileSystem(format!(
-          "Deploy directory task failed: {}",
-          e
-        )))
-      })?
-      .map_err(|e| {
-        error!("Failed to create deploy directory: {}", e);
-        Box::new(AdeployError::FileSystem(format!(
-          "Failed to create deploy directory: {}",
-          e
-        )))
-      })?;
+    self.ensure_deploy_directory(&config.deploy_path).await?;
 
-    let deploy_path = config.deploy_path.clone();
-    spawn_blocking(move || -> Result<()> {
-      let decoder = flate2::read::GzDecoder::new(&archive_data[..]);
-      let mut archive = tar::Archive::new(decoder);
-      archive.unpack(&deploy_path).map_err(|e| {
-        Box::new(AdeployError::Deploy(format!(
-          "Failed to extract archive: {}",
-          e
-        )))
-      })?;
-      Ok(())
-    })
-    .await
-    .map_err(|e| {
-      Box::new(AdeployError::Deploy(format!(
-        "Archive extraction task failed: {}",
-        e
-      )))
-    })??;
+    self
+      .unpack_archive(archive_data, &config.deploy_path)
+      .await?;
 
     info!("Extraction complete: {}", config.deploy_path);
     Ok(())
@@ -204,22 +151,9 @@ impl DeployManager {
     &self,
     config: &ServerPackageConfig,
   ) -> Result<Vec<String>> {
-    if let Some(script_path) = &config.before_deploy_script {
-      info!("Running Before-deploy script {}", script_path);
-      match self.execute_script(script_path).await {
-        Ok(logs) => {
-          info!("Before-deploy script succeeded");
-          Ok(logs)
-        }
-        Err(e) => {
-          error!("Before-deploy script failed: {}", e);
-          Err(e)
-        }
-      }
-    } else {
-      info!("No Before-deploy script configured");
-      Ok(vec![])
-    }
+    self
+      .run_deploy_script(config.before_deploy_script.as_deref(), "Before-deploy")
+      .await
   }
 
   /// Execute after-deployment script
@@ -227,22 +161,9 @@ impl DeployManager {
     &self,
     config: &ServerPackageConfig,
   ) -> Result<Vec<String>> {
-    if let Some(script_path) = &config.after_deploy_script {
-      info!("Running After-deploy script {}", script_path);
-      match self.execute_script(script_path).await {
-        Ok(logs) => {
-          info!("After-deploy script succeeded");
-          Ok(logs)
-        }
-        Err(e) => {
-          error!("After-deploy script failed: {}", e);
-          Err(e)
-        }
-      }
-    } else {
-      info!("No After-deploy script configured");
-      Ok(vec![])
-    }
+    self
+      .run_deploy_script(config.after_deploy_script.as_deref(), "After-deploy")
+      .await
   }
 
   /// Execute a shell script
@@ -297,32 +218,7 @@ impl DeployManager {
       return Ok(());
     }
 
-    // Choose backup directory
-    let backup_dir_path = match &config.backup_path {
-      Some(path) => {
-        info!("Using custom backup path {}", path);
-        Path::new(path).to_path_buf()
-      }
-      None => {
-        // Use executable directory as base
-        let current_exe = std::env::current_exe().map_err(|e| {
-          Box::new(AdeployError::FileSystem(format!(
-            "Failed to get current executable path: {}",
-            e
-          )))
-        })?;
-
-        let current_dir = current_exe.parent().ok_or_else(|| {
-          Box::new(AdeployError::FileSystem(
-            "Failed to get parent directory of executable".to_string(),
-          ))
-        })?;
-
-        // Append package name to backup path
-        current_dir.join(package_name)
-      }
-    };
-
+    let backup_dir_path = self.resolve_backup_directory(config, package_name)?;
     std::fs::create_dir_all(&backup_dir_path).map_err(|e| {
       Box::new(AdeployError::FileSystem(format!(
         "Failed to create backup directory: {}",
@@ -332,28 +228,11 @@ impl DeployManager {
 
     info!("Creating backup at {}", backup_dir_path.display());
 
-    // Copy deployment into timestamped folder
     let backup_name = format!("backup_{}", self.start_time.format("%Y%m%d_%H%M%S"));
     let backup_full_path = backup_dir_path.join(backup_name);
 
-    if Path::new(&config.deploy_path).exists() {
-      self
-        .copy_directory(&config.deploy_path, &backup_full_path.to_string_lossy())
-        .await?;
-      info!("Backup stored at {}", backup_full_path.display());
-    } else {
-      info!(
-        "No existing deployment at {}; skipping backup",
-        config.deploy_path
-      );
-    }
-
-    if backup_full_path.exists() {
-      for entry in backup_full_path.read_dir()? {
-        let entry = entry?;
-        info!("Backup item: {}", entry.file_name().to_string_lossy());
-      }
-    }
+    self.copy_existing_deploy(config, &backup_full_path).await?;
+    self.log_backup_contents(&backup_full_path)?;
     Ok(())
   }
 
@@ -382,6 +261,165 @@ impl DeployManager {
     })??;
 
     info!("Copied {} -> {}", src, dst);
+    Ok(())
+  }
+}
+
+impl DeployManager {
+  async fn run_deploy_script(
+    &self,
+    script_path: Option<&str>,
+    stage_name: &str,
+  ) -> Result<Vec<String>> {
+    let Some(path) = script_path else {
+      info!("No {} script configured", stage_name);
+      return Ok(vec![]);
+    };
+
+    info!("Running {} script {}", stage_name, path);
+    match self.execute_script(path).await {
+      Ok(logs) => {
+        info!("{} script succeeded", stage_name);
+        Ok(logs)
+      }
+      Err(e) => {
+        error!("{} script failed: {}", stage_name, e);
+        Err(e)
+      }
+    }
+  }
+
+  async fn verify_archive_hash(
+    &self,
+    archive_data: Vec<u8>,
+    expected_hash: &str,
+  ) -> Result<Vec<u8>> {
+    let expected_hash = expected_hash.to_string();
+    let (archive_data, actual_hash) = spawn_blocking(move || -> Result<(Vec<u8>, String)> {
+      let mut hasher = Sha256::new();
+      hasher.update(&archive_data);
+      let actual_hash = format!("{:x}", hasher.finalize());
+      Ok((archive_data, actual_hash))
+    })
+    .await
+    .map_err(|e| {
+      Box::new(AdeployError::Deploy(format!(
+        "Hash computation task failed: {}",
+        e
+      )))
+    })??;
+
+    if actual_hash != expected_hash {
+      error!(
+        "Hash mismatch: expected {}, actual {}",
+        expected_hash, actual_hash
+      );
+      return Err(Box::new(AdeployError::Deploy(format!(
+        "Hash verification failed. Expected: {}, Actual: {}",
+        expected_hash, actual_hash
+      ))));
+    }
+
+    Ok(archive_data)
+  }
+
+  async fn ensure_deploy_directory(&self, path: &str) -> Result<()> {
+    let deploy_path = PathBuf::from(path);
+    spawn_blocking(move || fs::create_dir_all(&deploy_path))
+      .await
+      .map_err(|e| {
+        Box::new(AdeployError::FileSystem(format!(
+          "Deploy directory task failed: {}",
+          e
+        )))
+      })?
+      .map_err(|e| {
+        error!("Failed to create deploy directory: {}", e);
+        Box::new(AdeployError::FileSystem(format!(
+          "Failed to create deploy directory: {}",
+          e
+        )))
+      })
+  }
+
+  async fn unpack_archive(&self, archive_data: Vec<u8>, deploy_path: &str) -> Result<()> {
+    let deploy_path = deploy_path.to_string();
+    spawn_blocking(move || -> Result<()> {
+      let decoder = flate2::read::GzDecoder::new(&archive_data[..]);
+      let mut archive = tar::Archive::new(decoder);
+      archive.unpack(&deploy_path).map_err(|e| {
+        Box::new(AdeployError::Deploy(format!(
+          "Failed to extract archive: {}",
+          e
+        )))
+      })?;
+      Ok(())
+    })
+    .await
+    .map_err(|e| {
+      Box::new(AdeployError::Deploy(format!(
+        "Archive extraction task failed: {}",
+        e
+      )))
+    })??;
+    Ok(())
+  }
+
+  fn resolve_backup_directory(
+    &self,
+    config: &ServerPackageConfig,
+    package_name: &str,
+  ) -> Result<PathBuf> {
+    match &config.backup_path {
+      Some(path) => {
+        info!("Using custom backup path {}", path);
+        Ok(Path::new(path).to_path_buf())
+      }
+      None => {
+        let current_exe = std::env::current_exe().map_err(|e| {
+          Box::new(AdeployError::FileSystem(format!(
+            "Failed to get current executable path: {}",
+            e
+          )))
+        })?;
+
+        let current_dir = current_exe.parent().ok_or_else(|| {
+          Box::new(AdeployError::FileSystem(
+            "Failed to get parent directory of executable".to_string(),
+          ))
+        })?;
+
+        Ok(current_dir.join(package_name))
+      }
+    }
+  }
+
+  async fn copy_existing_deploy(
+    &self,
+    config: &ServerPackageConfig,
+    backup_full_path: &Path,
+  ) -> Result<()> {
+    if Path::new(&config.deploy_path).exists() {
+      self
+        .copy_directory(&config.deploy_path, &backup_full_path.to_string_lossy())
+        .await?;
+      info!("Backup stored at {}", backup_full_path.display());
+    } else {
+      info!(
+        "No existing deployment at {}; skipping backup",
+        config.deploy_path
+      );
+    }
+    Ok(())
+  }
+
+  fn log_backup_contents(&self, backup_full_path: &Path) -> Result<()> {
+    if backup_full_path.exists() {
+      for entry in backup_full_path.read_dir()? {
+        let entry = entry?;
+        info!("Backup item: {}", entry.file_name().to_string_lossy());
+      }
+    }
     Ok(())
   }
 }
