@@ -60,7 +60,12 @@ impl ConfigProvider for ConfigProviderImpl {
       )));
     };
 
-    Ok(exe_path.join(config_name))
+    let Some(parent) = exe_path.parent() else {
+      return Err(Box::new(AdeployError::FileSystem(
+        "Failed to get parent directory of executable".to_string(),
+      )));
+    };
+    Ok(parent.join(config_name))
   }
 
   fn load_client_config(&self, path: &Path) -> Result<ClientConfig> {
