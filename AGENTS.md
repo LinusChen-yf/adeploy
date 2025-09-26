@@ -7,7 +7,7 @@ The deployment runtime lives in `src/`, with entrypoints in `main.rs` routing to
 - `cargo build` — compile the CLI and server binaries with protobuf generation.
 - `cargo run -- server` — start the gRPC deployment server using `server_config.toml`.
 - `cargo run -- client <host> <package>` — push a deployment defined in `client_config.toml`.
-- `cargo fmt` / `cargo fmt --check` — apply or verify repository rustfmt settings.
+- `cargo +nightly fmt` / `cargo +nightly fmt --check` — apply or verify repository rustfmt settings.
 - `cargo clippy -- -D warnings` — lint with all warnings elevated to errors.
 - `cargo test` — execute unit and integration suites locally.
 
