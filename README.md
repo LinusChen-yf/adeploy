@@ -10,9 +10,9 @@ ADeploy is a lightweight Rust tool for deploying applications across platforms t
 
 ## Quick Start
 ```bash
-./adeploy server                # start the gRPC server with server_config.toml
-./adeploy client <host> <pkg>    # deploy a package defined in client_config.toml
-./adeploy client 192.168.50.11 myapp
+./adeploy server                          # start the gRPC server with server_config.toml
+./adeploy client <host> <pkg1> [pkgN...]  # deploy one or more packages from client_config.toml
+./adeploy client 192.168.50.11 myapp myapp2
 ./adeploy --help                 # list available subcommands and flags
 ```
 Build with `cargo build` first if you do not already have the binary.
@@ -20,10 +20,10 @@ Build with `cargo build` first if you do not already have the binary.
 ## Configuration Basics
 Sample templates live in `config_example/`. Copy the appropriate template into the same directory as the `adeploy` binary and name it `client_config.toml` (for client runs) or `server_config.toml` (for server runs). The executable automatically loads the config file from its own directory.
 
-### Client ([`config_example/client_config.toml`](config_example/client_config.toml))
+### Client ([`client_config.toml`](config_example/client_config.toml))
 The template covers package sources, per-host overrides, and a fallback block. Each field is documented inline so you can mirror the structure while tweaking values for your environment.
 
-### Server ([`config_example/server_config.toml`](config_example/server_config.toml))
+### Server ([`server_config.toml`](config_example/server_config.toml))
 This template walks through listener settings, allowed deploy keys, hook scripts, and backup controls. Refer to the embedded comments for the exact behavior of every knob.
 
-Use `./adeploy server` with the sample server config, then run `./adeploy client 192.168.50.11 demo` to push the demo package defined in the client template.
+Use `./adeploy server` with the sample server config, then run `./adeploy client 192.168.50.11 demo` (or list multiple packages) to push the demo package defined in the client template.

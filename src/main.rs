@@ -26,9 +26,9 @@ struct Cli {
   #[arg(value_name = "HOST")]
   host: Option<String>,
 
-  /// Package name (when using default client mode)
-  #[arg(value_name = "PACKAGE")]
-  package: Option<String>,
+  /// Package names (when using default client mode)
+  #[arg(value_name = "PACKAGE", num_args = 0..)]
+  packages: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -39,8 +39,9 @@ enum Commands {
   Client {
     /// Server host
     host: String,
-    /// Package name
-    package: String,
+    /// Package names to deploy
+    #[arg(value_name = "PACKAGE", num_args = 1..)]
+    packages: Vec<String>,
   },
 }
 
@@ -50,7 +51,7 @@ async fn main() {
   let Cli {
     command,
     host: default_host,
-    package: default_package,
+    packages: default_packages,
   } = cli;
 
   match command {
@@ -69,33 +70,36 @@ async fn main() {
         std::process::exit(1);
       }
     }
-    Some(Commands::Client { host, package }) => {
+    Some(Commands::Client { host, packages }) => {
       let _log2 = log2::start();
-      let provider: Arc<dyn config::ConfigProvider> = Arc::new(config::ConfigProviderImpl);
-      if let Err(e) = client::deploy(&host, Some(vec![package]), provider.as_ref()).await {
-        error!("{}", e);
-        std::process::exit(1);
-      }
+      run_client_mode(&host, packages).await;
     }
     None => {
       let _log2 = log2::start();
-      match (default_host, default_package) {
-        (Some(host), Some(package)) => {
-          let provider: Arc<dyn config::ConfigProvider> = Arc::new(config::ConfigProviderImpl);
-          if let Err(e) = client::deploy(&host, Some(vec![package]), provider.as_ref()).await {
-            error!("{}", e);
-            std::process::exit(1);
-          }
-        }
-        _ => {
-          let message = "Host and package are required when not using subcommands";
-          error!("{message}");
-          error!("Usage: adeploy <HOST> <PACKAGE>");
-          error!("   or: adeploy client <HOST> <PACKAGE>");
-          error!("   or: adeploy server");
-          std::process::exit(1);
-        }
+      let host = default_host
+        .unwrap_or_else(|| usage_and_exit("Host is required when not using subcommands"));
+      if default_packages.is_empty() {
+        usage_and_exit("At least one package is required when not using subcommands");
       }
+
+      run_client_mode(&host, default_packages).await;
     }
   };
+}
+
+async fn run_client_mode(host: &str, packages: Vec<String>) {
+  let provider: Arc<dyn config::ConfigProvider> = Arc::new(config::ConfigProviderImpl);
+
+  if let Err(e) = client::deploy(host, Some(packages), provider.as_ref()).await {
+    error!("{}", e);
+    std::process::exit(1);
+  }
+}
+
+fn usage_and_exit(message: &str) -> ! {
+  error!("{message}");
+  error!("Usage: adeploy <HOST> <PACKAGE> [PACKAGE...]");
+  error!("   or: adeploy client <HOST> <PACKAGE> [PACKAGE...]");
+  error!("   or: adeploy server");
+  std::process::exit(1);
 }
