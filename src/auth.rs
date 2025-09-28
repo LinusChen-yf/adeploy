@@ -7,7 +7,7 @@ use std::{
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use log2::*;
-use rand::rngs::OsRng;
+use rand_core::OsRng;
 
 use crate::error::{AdeployError, Result};
 
