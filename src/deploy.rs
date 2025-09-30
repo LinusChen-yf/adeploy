@@ -168,6 +168,27 @@ impl DeployManager {
 
   /// Execute a shell script
   async fn execute_script(&self, script_path: &str) -> Result<Vec<String>> {
+    // Get adeploy executable directory
+    let exe_dir = std::env::current_exe()
+      .map_err(|e| {
+        Box::new(AdeployError::Deploy(format!(
+          "Failed to get current executable path: {}",
+          e
+        )))
+      })?
+      .parent()
+      .ok_or_else(|| {
+        Box::new(AdeployError::Deploy(
+          "Failed to get parent directory of executable".to_string(),
+        ))
+      })?
+      .to_path_buf();
+
+    info!(
+      "Executing script in adeploy directory: {}",
+      exe_dir.display()
+    );
+
     let mut command = if cfg!(target_os = "windows") {
       let mut cmd = Command::new("cmd");
       cmd.arg("/C").arg(script_path);
@@ -177,6 +198,9 @@ impl DeployManager {
       cmd.arg("-c").arg(script_path);
       cmd
     };
+
+    // Set working directory to adeploy executable directory
+    command.current_dir(&exe_dir);
 
     let output = command.output().await.map_err(|e| {
       Box::new(AdeployError::Deploy(format!(
