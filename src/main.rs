@@ -1,7 +1,8 @@
-use std::sync::Arc;
+use std::{path::PathBuf, process, sync::Arc};
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use log2::*;
+use tokio::runtime::Builder as RuntimeBuilder;
 
 mod auth;
 mod client;
@@ -9,6 +10,7 @@ mod config;
 mod deploy;
 mod error;
 mod server;
+use crate::error::{AdeployError, Result};
 
 // Generated gRPC bindings
 pub mod adeploy {
@@ -31,10 +33,15 @@ struct Cli {
   packages: Vec<String>,
 }
 
+const DEFAULT_SERVICE_LABEL: &str = "adeploy";
+
 #[derive(Subcommand)]
 enum Commands {
-  /// Start the deployment server
-  Server,
+  /// Manage the deployment server
+  Server {
+    #[command(subcommand)]
+    action: Option<ServerAction>,
+  },
   /// Deploy to a server (explicit client mode)
   Client {
     /// Server host
@@ -45,9 +52,81 @@ enum Commands {
   },
 }
 
-#[tokio::main]
-async fn main() {
+#[derive(Subcommand)]
+enum ServerAction {
+  /// Run the server in the foreground (default)
+  Run(ServiceRunArgs),
+  /// Install the server as a service
+  Install(ServiceInstallArgs),
+  /// Uninstall the server service
+  Uninstall(ServiceTargetArgs),
+  /// Start the installed server service
+  Start(ServiceTargetArgs),
+  /// Stop the running server service
+  Stop(ServiceTargetArgs),
+  /// Show the current service status
+  Status(ServiceTargetArgs),
+}
+
+#[derive(Args, Clone, Default)]
+struct ServiceRunArgs {
+  /// Internal: service identifier when running under a supervisor
+  #[arg(long, hide = true)]
+  service_label: Option<String>,
+}
+
+#[derive(Args, Clone)]
+struct ServiceInstallArgs {
+  /// Service label / identifier
+  #[arg(long, default_value = DEFAULT_SERVICE_LABEL)]
+  label: String,
+  /// Install as a per-user service instead of system-wide
+  #[arg(long)]
+  user: bool,
+  /// Disable automatic restart if the service fails
+  #[arg(long)]
+  disable_restart_on_failure: bool,
+  /// Do not start the service automatically on boot
+  #[arg(long)]
+  no_autostart: bool,
+  /// Working directory used by the service
+  #[arg(long, value_name = "PATH")]
+  working_directory: Option<PathBuf>,
+  /// Run the service under a specific username (platform-specific)
+  #[arg(long)]
+  username: Option<String>,
+}
+
+#[derive(Args, Clone)]
+struct ServiceTargetArgs {
+  /// Service label / identifier
+  #[arg(long, default_value = DEFAULT_SERVICE_LABEL)]
+  label: String,
+  /// Target a per-user service instead of system-wide
+  #[arg(long)]
+  user: bool,
+}
+
+fn main() {
   let cli = Cli::parse();
+  let _log_handle = initialize_logging(&cli);
+  if let Err(err) = run_cli(cli) {
+    error!("{err}");
+    process::exit(1);
+  }
+}
+
+fn initialize_logging(cli: &Cli) -> log2::Handle {
+  match &cli.command {
+    Some(Commands::Server { action }) => match action.as_ref() {
+      Some(ServerAction::Run(_)) | None => server::init_server_logging(),
+      _ => log2::stdout().level("info").start(),
+    },
+    _ => log2::stdout().level("info").start(),
+  }
+}
+
+fn run_cli(cli: Cli) -> Result<()> {
   let Cli {
     command,
     host: default_host,
@@ -55,36 +134,27 @@ async fn main() {
   } = cli;
 
   match command {
-    Some(Commands::Server) => {
-      std::fs::create_dir_all("./logs").ok();
-      let _log = log2::open("./logs/server.log")
-        .size(10 * 1024 * 1024) // 10MB per log file
-        .rotate(5) // Keep 5 backup files
-        .level("info") // Log level
-        .tee(true) // Also output to stdout
-        .start();
-
-      let provider: Arc<dyn config::ConfigProvider> = Arc::new(config::ConfigProviderImpl);
-      if let Err(e) = server::start_server(provider.clone()).await {
-        error!("{}", e);
-        std::process::exit(1);
-      }
+    Some(Commands::Server { action }) => {
+      let action = action.unwrap_or(ServerAction::Run(ServiceRunArgs::default()));
+      handle_server(action)?;
     }
     Some(Commands::Client { host, packages }) => {
-      let _log2 = log2::start();
-      run_client_mode(&host, packages).await;
+      let runtime = build_runtime()?;
+      runtime.block_on(run_client_mode(&host, packages));
     }
     None => {
-      let _log2 = log2::start();
       let host = default_host
         .unwrap_or_else(|| usage_and_exit("Host is required when not using subcommands"));
       if default_packages.is_empty() {
         usage_and_exit("At least one package is required when not using subcommands");
       }
 
-      run_client_mode(&host, default_packages).await;
+      let runtime = build_runtime()?;
+      runtime.block_on(run_client_mode(&host, default_packages));
     }
-  };
+  }
+
+  Ok(())
 }
 
 async fn run_client_mode(host: &str, packages: Vec<String>) {
@@ -100,6 +170,113 @@ fn usage_and_exit(message: &str) -> ! {
   error!("{message}");
   error!("Usage: adeploy <HOST> <PACKAGE> [PACKAGE...]");
   error!("   or: adeploy client <HOST> <PACKAGE> [PACKAGE...]");
-  error!("   or: adeploy server");
+  error!("   or: adeploy server [run|install|start|stop|status|uninstall]");
   std::process::exit(1);
+}
+
+fn build_runtime() -> Result<tokio::runtime::Runtime> {
+  RuntimeBuilder::new_multi_thread()
+    .enable_all()
+    .build()
+    .map_err(|err| {
+      Box::new(AdeployError::Service(format!(
+        "Failed to initialize runtime: {err}"
+      )))
+    })
+}
+
+fn handle_server(action: ServerAction) -> Result<()> {
+  match action {
+    ServerAction::Run(opts) => {
+      let provider: Arc<dyn config::ConfigProvider> = Arc::new(config::ConfigProviderImpl);
+      #[cfg(windows)]
+      {
+        let service_name = opts
+          .service_label
+          .as_deref()
+          .unwrap_or(DEFAULT_SERVICE_LABEL);
+        if server::try_run_windows_service(provider.clone(), service_name)? {
+          return Ok(());
+        }
+      }
+      #[cfg(not(windows))]
+      let _ = &opts;
+
+      let runtime = build_runtime()?;
+      runtime.block_on(server::start_server(provider))?;
+    }
+    ServerAction::Install(opts) => {
+      if let Err(e) = server::install_service(
+        &opts.label,
+        opts.user,
+        !opts.no_autostart,
+        opts.disable_restart_on_failure,
+        opts.working_directory.clone(),
+        opts.username.clone(),
+      ) {
+        error!("{e}");
+        process::exit(1);
+      } else {
+        info!(
+          "Installed ADeploy service '{}' at {} level",
+          opts.label,
+          if opts.user { "user" } else { "system" }
+        );
+      }
+    }
+    ServerAction::Uninstall(opts) => {
+      if let Err(e) = server::uninstall_service(&opts.label, opts.user) {
+        error!("{e}");
+        process::exit(1);
+      } else {
+        info!(
+          "Uninstalled ADeploy service '{}' at {} level",
+          opts.label,
+          if opts.user { "user" } else { "system" }
+        );
+      }
+    }
+    ServerAction::Start(opts) => {
+      if let Err(e) = server::start_service(&opts.label, opts.user) {
+        error!("{e}");
+        process::exit(1);
+      } else {
+        info!(
+          "Started ADeploy service '{}' at {} level",
+          opts.label,
+          if opts.user { "user" } else { "system" }
+        );
+      }
+    }
+    ServerAction::Stop(opts) => {
+      if let Err(e) = server::stop_service(&opts.label, opts.user) {
+        error!("{e}");
+        process::exit(1);
+      } else {
+        info!(
+          "Stopped ADeploy service '{}' at {} level",
+          opts.label,
+          if opts.user { "user" } else { "system" }
+        );
+      }
+    }
+    ServerAction::Status(opts) => {
+      let status = match server::service_status(&opts.label, opts.user) {
+        Ok(status) => status,
+        Err(e) => {
+          error!("{e}");
+          process::exit(1);
+        }
+      };
+
+      info!(
+        "Service '{}'(level: {}) status: {}",
+        opts.label,
+        if opts.user { "user" } else { "system" },
+        server::format_service_status(&status)
+      );
+    }
+  }
+
+  Ok(())
 }
