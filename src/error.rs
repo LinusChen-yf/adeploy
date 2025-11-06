@@ -18,6 +18,9 @@ pub enum AdeployError {
   #[error("File system error: {0}")]
   FileSystem(String),
 
+  #[error("Service management error: {0}")]
+  Service(String),
+
   #[error(
     "gRPC error (code: {code:?}, message: {message})",
     code = .0.code(),

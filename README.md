@@ -17,6 +17,17 @@ ADeploy is a lightweight Rust tool for deploying applications across platforms t
 ```
 Build with `cargo build` first if you do not already have the binary.
 
+### Running as a Service
+```bash
+./adeploy server install                 # install the server as a system service
+./adeploy server install --user          # install a per-user service (systemd --user / launchd)
+./adeploy server start                   # start the installed service immediately
+./adeploy server status                  # inspect the current service state
+./adeploy server stop                    # stop the running service
+./adeploy server uninstall               # remove the service definition
+```
+Pass `--label <name>` to customise the service identifier (defaults to `adeploy`). Add `--no-autostart` to skip starting on boot or `--disable-restart-on-failure` to prevent automatic restarts when the service exits with an error.
+
 ## Configuration Basics
 Sample templates live in `config_example/`. Copy the appropriate template into the same directory as the `adeploy` binary and name it `client_config.toml` (for client runs) or `server_config.toml` (for server runs). The executable automatically loads the config file from its own directory.
 

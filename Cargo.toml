@@ -30,6 +30,11 @@ sha2 = "0.10"
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }
 rand = "0.9"
 rand_core = { version = "0.6", features = ["std"] }
+service-manager = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.6"
+windows-sys = { version = "0.52", features = ["Win32_Foundation"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14"
