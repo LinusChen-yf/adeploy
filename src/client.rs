@@ -1,11 +1,17 @@
-use std::{convert::TryInto, time::Duration};
+use std::{
+  convert::{TryFrom, TryInto},
+  time::Duration,
+};
 
 use base64::{engine::general_purpose, Engine as _};
 use log2::*;
 use tonic::transport::{Channel, Endpoint};
 
 use crate::{
-  adeploy::{deploy_service_client::DeployServiceClient, DeployRequest},
+  adeploy::{
+    deploy_log::Level as DeployLogLevel, deploy_service_client::DeployServiceClient, DeployLog,
+    DeployRequest,
+  },
   auth::Auth,
   config::{
     get_remote_config, ClientConfig, ClientPackageConfig, ConfigProvider, ConfigType, RemoteConfig,
@@ -199,7 +205,7 @@ async fn deploy_single_package(
       package_name, deploy_response.deploy_id
     );
     for log_line in &deploy_response.logs {
-      info!("{}", log_line);
+      log_deploy_server_entry(log_line);
     }
     Ok(())
   } else {
@@ -208,7 +214,7 @@ async fn deploy_single_package(
       package_name, deploy_response.message
     );
     for log_line in &deploy_response.logs {
-      error!("{}", log_line);
+      log_deploy_server_entry(log_line);
     }
     Err(Box::new(AdeployError::Deploy(format!(
       "Package {} deployment failed: {}",
@@ -251,4 +257,14 @@ fn enforce_client_archive_size(data: &[u8], limit: u64) -> Result<()> {
     }
   }
   Ok(())
+}
+
+fn log_deploy_server_entry(entry: &DeployLog) {
+  let level = DeployLogLevel::try_from(entry.level).unwrap_or(DeployLogLevel::Info);
+  let message = entry.message.as_str();
+  match level {
+    DeployLogLevel::Error => error!("{}", message),
+    DeployLogLevel::Warn => warn!("{}", message),
+    DeployLogLevel::Unspecified | DeployLogLevel::Info => info!("{}", message),
+  }
 }

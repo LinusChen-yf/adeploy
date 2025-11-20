@@ -8,6 +8,7 @@ mod auth;
 mod client;
 mod config;
 mod deploy;
+mod deploy_log;
 mod error;
 mod server;
 use crate::error::{AdeployError, Result};

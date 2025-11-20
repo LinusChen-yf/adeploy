@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::{
   config::{ClientPackageConfig, ServerPackageConfig},
+  deploy_log::DeployLogEntry,
   error::{AdeployError, Result},
 };
 
@@ -150,7 +151,7 @@ impl DeployManager {
   pub async fn execute_before_deploy_script(
     &self,
     config: &ServerPackageConfig,
-  ) -> Result<Vec<String>> {
+  ) -> Result<Vec<DeployLogEntry>> {
     self
       .run_deploy_script(config.before_deploy_script.as_deref(), "Before-deploy")
       .await
@@ -160,14 +161,14 @@ impl DeployManager {
   pub async fn execute_after_deploy_script(
     &self,
     config: &ServerPackageConfig,
-  ) -> Result<Vec<String>> {
+  ) -> Result<Vec<DeployLogEntry>> {
     self
       .run_deploy_script(config.after_deploy_script.as_deref(), "After-deploy")
       .await
   }
 
   /// Execute a shell script
-  async fn execute_script(&self, script_path: &str) -> Result<Vec<String>> {
+  async fn execute_script(&self, script_path: &str) -> Result<Vec<DeployLogEntry>> {
     // Get adeploy executable directory
     let exe_dir = std::env::current_exe()
       .map_err(|e| {
@@ -212,14 +213,18 @@ impl DeployManager {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    let mut logs = vec![];
+    let mut logs: Vec<DeployLogEntry> = vec![];
     if !stdout.is_empty() {
       info!("Script stdout: {}", stdout.trim_end());
-      logs.extend(stdout.lines().map(|s| s.to_string()));
+      logs.extend(stdout.lines().map(|s| DeployLogEntry::info(s)));
     }
     if !stderr.is_empty() {
       warn!("Script stderr: {}", stderr.trim_end());
-      logs.extend(stderr.lines().map(|s| format!("STDERR: {}", s)));
+      logs.extend(
+        stderr
+          .lines()
+          .map(|s| DeployLogEntry::warn(format!("STDERR: {}", s))),
+      );
     }
 
     if !output.status.success() {
@@ -294,7 +299,7 @@ impl DeployManager {
     &self,
     script_path: Option<&str>,
     stage_name: &str,
-  ) -> Result<Vec<String>> {
+  ) -> Result<Vec<DeployLogEntry>> {
     let Some(path) = script_path else {
       info!("No {} script configured", stage_name);
       return Ok(vec![]);

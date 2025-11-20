@@ -23,5 +23,16 @@ message DeployResponse {
     bool success = 1;
     string message = 2;
     string deploy_id = 3;
-    repeated string logs = 4;
+    repeated DeployLog logs = 4;
+}
+
+message DeployLog {
+    enum Level {
+        LEVEL_UNSPECIFIED = 0;
+        INFO = 1;
+        WARN = 2;
+        ERROR = 3;
+    }
+    Level level = 1;
+    string message = 2;
 }

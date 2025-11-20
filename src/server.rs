@@ -19,6 +19,7 @@ use crate::{
   auth::Auth,
   config::{ConfigProvider, ConfigType, ServerConfig},
   deploy::DeployManager,
+  deploy_log::{DeployLogEntry, LogLevel},
   error::{AdeployError, Result},
 };
 
@@ -139,7 +140,7 @@ impl DeployService for AdeployService {
           success: true,
           message: "Deployment completed successfully".to_string(),
           deploy_id,
-          logs,
+          logs: Self::encode_logs(logs),
         }))
       }
       Err(e) => {
@@ -149,18 +150,18 @@ impl DeployService for AdeployService {
         );
 
         // Always collect logs on failure
-        let mut logs = vec![format!("ERROR: Deployment failed: {}", e)];
+        let mut logs = vec![DeployLogEntry::error(format!("Deployment failed: {}", e))];
 
         // Include additional details when available
         if let AdeployError::Deploy(msg) = e.as_ref() {
-          logs.push(format!("Details: {}", msg));
+          logs.push(DeployLogEntry::error(format!("Details: {}", msg)));
         }
 
         Ok(Response::new(DeployResponse {
           success: false,
           message: e.to_string(),
           deploy_id,
-          logs,
+          logs: Self::encode_logs(logs),
         }))
       }
     }
@@ -168,73 +169,102 @@ impl DeployService for AdeployService {
 }
 
 impl AdeployService {
+  fn encode_logs(logs: Vec<DeployLogEntry>) -> Vec<crate::adeploy::DeployLog> {
+    logs
+      .into_iter()
+      .map(|entry| crate::adeploy::DeployLog {
+        level: Self::map_log_level(entry.level) as i32,
+        message: entry.message,
+      })
+      .collect()
+  }
+
+  fn map_log_level(level: LogLevel) -> crate::adeploy::deploy_log::Level {
+    match level {
+      LogLevel::Info => crate::adeploy::deploy_log::Level::Info,
+      LogLevel::Warn => crate::adeploy::deploy_log::Level::Warn,
+      LogLevel::Error => crate::adeploy::deploy_log::Level::Error,
+    }
+  }
+
   async fn execute_deployment(
     deploy_manager: &DeployManager,
     package_config: &crate::config::ServerPackageConfig,
     file_data: Vec<u8>,
     file_hash: String,
     package_name: &str,
-  ) -> Result<Vec<String>> {
+  ) -> Result<Vec<DeployLogEntry>> {
     let mut logs = Vec::new();
-    logs.push(format!(
+    logs.push(DeployLogEntry::info(format!(
       "[{}] Starting deployment execution",
       deploy_manager.deploy_id
-    ));
+    )));
 
     // Run before-deploy hook
-    logs.push("Running Before-deploy script...".to_string());
+    logs.push(DeployLogEntry::info("Running Before-deploy script..."));
     match deploy_manager
       .execute_before_deploy_script(package_config)
       .await
     {
       Ok(pre_logs) => {
         logs.extend(pre_logs);
-        logs.push("Before-deploy script succeeded".to_string());
+        logs.push(DeployLogEntry::info("Before-deploy script succeeded"));
       }
       Err(e) => {
         error!("Before-deploy script failed: {}", e);
-        logs.push(format!("ERROR: Before-deploy script failed: {}", e));
+        logs.push(DeployLogEntry::error(format!(
+          "Before-deploy script failed: {}",
+          e
+        )));
         return Err(e);
       }
     }
 
     // Extract archive and verify hash
-    logs.push("Extracting files...".to_string());
+    logs.push(DeployLogEntry::info("Extracting files..."));
     match deploy_manager
       .extract_files(file_data, &file_hash, package_config, package_name)
       .await
     {
       Ok(()) => {
-        logs.push("Files extracted and deployed successfully".to_string());
+        logs.push(DeployLogEntry::info(
+          "Files extracted and deployed successfully",
+        ));
       }
       Err(e) => {
         error!("File extraction failed: {}", e);
-        logs.push(format!("ERROR: File extraction failed: {}", e));
+        logs.push(DeployLogEntry::error(format!(
+          "File extraction failed: {}",
+          e
+        )));
         return Err(e);
       }
     }
 
     // Run after-deploy hook
-    logs.push("Running After-deploy script...".to_string());
+    logs.push(DeployLogEntry::info("Running After-deploy script..."));
     match deploy_manager
       .execute_after_deploy_script(package_config)
       .await
     {
       Ok(post_logs) => {
         logs.extend(post_logs);
-        logs.push("After-deploy script succeeded".to_string());
+        logs.push(DeployLogEntry::info("After-deploy script succeeded"));
       }
       Err(e) => {
         error!("After-deploy script failed: {}", e);
-        logs.push(format!("ERROR: After-deploy script failed: {}", e));
+        logs.push(DeployLogEntry::error(format!(
+          "After-deploy script failed: {}",
+          e
+        )));
         // Deployment succeeds even if the After-deploy script fails
       }
     }
 
-    logs.push(format!(
+    logs.push(DeployLogEntry::info(format!(
       "[{}] Deployment completed successfully",
       deploy_manager.deploy_id
-    ));
+    )));
     Ok(logs)
   }
 }
