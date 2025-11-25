@@ -21,6 +21,7 @@ pub async fn find_available_port() -> u16 {
 }
 
 /// Escape Windows backslashes so TOML paths parse correctly across platforms.
+#[allow(dead_code)]
 pub fn toml_escape_path(path: &Path) -> String {
   path.to_string_lossy().replace('\\', "\\\\")
 }
