@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  pull_request:
+    types:
+      - closed
+
+permissions:
+  contents: write
+
+jobs:
+  create_release_placeholder:
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.base.ref == 'main' &&
+      startsWith(github.event.pull_request.head.ref, 'release/')
+    runs-on: ubuntu-latest
+    outputs:
+      tag_name: ${{ steps.get_version.outputs.TAG_NAME }}
+    steps:
+      - name: Get version from branch name
+        id: get_version
+        run: |
+          BRANCH="${{ github.event.pull_request.head.ref }}"
+          VERSION="${BRANCH#release/}"
+          TAG_NAME="v${VERSION}"
+          echo "TAG_NAME=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "Detected version tag: ${TAG_NAME}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.get_version.outputs.TAG_NAME }}
+          name: ${{ steps.get_version.outputs.TAG_NAME }}
+          body: ${{ github.event.pull_request.body }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build_and_upload:
+    needs: create_release_placeholder
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform_name: linux
+            arch_name: x86_64
+            binary_suffix: ""
+          - os: windows-latest
+            platform_name: windows
+            arch_name: x86_64
+            binary_suffix: ".exe"
+          - os: macos-14
+            platform_name: macos
+            arch_name: aarch64
+            binary_suffix: ""
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Release
+        run: cargo build --release
+
+      - name: Setup Environment Variables
+        shell: bash
+        run: |
+          BIN_NAME="adeploy${{ matrix.binary_suffix }}"
+          DEPLOY_NAME="adeploy-${{ matrix.arch_name }}-${{ matrix.platform_name }}${{ matrix.binary_suffix }}"
+
+          echo "BIN_NAME=$BIN_NAME" >> $GITHUB_ENV
+          echo "DEPLOY_NAME=$DEPLOY_NAME" >> $GITHUB_ENV
+          echo "ASSET_PATH=target/release/$DEPLOY_NAME" >> $GITHUB_ENV
+
+      - name: Rename Binary
+        shell: bash
+        run: |
+          cd target/release
+          mv "${{ env.BIN_NAME }}" "${{ env.DEPLOY_NAME }}"
+          echo "✅ Renamed ${{ env.BIN_NAME }} to ${{ env.DEPLOY_NAME }}"
+
+      - name: Upload Asset to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.create_release_placeholder.outputs.tag_name }}
+          files: ${{ env.ASSET_PATH }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
