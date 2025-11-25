@@ -55,7 +55,6 @@ jobs:
         uses: peter-evans/create-pull-request@v7
         with:
           title: "uprev: version ${{ inputs.version }}"
-          commit-message: "chore: bump version to ${{ inputs.version }}"
           body: |
             **Release Notes:**
             ---
