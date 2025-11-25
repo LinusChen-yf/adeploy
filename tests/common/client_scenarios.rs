@@ -5,6 +5,8 @@ use std::{
   path::{Path, PathBuf},
 };
 
+use crate::common::toml_escape_path;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ClientScenarioKind {
   /// Everything configured correctly.
@@ -130,8 +132,8 @@ sources = [
 ]
 
 {host_remote}{default_remote}{fallback_remote}"#,
-    test1 = test1_path.display(),
-    test2 = test2_path.display(),
+    test1 = toml_escape_path(&test1_path),
+    test2 = toml_escape_path(&test2_path),
     host_remote = host_remote_block,
     default_remote = default_remote_block,
     fallback_remote = fallback_remote_block,

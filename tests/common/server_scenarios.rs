@@ -5,6 +5,8 @@ use std::{
   path::{Path, PathBuf},
 };
 
+use crate::common::toml_escape_path;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ServerScenarioKind {
   /// Server with backup + hooks executes successfully.
@@ -173,11 +175,11 @@ after_deploy_script = "{post_script}"
     port = port,
     allowed_key = allowed_key_entry,
     package = configured_package_name,
-    deploy_path = deploy_path.display(),
+    deploy_path = toml_escape_path(&deploy_path),
     backup_enabled = backup_enabled,
-    backup_path = backup_path.display(),
-    pre_script = pre_script_path.display(),
-    post_script = post_script_path.display(),
+    backup_path = toml_escape_path(&backup_path),
+    pre_script = toml_escape_path(&pre_script_path),
+    post_script = toml_escape_path(&post_script_path),
   );
 
   let config_path = server_dir.join("server_config.toml");
