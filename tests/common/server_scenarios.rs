@@ -102,35 +102,65 @@ pub fn write_server_config(
   let pre_marker = deploy_path.join("pre_deploy_executed.marker");
   let post_marker = deploy_path.join("post_deploy_executed.marker");
 
-  let pre_script_path = scripts_dir.join("pre_deploy.sh");
-  let pre_script_content = match scenario {
-    PreDeployScriptFailure => r"#!/bin/sh
+  let windows = cfg!(target_os = "windows");
+
+  let pre_script_path = scripts_dir.join(if windows {
+    "pre_deploy.cmd"
+  } else {
+    "pre_deploy.sh"
+  });
+
+  let pre_script_content = if windows {
+    match scenario {
+      PreDeployScriptFailure => {
+        "@echo off\r\necho pre hook failed 1>&2\r\nexit /B 1\r\n".to_string()
+      }
+      _ => format!("@echo off\r\ntype nul > \"{}\"\r\n", pre_marker.display()),
+    }
+  } else {
+    match scenario {
+      PreDeployScriptFailure => r"#!/bin/sh
 echo 'pre hook failed' >&2
 exit 1
 "
-    .to_string(),
-    _ => format!(
-      r"#!/bin/sh
+      .to_string(),
+      _ => format!(
+        r"#!/bin/sh
 touch '{}'
 ",
-      pre_marker.display()
-    ),
+        pre_marker.display()
+      ),
+    }
   };
   fs::write(&pre_script_path, pre_script_content).expect("Failed to write Before-deploy script");
 
-  let post_script_path = scripts_dir.join("post_deploy.sh");
-  let post_script_content = match scenario {
-    PostDeployScriptFailure => r"#!/bin/sh
+  let post_script_path = scripts_dir.join(if windows {
+    "post_deploy.cmd"
+  } else {
+    "post_deploy.sh"
+  });
+
+  let post_script_content = if windows {
+    match scenario {
+      PostDeployScriptFailure => {
+        "@echo off\r\necho post hook failed 1>&2\r\nexit /B 1\r\n".to_string()
+      }
+      _ => format!("@echo off\r\ntype nul > \"{}\"\r\n", post_marker.display()),
+    }
+  } else {
+    match scenario {
+      PostDeployScriptFailure => r"#!/bin/sh
 echo 'post hook failed' >&2
 exit 1
 "
-    .to_string(),
-    _ => format!(
-      r"#!/bin/sh
+      .to_string(),
+      _ => format!(
+        r"#!/bin/sh
 touch '{}'
 ",
-      post_marker.display()
-    ),
+        post_marker.display()
+      ),
+    }
   };
   fs::write(&post_script_path, post_script_content).expect("Failed to write After-deploy script");
 
