@@ -1,0 +1,77 @@
+name: Create Uprev PR
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version, e.g. 1.0.0"
+        required: true
+        type: string
+
+jobs:
+  create_pr:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      VERSION: ${{ inputs.version }}
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-edit
+        run: cargo install cargo-edit --locked
+
+      - name: Validate tag
+        shell: bash
+        run: |
+          if git rev-parse "v${VERSION}" >/dev/null 2>&1; then
+            echo "❌ Tag v${VERSION} already exists."
+            exit 1
+          fi
+          echo "✅ Tag v${VERSION} is available."
+
+      - name: Update version in Cargo.toml
+        shell: bash
+        run: |
+          cargo set-version "$VERSION"
+          echo "Updated Cargo.toml version to $VERSION"
+
+      - name: Update Cargo.lock (via cargo check)
+        shell: bash
+        run: |
+          cargo check
+          echo "✅ Cargo.lock updated."
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          title: "uprev: version ${{ inputs.version }}"
+          commit-message: "chore: bump version to ${{ inputs.version }}"
+          body: |
+            **Release Notes:**
+            ---
+            Version bump to ${{ inputs.version }}.
+
+            The `Cargo.lock` has been automatically updated.
+            CI checks (clippy & fmt) will run automatically on this PR.
+
+            😸 Features
+            * -
+
+            😼 Refine
+            * -
+
+            😾 Bug Fixes
+            * -
+          base: main
+          branch: release/${{ inputs.version }}
+          delete-branch: true
