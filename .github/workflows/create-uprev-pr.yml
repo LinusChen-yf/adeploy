@@ -63,10 +63,6 @@ jobs:
           body: |
             **Release Notes:**
             ---
-            Version bump to ${{ inputs.version }}.
-
-            The `Cargo.lock` has been automatically updated.
-            CI checks (clippy & fmt) will run automatically on this PR.
 
             😸 Features
             * -

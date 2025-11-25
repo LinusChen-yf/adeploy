@@ -33,6 +33,7 @@ jobs:
           tag_name: ${{ steps.get_version.outputs.TAG_NAME }}
           name: ${{ steps.get_version.outputs.TAG_NAME }}
           body: ${{ github.event.pull_request.body }}
+          generate_release_notes: false
           draft: false
           prerelease: false
         env:
