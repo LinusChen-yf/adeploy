@@ -216,7 +216,7 @@ impl DeployManager {
     let mut logs: Vec<DeployLogEntry> = vec![];
     if !stdout.is_empty() {
       info!("Script stdout: {}", stdout.trim_end());
-      logs.extend(stdout.lines().map(|s| DeployLogEntry::info(s)));
+      logs.extend(stdout.lines().map(DeployLogEntry::info));
     }
     if !stderr.is_empty() {
       warn!("Script stderr: {}", stderr.trim_end());

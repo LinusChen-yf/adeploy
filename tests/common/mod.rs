@@ -1,5 +1,7 @@
 //! Common test utilities and helpers
 
+use std::path::Path;
+
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 
@@ -16,4 +18,10 @@ pub async fn find_available_port() -> u16 {
     .expect("Failed to bind to port");
   let addr = listener.local_addr().expect("Failed to get local address");
   addr.port()
+}
+
+/// Escape Windows backslashes so TOML paths parse correctly across platforms.
+#[allow(dead_code)]
+pub fn toml_escape_path(path: &Path) -> String {
+  path.to_string_lossy().replace('\\', "\\\\")
 }
