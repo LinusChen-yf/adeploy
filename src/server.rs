@@ -28,12 +28,15 @@ use crate::{
     deploy_chunk::Payload,
     deploy_event::Event,
     deploy_service_server::{DeployService, DeployServiceServer},
-    DeployAccepted, DeployChunk, DeployEvent, DeployLog, DeployResult, DeployStart, PairRequest,
-    PairResponse, PairState,
+    BackupEntry, BackupListRequest, BackupListResponse, DeployAccepted, DeployChunk, DeployEvent,
+    DeployLog, DeployResult, DeployStart, PairRequest, PairResponse, PairState, RollbackRequest,
   },
-  auth::{deploy_start_signing_payload, fingerprint, pair_signing_payload, Auth},
+  auth::{
+    backup_list_signing_payload, deploy_start_signing_payload, fingerprint, pair_signing_payload,
+    rollback_signing_payload, Auth,
+  },
   config::{ConfigProvider, PackageConfig, ProjectConfig},
-  deploy::DeployManager,
+  deploy::{backup_directory, list_backups, DeployManager, DeployTarget},
   deploy_log::{DeployLogEntry, LogLevel, LogSink},
   error::{AdeployError, Result},
   init,
@@ -93,7 +96,16 @@ struct AcceptedDeploy {
   start: DeployStart,
   package_config: PackageConfig,
   deploy_path: PathBuf,
+  backup_dir: PathBuf,
   staging_dir: PathBuf,
+}
+
+/// Everything a package's name resolves to on this server.
+struct PackageContext {
+  config: PackageConfig,
+  deploy_path: PathBuf,
+  backup_dir: PathBuf,
+  deploy_root: PathBuf,
 }
 
 /// An upload written to disk, removed when it goes out of scope.
@@ -146,6 +158,112 @@ impl DeployService for AdeployService {
 
     let stream = deployment_stream(deploy_manager, accepted, inbound);
     Ok(Response::new(Box::pin(stream) as Self::DeployStream))
+  }
+
+  async fn list_backups(
+    &self,
+    request: Request<BackupListRequest>,
+  ) -> std::result::Result<Response<BackupListResponse>, Status> {
+    let request = request.into_inner();
+
+    let payload = backup_list_signing_payload(
+      &request.package_name,
+      &request.public_key,
+      &request.nonce,
+      request.timestamp_ms,
+    );
+    self
+      .authenticate(
+        &request.public_key,
+        &request.signature,
+        &payload,
+        &request.nonce,
+        request.timestamp_ms,
+      )
+      .await?;
+
+    let context = self.package_context(&request.package_name).await?;
+    let backups = list_backups(&context.backup_dir)
+      .map_err(|e| Status::internal(format!("Failed to read snapshots: {}", e)))?;
+
+    info!(
+      "Listed {} snapshot(s) for {}",
+      backups.len(),
+      request.package_name
+    );
+
+    Ok(Response::new(BackupListResponse {
+      backups: backups
+        .into_iter()
+        .map(|backup| BackupEntry {
+          name: backup.name,
+          created_ms: backup.created_ms,
+          size_bytes: backup.size_bytes,
+        })
+        .collect(),
+    }))
+  }
+
+  type RollbackStream =
+    Pin<Box<dyn Stream<Item = std::result::Result<DeployEvent, Status>> + Send + 'static>>;
+
+  async fn rollback(
+    &self,
+    request: Request<RollbackRequest>,
+  ) -> std::result::Result<Response<Self::RollbackStream>, Status> {
+    let request = request.into_inner();
+
+    let payload = rollback_signing_payload(
+      &request.package_name,
+      &request.backup_name,
+      &request.public_key,
+      &request.nonce,
+      request.timestamp_ms,
+    );
+    self
+      .authenticate(
+        &request.public_key,
+        &request.signature,
+        &payload,
+        &request.nonce,
+        request.timestamp_ms,
+      )
+      .await?;
+
+    let context = self.package_context(&request.package_name).await?;
+    let backups = list_backups(&context.backup_dir)
+      .map_err(|e| Status::internal(format!("Failed to read snapshots: {}", e)))?;
+
+    // Choosing the snapshot before the response stream exists means "there is
+    // nothing to roll back to" is a plain status rather than a stream that
+    // opens and immediately fails.
+    let chosen = if request.backup_name.is_empty() {
+      backups.first().cloned().ok_or_else(|| {
+        Status::not_found(format!(
+          "No snapshots exist for '{}'; a deployment with backup_enabled creates them",
+          request.package_name
+        ))
+      })?
+    } else {
+      backups
+        .into_iter()
+        .find(|backup| backup.name == request.backup_name)
+        .ok_or_else(|| {
+          Status::not_found(format!(
+            "No snapshot named '{}' for '{}'",
+            request.backup_name, request.package_name
+          ))
+        })?
+    };
+
+    let deploy_manager = DeployManager::new();
+    info!(
+      "Rolling {} back to {} ({})",
+      request.package_name, chosen.name, deploy_manager.deploy_id
+    );
+
+    let stream = rollback_stream(deploy_manager, request.package_name, context, chosen);
+    Ok(Response::new(Box::pin(stream) as Self::RollbackStream))
   }
 
   async fn pair(
@@ -262,42 +380,91 @@ impl DeployService for AdeployService {
 }
 
 impl AdeployService {
-  /// Check who is calling and what they are asking for, before accepting bytes.
-  async fn authorize(&self, start: DeployStart) -> std::result::Result<AcceptedDeploy, Status> {
-    info!("Deploy request for {} from a client", start.package_name);
+  /// The checks every authenticated call shares: allowlist, signature, replay.
+  ///
+  /// Each caller supplies the bytes its own message signs, under its own domain
+  /// tag, so a signature authorising one operation is never valid for another.
+  async fn authenticate(
+    &self,
+    public_key: &str,
+    signature_b64: &str,
+    payload: &[u8],
+    nonce: &str,
+    timestamp_ms: i64,
+  ) -> std::result::Result<(), Status> {
+    let allowed_keys = {
+      let config = self.config.read().await;
+      config.server.allowed_keys.clone()
+    };
 
+    if !self.is_trusted(&allowed_keys, public_key.trim()) {
+      error!("Public key not allowed ({})", fingerprint(public_key));
+      return Err(Status::unauthenticated("Client public key not allowed"));
+    }
+
+    let signature = general_purpose::STANDARD
+      .decode(signature_b64)
+      .map_err(|e| {
+        error!("Invalid signature format: {}", e);
+        Status::invalid_argument(format!("Invalid signature: {}", e))
+      })?;
+
+    match Auth::verify_signature(public_key, payload, &signature) {
+      Ok(true) => {}
+      Ok(false) => {
+        error!("Signature verification failed");
+        return Err(Status::unauthenticated("Invalid Ed25519 signature"));
+      }
+      Err(e) => {
+        error!("Ed25519 signature verification error: {}", e);
+        return Err(Status::unauthenticated(format!("Auth error: {}", e)));
+      }
+    }
+
+    // Only after the signature holds: an unsigned nonce could be invented by
+    // anyone, and recording it would burn a value a real client might use.
+    self
+      .replay
+      .admit(nonce, timestamp_ms)
+      .map_err(|rejection| Status::unauthenticated(rejection.message()))
+  }
+
+  /// Resolve a package name against this server's configuration.
+  async fn package_context(
+    &self,
+    package_name: &str,
+  ) -> std::result::Result<PackageContext, Status> {
     let fallback_root = init::default_deploy_root().map_err(|e| {
       error!("Cannot determine the deploy root: {}", e);
       Status::internal(format!("Cannot determine deploy root: {}", e))
     })?;
 
-    let (allowed_keys, package_config, deploy_path, max_file_size, deploy_root) = {
-      let config = self.config.read().await;
-      (
-        config.server.allowed_keys.clone(),
-        config.packages.get(&start.package_name).cloned(),
-        config.resolve_deploy_path(&start.package_name, &fallback_root),
-        config.server.max_file_size,
-        resolve_deploy_root(&config).unwrap_or_else(|_| fallback_root.clone()),
-      )
-    };
+    let config = self.config.read().await;
+    let deploy_root = resolve_deploy_root(&config).unwrap_or_else(|_| fallback_root.clone());
 
-    let presented_key = start.public_key.trim();
-    if !self.is_trusted(&allowed_keys, presented_key) {
-      error!(
-        "Public key not allowed for {} ({})",
-        start.package_name,
-        fingerprint(presented_key)
-      );
-      return Err(Status::unauthenticated("Client public key not allowed"));
+    let package_config = config.packages.get(package_name).cloned();
+    let deploy_path = config.resolve_deploy_path(package_name, &fallback_root);
+
+    match (package_config, deploy_path) {
+      (Some(package_config), Some(deploy_path)) => Ok(PackageContext {
+        backup_dir: backup_directory(&package_config, package_name, &deploy_root),
+        config: package_config,
+        deploy_path,
+        deploy_root,
+      }),
+      _ => {
+        error!("Package {} is not configured", package_name);
+        Err(Status::not_found(format!(
+          "Package '{}' not configured",
+          package_name
+        )))
+      }
     }
+  }
 
-    let signature = general_purpose::STANDARD
-      .decode(&start.signature)
-      .map_err(|e| {
-        error!("Invalid signature format: {}", e);
-        Status::invalid_argument(format!("Invalid signature: {}", e))
-      })?;
+  /// Check who is calling and what they are asking for, before accepting bytes.
+  async fn authorize(&self, start: DeployStart) -> std::result::Result<AcceptedDeploy, Status> {
+    info!("Deploy request for {} from a client", start.package_name);
 
     let payload = deploy_start_signing_payload(
       &start.package_name,
@@ -307,31 +474,20 @@ impl AdeployService {
       &start.nonce,
       start.timestamp_ms,
     );
+    self
+      .authenticate(
+        &start.public_key,
+        &start.signature,
+        &payload,
+        &start.nonce,
+        start.timestamp_ms,
+      )
+      .await?;
 
-    match Auth::verify_signature(&start.public_key, &payload, &signature) {
-      Ok(true) => {}
-      Ok(false) => {
-        error!("Signature verification failed for {}", start.package_name);
-        return Err(Status::unauthenticated("Invalid Ed25519 signature"));
-      }
-      Err(e) => {
-        error!("Ed25519 signature verification error: {}", e);
-        return Err(Status::unauthenticated(format!("Auth error: {}", e)));
-      }
-    }
-
-    // Only now is the nonce worth remembering: an unsigned one could be
-    // invented by anyone, and recording it would let a stranger burn a value a
-    // legitimate client might later use.
-    if let Err(rejection) = self.replay.admit(&start.nonce, start.timestamp_ms) {
-      error!(
-        "Rejected {} for {}: {}",
-        start.package_name,
-        presented_key,
-        rejection.message()
-      );
-      return Err(Status::unauthenticated(rejection.message()));
-    }
+    let max_file_size = {
+      let config = self.config.read().await;
+      config.server.max_file_size
+    };
 
     if max_file_size > 0 && start.total_size > max_file_size {
       error!(
@@ -344,22 +500,14 @@ impl AdeployService {
       )));
     }
 
-    let (package_config, deploy_path) = match (package_config, deploy_path) {
-      (Some(config), Some(path)) => (config, path),
-      _ => {
-        error!("Package {} is not configured", start.package_name);
-        return Err(Status::not_found(format!(
-          "Package '{}' not configured",
-          start.package_name
-        )));
-      }
-    };
+    let context = self.package_context(&start.package_name).await?;
 
     Ok(AcceptedDeploy {
       start,
-      package_config,
-      deploy_path,
-      staging_dir: deploy_root.join(STAGING_DIR),
+      package_config: context.config,
+      deploy_path: context.deploy_path,
+      backup_dir: context.backup_dir,
+      staging_dir: context.deploy_root.join(STAGING_DIR),
     })
   }
 }
@@ -433,6 +581,118 @@ fn deployment_stream(
       }
     }
   }
+}
+
+/// Put a snapshot back, reporting progress the way a deployment does.
+fn rollback_stream(
+  deploy_manager: DeployManager,
+  package_name: String,
+  context: PackageContext,
+  chosen: crate::deploy::BackupInfo,
+) -> impl Stream<Item = std::result::Result<DeployEvent, Status>> + Send + 'static {
+  try_stream! {
+    let deploy_id = deploy_manager.deploy_id.clone();
+    yield accepted_event(&deploy_id);
+
+    let (sender, mut receiver) = mpsc::channel(EVENT_CHANNEL_SIZE);
+    let sink = LogSink::new(sender);
+    let work = execute_rollback(&deploy_manager, &package_name, &context, &chosen, &sink);
+    tokio::pin!(work);
+
+    loop {
+      let step = tokio::select! {
+        Some(entry) = receiver.recv() => DeployStep::Log(entry),
+        outcome = &mut work => DeployStep::Finished(outcome),
+      };
+
+      match step {
+        DeployStep::Log(entry) => yield log_event(entry),
+        DeployStep::Finished(outcome) => {
+          while let Ok(entry) = receiver.try_recv() {
+            yield log_event(entry);
+          }
+
+          match outcome {
+            Ok(()) => {
+              info!("Rollback {} completed for {}", deploy_id, package_name);
+              yield result_event(
+                true,
+                &format!("Rolled back to {}", chosen.name),
+                &deploy_id,
+              );
+            }
+            Err(e) => {
+              error!("Rollback {} failed for {}: {}", deploy_id, package_name, e);
+              yield log_event(DeployLogEntry::error(format!("Rollback failed: {}", e)));
+              yield result_event(false, &e.to_string(), &deploy_id);
+            }
+          }
+          break;
+        }
+      }
+    }
+  }
+}
+
+/// Run the hooks around restoring a snapshot.
+///
+/// The same hooks a deployment runs, because putting files back has the same
+/// requirements: the service holding them has to stop first and start after.
+async fn execute_rollback(
+  deploy_manager: &DeployManager,
+  package_name: &str,
+  context: &PackageContext,
+  chosen: &crate::deploy::BackupInfo,
+  sink: &LogSink,
+) -> Result<()> {
+  sink
+    .info(format!(
+      "[{}] Rolling back to {}",
+      deploy_manager.deploy_id, chosen.name
+    ))
+    .await;
+
+  deploy_manager
+    .execute_before_deploy_script(&context.config, sink)
+    .await?;
+
+  // Snapshot what is there now, so a rollback can itself be undone.
+  if context.config.backup_enabled {
+    sink.info("Creating backup snapshot").await;
+    deploy_manager
+      .create_backup(package_name, &context.deploy_path, &context.backup_dir)
+      .await?;
+  }
+
+  sink
+    .info(format!(
+      "Restoring {} into {}",
+      chosen.name,
+      context.deploy_path.display()
+    ))
+    .await;
+  deploy_manager
+    .restore_backup(&chosen.path, &context.deploy_path)
+    .await?;
+  sink.info("Restore complete").await;
+
+  if let Err(e) = deploy_manager
+    .execute_after_deploy_script(&context.config, sink)
+    .await
+  {
+    warn!("After-deploy script failed: {}", e);
+    sink
+      .warn(format!("After-deploy script failed: {}", e))
+      .await;
+  }
+
+  sink
+    .info(format!(
+      "[{}] Rollback completed successfully",
+      deploy_manager.deploy_id
+    ))
+    .await;
+  Ok(())
 }
 
 /// Write the incoming chunks to disk, holding the declared size to account.
@@ -529,8 +789,11 @@ async fn execute_deployment(
       archive_path,
       &accepted.start.file_hash,
       &accepted.package_config,
-      &accepted.start.package_name,
-      &accepted.deploy_path,
+      DeployTarget {
+        package_name: &accepted.start.package_name,
+        deploy_path: &accepted.deploy_path,
+        backup_dir: &accepted.backup_dir,
+      },
       sink,
     )
     .await?;

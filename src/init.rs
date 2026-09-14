@@ -50,8 +50,8 @@ deploy_path = "demo"
 # clean_deploy = false
 # Server: snapshot the existing directory before unpacking.
 backup_enabled = true
-# Server: where snapshots go. Defaults to a directory named after the package,
-# beside the server binary.
+# Server: where snapshots go, and what `adeploy rollback` restores from.
+# Defaults to <deploy_root>/.backups/<package>.
 # backup_path = "/var/backups/demo"
 # Server: runs before unpacking. A non-zero exit aborts the deployment, so this
 # is the place to stop a service that holds the files open.

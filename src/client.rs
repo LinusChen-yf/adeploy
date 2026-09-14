@@ -10,10 +10,13 @@ use uuid::Uuid;
 use crate::{
   adeploy::{
     deploy_chunk::Payload, deploy_event::Event, deploy_log::Level as DeployLogLevel,
-    deploy_service_client::DeployServiceClient, DeployChunk, DeployEvent, DeployLog, DeployResult,
-    DeployStart, PairRequest, PairState,
+    deploy_service_client::DeployServiceClient, BackupListRequest, DeployChunk, DeployEvent,
+    DeployLog, DeployResult, DeployStart, PairRequest, PairState, RollbackRequest,
   },
-  auth::{deploy_start_signing_payload, fingerprint, pair_signing_payload, Auth},
+  auth::{
+    backup_list_signing_payload, deploy_start_signing_payload, fingerprint, pair_signing_payload,
+    rollback_signing_payload, Auth,
+  },
   config::{ConfigProvider, LoadedConfig, ResolvedRemote},
   deploy::DeployManager,
   error::{AdeployError, Result},
@@ -68,6 +71,148 @@ pub async fn deploy(
 struct AuthResources {
   ssh_auth: Auth,
   public_key: String,
+}
+
+/// Show which snapshots `host` holds for `package`.
+pub async fn list_backups(host: &str, package: &str, provider: &dyn ConfigProvider) -> Result<()> {
+  let loaded = provider.load()?;
+  let remote = loaded.config.resolve_remote(host);
+  let auth = prepare_auth_resources(provider)?;
+
+  let nonce = Uuid::new_v4().to_string();
+  let timestamp_ms = now_ms();
+  let payload = backup_list_signing_payload(package, &auth.public_key, &nonce, timestamp_ms);
+  let signature = sign(&auth, &payload)?;
+
+  let mut client = connect_deploy_client(host, &remote).await?;
+  let response = client
+    .list_backups(tonic::Request::new(BackupListRequest {
+      package_name: package.to_string(),
+      public_key: auth.public_key.clone(),
+      nonce,
+      timestamp_ms,
+      signature,
+    }))
+    .await
+    .map_err(|status| unauthenticated_hint(status, &auth.public_key))?
+    .into_inner();
+
+  if response.backups.is_empty() {
+    info!(
+      "{} holds no snapshots of {}; a deployment with backup_enabled creates them",
+      host, package
+    );
+    return Ok(());
+  }
+
+  info!("Snapshots of {} on {}, newest first:", package, host);
+  for backup in &response.backups {
+    info!(
+      "  {}  {}  ({})",
+      backup.name,
+      format_timestamp(backup.created_ms),
+      format_size(backup.size_bytes)
+    );
+  }
+  info!(
+    "Roll back with `adeploy rollback {} {} --to <name>`",
+    host, package
+  );
+  Ok(())
+}
+
+/// Put a snapshot back on `host`.
+pub async fn rollback(
+  host: &str,
+  package: &str,
+  backup_name: Option<String>,
+  provider: &dyn ConfigProvider,
+) -> Result<()> {
+  let loaded = provider.load()?;
+  let remote = loaded.config.resolve_remote(host);
+  let auth = prepare_auth_resources(provider)?;
+  let backup_name = backup_name.unwrap_or_default();
+
+  let nonce = Uuid::new_v4().to_string();
+  let timestamp_ms = now_ms();
+  let payload = rollback_signing_payload(
+    package,
+    &backup_name,
+    &auth.public_key,
+    &nonce,
+    timestamp_ms,
+  );
+  let signature = sign(&auth, &payload)?;
+
+  if backup_name.is_empty() {
+    info!(
+      "Rolling {} back to its most recent snapshot on {}",
+      package, host
+    );
+  } else {
+    info!("Rolling {} back to {} on {}", package, backup_name, host);
+  }
+
+  let mut client = connect_deploy_client(host, &remote).await?;
+  let mut request = tonic::Request::new(RollbackRequest {
+    package_name: package.to_string(),
+    backup_name,
+    public_key: auth.public_key.clone(),
+    nonce,
+    timestamp_ms,
+    signature,
+  });
+  if remote.deploy_timeout > 0 {
+    request.set_timeout(Duration::from_secs(remote.deploy_timeout));
+  }
+
+  let response = client
+    .rollback(request)
+    .await
+    .map_err(|status| unauthenticated_hint(status, &auth.public_key))?;
+
+  consume_events(response.into_inner(), package, Operation::Rollback).await
+}
+
+fn sign(auth: &AuthResources, payload: &[u8]) -> Result<String> {
+  let signature = auth
+    .ssh_auth
+    .sign_data(payload)
+    .map_err(|e| Box::new(AdeployError::Auth(format!("Failed to sign request: {}", e))))?;
+  Ok(general_purpose::STANDARD.encode(&signature))
+}
+
+/// Turn a rejection into advice, rather than leaving the user to guess.
+fn unauthenticated_hint(status: tonic::Status, public_key: &str) -> Box<AdeployError> {
+  if status.code() == tonic::Code::Unauthenticated {
+    error!(
+      "Rejected (unauthenticated). This machine's key fingerprint is {}",
+      fingerprint(public_key)
+    );
+    error!("Run `adeploy pair <host>` to request access, then have an operator approve it");
+  }
+  Box::new(AdeployError::Grpc(status))
+}
+
+fn format_timestamp(created_ms: i64) -> String {
+  chrono::DateTime::from_timestamp_millis(created_ms)
+    .map(|time| time.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+    .unwrap_or_else(|| "unknown time".to_string())
+}
+
+fn format_size(bytes: u64) -> String {
+  const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+  let mut size = bytes as f64;
+  let mut unit = 0;
+  while size >= 1024.0 && unit < UNITS.len() - 1 {
+    size /= 1024.0;
+    unit += 1;
+  }
+  if unit == 0 {
+    format!("{} {}", bytes, UNITS[unit])
+  } else {
+    format!("{:.1} {}", size, UNITS[unit])
+  }
 }
 
 /// Ask `host` to trust this machine's key.
@@ -277,7 +422,12 @@ async fn deploy_single_package(
     }
   };
 
-  consume_events(response.into_inner(), package_name, total_size).await
+  consume_events(
+    response.into_inner(),
+    package_name,
+    Operation::Deploy { total_size },
+  )
+  .await
 }
 
 /// Describe and sign the upload that is about to start.
@@ -348,11 +498,52 @@ fn upload_stream(
   }
 }
 
+/// What the event stream is reporting on, so its messages can say so.
+enum Operation {
+  Deploy { total_size: u64 },
+  Rollback,
+}
+
+impl Operation {
+  fn accepted(&self, package_name: &str, deploy_id: &str) -> String {
+    match self {
+      Self::Deploy { total_size } => format!(
+        "Server accepted {} ({} bytes), deploy ID {}",
+        package_name, total_size, deploy_id
+      ),
+      Self::Rollback => format!(
+        "Server accepted the rollback of {}, ID {}",
+        package_name, deploy_id
+      ),
+    }
+  }
+
+  fn succeeded(&self, package_name: &str, deploy_id: &str) -> String {
+    match self {
+      Self::Deploy { .. } => format!(
+        "Deployment succeeded for {} (ID: {})",
+        package_name, deploy_id
+      ),
+      Self::Rollback => format!(
+        "Rollback succeeded for {} (ID: {})",
+        package_name, deploy_id
+      ),
+    }
+  }
+
+  fn failed(&self, package_name: &str, message: &str) -> String {
+    match self {
+      Self::Deploy { .. } => format!("Package {} deployment failed: {}", package_name, message),
+      Self::Rollback => format!("Package {} rollback failed: {}", package_name, message),
+    }
+  }
+}
+
 /// Render the server's events as they arrive, and report the final outcome.
 async fn consume_events(
   mut events: tonic::Streaming<DeployEvent>,
   package_name: &str,
-  total_size: u64,
+  operation: Operation,
 ) -> Result<()> {
   let mut outcome: Option<DeployResult> = None;
 
@@ -366,10 +557,7 @@ async fn consume_events(
 
     match event.event {
       Some(Event::Accepted(accepted)) => {
-        info!(
-          "Server accepted {} ({} bytes), deploy ID {}",
-          package_name, total_size, accepted.deploy_id
-        );
+        info!("{}", operation.accepted(package_name, &accepted.deploy_id));
       }
       Some(Event::Log(entry)) => log_deploy_server_entry(&entry),
       Some(Event::Result(result)) => outcome = Some(result),
@@ -379,18 +567,14 @@ async fn consume_events(
 
   match outcome {
     Some(result) if result.success => {
-      info!(
-        "Deployment succeeded for {} (ID: {})",
-        package_name, result.deploy_id
-      );
+      info!("{}", operation.succeeded(package_name, &result.deploy_id));
       Ok(())
     }
     Some(result) => {
-      error!("Deployment failed for {}: {}", package_name, result.message);
-      Err(Box::new(AdeployError::Deploy(format!(
-        "Package {} deployment failed: {}",
-        package_name, result.message
-      ))))
+      error!("Failed for {}: {}", package_name, result.message);
+      Err(Box::new(AdeployError::Deploy(
+        operation.failed(package_name, &result.message),
+      )))
     }
     // The stream ended without a verdict, which means the server went away
     // mid-deployment rather than deciding anything.

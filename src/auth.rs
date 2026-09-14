@@ -231,6 +231,48 @@ pub fn pair_signing_payload(
   payload
 }
 
+/// Bytes signed by a `BackupListRequest`.
+pub fn backup_list_signing_payload(
+  package_name: &str,
+  public_key: &str,
+  nonce: &str,
+  timestamp_ms: i64,
+) -> Vec<u8> {
+  const DOMAIN: &[u8] = b"adeploy:backup-list:v1";
+
+  let mut payload = Vec::with_capacity(DOMAIN.len() + 96);
+  payload.extend_from_slice(DOMAIN);
+  push_field(&mut payload, package_name.as_bytes());
+  push_field(&mut payload, public_key.as_bytes());
+  push_field(&mut payload, nonce.as_bytes());
+  payload.extend_from_slice(&timestamp_ms.to_le_bytes());
+  payload
+}
+
+/// Bytes signed by a `RollbackRequest`.
+///
+/// A separate domain from a deployment's: a signature authorising one must
+/// never be usable as the other, since rolling back replaces a live directory
+/// just as thoroughly as deploying does.
+pub fn rollback_signing_payload(
+  package_name: &str,
+  backup_name: &str,
+  public_key: &str,
+  nonce: &str,
+  timestamp_ms: i64,
+) -> Vec<u8> {
+  const DOMAIN: &[u8] = b"adeploy:rollback:v1";
+
+  let mut payload = Vec::with_capacity(DOMAIN.len() + 128);
+  payload.extend_from_slice(DOMAIN);
+  push_field(&mut payload, package_name.as_bytes());
+  push_field(&mut payload, backup_name.as_bytes());
+  push_field(&mut payload, public_key.as_bytes());
+  push_field(&mut payload, nonce.as_bytes());
+  payload.extend_from_slice(&timestamp_ms.to_le_bytes());
+  payload
+}
+
 /// A short, comparable name for a public key, in the style of SSH.
 ///
 /// Printed by the client and shown in the server's pending list so an operator
