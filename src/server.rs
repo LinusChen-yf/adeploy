@@ -1,5 +1,11 @@
 use std::{
-  convert::TryInto, env, ffi::OsString, future::Future, path::PathBuf, sync::Arc, time::Duration,
+  convert::TryInto,
+  env,
+  ffi::OsString,
+  future::Future,
+  path::{Path, PathBuf},
+  sync::Arc,
+  time::Duration,
 };
 
 use base64::{engine::general_purpose, Engine as _};
@@ -17,7 +23,7 @@ use crate::{
     DeployRequest, DeployResponse,
   },
   auth::Auth,
-  config::{ConfigProvider, ConfigType, ServerConfig},
+  config::{executable_dir, ConfigProvider, PackageConfig, ProjectConfig},
   deploy::DeployManager,
   deploy_log::{DeployLogEntry, LogLevel},
   error::{AdeployError, Result},
@@ -28,11 +34,11 @@ const DEFAULT_MAX_MESSAGE_SIZE: u64 = 100 * 1024 * 1024;
 /// ADeploy gRPC service implementation
 #[derive(Clone)]
 pub struct AdeployService {
-  config: Arc<RwLock<ServerConfig>>,
+  config: Arc<RwLock<ProjectConfig>>,
 }
 
 impl AdeployService {
-  pub fn new(config: Arc<RwLock<ServerConfig>>) -> Self {
+  pub fn new(config: Arc<RwLock<ProjectConfig>>) -> Self {
     Self { config }
   }
 }
@@ -59,11 +65,28 @@ impl DeployService for AdeployService {
       }
     };
 
-    let (allowed_keys, package_config, max_file_size) = {
+    let fallback_root = match executable_dir() {
+      Ok(dir) => dir,
+      Err(e) => {
+        error!("Cannot determine the deploy root: {}", e);
+        return Err(Status::internal(format!(
+          "Cannot determine deploy root: {}",
+          e
+        )));
+      }
+    };
+
+    let (allowed_keys, package_config, deploy_path, max_file_size) = {
       let config = self.config.read().await;
       let allowed_keys = config.server.allowed_keys.clone();
       let package_config = config.packages.get(&req.package_name).cloned();
-      (allowed_keys, package_config, config.server.max_file_size)
+      let deploy_path = config.resolve_deploy_path(&req.package_name, &fallback_root);
+      (
+        allowed_keys,
+        package_config,
+        deploy_path,
+        config.defaults.max_file_size,
+      )
     };
 
     // Ensure the provided public key is allowed
@@ -90,9 +113,9 @@ impl DeployService for AdeployService {
     }
 
     // Ensure package configuration exists
-    let package_config = match package_config {
-      Some(config) => config,
-      None => {
+    let (package_config, deploy_path) = match (package_config, deploy_path) {
+      (Some(config), Some(path)) => (config, path),
+      _ => {
         error!("Package {} is not configured", req.package_name);
         return Err(Status::not_found(format!(
           "Package '{}' not configured",
@@ -130,6 +153,7 @@ impl DeployService for AdeployService {
       file_data,
       file_hash,
       &package_name,
+      &deploy_path,
     )
     .await
     {
@@ -189,10 +213,11 @@ impl AdeployService {
 
   async fn execute_deployment(
     deploy_manager: &DeployManager,
-    package_config: &crate::config::ServerPackageConfig,
+    package_config: &PackageConfig,
     file_data: Vec<u8>,
     file_hash: String,
     package_name: &str,
+    deploy_path: &Path,
   ) -> Result<Vec<DeployLogEntry>> {
     let mut logs = Vec::new();
     logs.push(DeployLogEntry::info(format!(
@@ -223,7 +248,13 @@ impl AdeployService {
     // Extract archive and verify hash
     logs.push(DeployLogEntry::info("Extracting files..."));
     match deploy_manager
-      .extract_files(file_data, &file_hash, package_config, package_name)
+      .extract_files(
+        file_data,
+        &file_hash,
+        package_config,
+        package_name,
+        deploy_path,
+      )
       .await
     {
       Ok(()) => {
@@ -280,20 +311,21 @@ pub async fn start_server_with_shutdown<F>(
 where
   F: Future<Output = ()> + Send + 'static,
 {
-  let config_path = provider.get_config_path(ConfigType::Server)?;
-  let config = provider.load_server_config(config_path.as_path())?;
+  let config_path = provider.get_config_path()?;
+  let config = provider.load_project_config(config_path.as_path())?;
 
-  let port = config.server.port;
+  let port = config.defaults.port;
   info!(
-    "Loaded server configuration; configured port {}",
-    config.server.port
+    "Loaded configuration from {}; listening port {}",
+    config_path.display(),
+    port
   );
 
   let addr = format!("0.0.0.0:{}", port)
     .parse()
     .map_err(|e| Box::new(AdeployError::Network(format!("Invalid address: {}", e))))?;
 
-  let message_limit = resolve_message_limit(config.server.max_file_size);
+  let message_limit = resolve_message_limit(config.defaults.max_file_size);
   let shared_config = Arc::new(RwLock::new(config));
   let (shutdown_tx, shutdown_rx) = watch::channel(false);
   let _watcher_guard = WatcherGuard {
@@ -338,7 +370,7 @@ fn resolve_message_limit(limit: u64) -> usize {
 fn spawn_config_watcher(
   provider: Arc<dyn ConfigProvider>,
   config_path: PathBuf,
-  shared_config: Arc<RwLock<ServerConfig>>,
+  shared_config: Arc<RwLock<ProjectConfig>>,
   mut shutdown_rx: watch::Receiver<bool>,
 ) {
   tokio::spawn(async move {
@@ -411,23 +443,23 @@ fn spawn_config_watcher(
         }
       }
 
-      match provider.load_server_config(config_path.as_path()) {
+      match provider.load_project_config(config_path.as_path()) {
         Ok(mut new_config) => {
           last_error = None;
 
           let existing_port = {
             let guard = shared_config.read().await;
-            guard.server.port
+            guard.defaults.port
           };
 
-          if new_config.server.port != existing_port {
+          if new_config.defaults.port != existing_port {
             warn!(
               "Ignoring server port change from {} to {} in {}",
               existing_port,
-              new_config.server.port,
+              new_config.defaults.port,
               config_path.display()
             );
-            new_config.server.port = existing_port;
+            new_config.defaults.port = existing_port;
           }
 
           {

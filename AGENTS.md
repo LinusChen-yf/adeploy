@@ -5,8 +5,9 @@ The deployment runtime lives in `src/`, with entrypoints in `main.rs` routing to
 
 ## Build, Test, and Development Commands
 - `cargo build` — compile the CLI and server binaries with protobuf generation.
-- `cargo run -- server` — start the gRPC deployment server using `server_config.toml`.
-- `cargo run -- client <host> <package>` — push a deployment defined in `client_config.toml`.
+- `cargo run -- server` — start the gRPC deployment server using the `adeploy.toml` beside the binary.
+- `cargo run -- client <host> <package>` — push a deployment defined in the project's `adeploy.toml`.
+- `cargo run -- init` — write a commented `adeploy.toml` into the working directory.
 - `cargo +nightly fmt` / `cargo +nightly fmt --check` — apply or verify repository rustfmt settings.
 - `cargo clippy -- -D warnings` — lint with all warnings elevated to errors.
 - `cargo test` — execute unit and integration suites locally.
@@ -21,4 +22,4 @@ Use `cargo test` for the full suite; integration flows in `tests/integration_tes
 Follow the Conventional Commit-style prefixes present in history (`fix:`, `refactor:`, `misc:`) and keep subjects under 65 characters. Each pull request should include a purpose summary, the commands run for verification, linked issues, and screenshots or log excerpts for user-visible changes. Request a maintainer review and rerun `cargo fmt`, `cargo clippy -- -D warnings`, and `cargo test` before pushing updates.
 
 ## Configuration & Security Notes
-Client and server settings are loaded from `client_config.toml` and `server_config.toml` located beside the binaries; never embed credentials in code. Key material belongs outside version control—store only mock keys or fingerprints needed for tests. When protobuf schemas change, rebuild with `cargo build` to regenerate bindings and ensure ports, timeouts, and deploy paths remain configurable through TOML rather than hardcoded constants.
+Client and server settings share one `adeploy.toml`. The client walks up from the working directory to find it, so the file lives in the project repository; the server reads the copy beside its binary. Both accept `--config <path>`. Relative `sources` resolve against the directory holding the config, never the working directory; never embed credentials in code. Key material belongs outside version control—store only mock keys or fingerprints needed for tests. When protobuf schemas change, rebuild with `cargo build` to regenerate bindings and ensure ports, timeouts, and deploy paths remain configurable through TOML rather than hardcoded constants.

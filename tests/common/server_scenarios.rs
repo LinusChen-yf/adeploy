@@ -77,7 +77,7 @@ pub fn get(kind: ServerScenarioKind) -> &'static ServerScenario {
     .expect("Missing server scenario definition")
 }
 
-/// Create a server configuration tailored to the provided scenario.
+/// Create a server-side `adeploy.toml` tailored to the provided scenario.
 pub fn write_server_config(
   scenario: ServerScenarioKind,
   server_dir: &Path,
@@ -188,9 +188,11 @@ touch '{}'
   let backup_enabled = !matches!(scenario, BackupDisabled);
 
   let config_content = format!(
-    r#"[server]
+    r#"[defaults]
 port = {port}
 max_file_size = 1048576
+
+[server]
 allowed_keys = [
   "{allowed_key}"
 ]
@@ -212,7 +214,7 @@ after_deploy_script = "{post_script}"
     post_script = toml_escape_path(&post_script_path),
   );
 
-  let config_path = server_dir.join("server_config.toml");
+  let config_path = server_dir.join("adeploy.toml");
   fs::write(&config_path, config_content).expect("Failed to write server config file");
 
   config_path

@@ -11,8 +11,8 @@ use crate::common::toml_escape_path;
 pub enum ClientScenarioKind {
   /// Everything configured correctly.
   HappyPath,
-  /// Remote host configuration is missing.
-  MissingRemoteConfig,
+  /// Host has no `[remotes]` entry and inherits `[defaults]`.
+  RemoteDefaultsFallback,
   /// Package references a missing source file.
   MissingSourceFile,
   /// Client fails because signing keys are unavailable.
@@ -46,9 +46,9 @@ const CLIENT_SCENARIOS: &[ClientScenario] = &[
     description: "Valid client configuration with generated key pair",
   },
   ClientScenario {
-    kind: ClientScenarioKind::MissingRemoteConfig,
-    name: "client_missing_remote_config",
-    description: "No host-specific or default remote entry",
+    kind: ClientScenarioKind::RemoteDefaultsFallback,
+    name: "client_remote_defaults_fallback",
+    description: "No host-specific remote entry, so [defaults] applies",
   },
   ClientScenario {
     kind: ClientScenarioKind::MissingSourceFile,
@@ -80,7 +80,7 @@ pub fn get(kind: ClientScenarioKind) -> &'static ClientScenario {
     .expect("Missing client scenario definition")
 }
 
-/// Create a client configuration tailored to the provided scenario.
+/// Create a client-side `adeploy.toml` tailored to the provided scenario.
 pub fn write_client_config(scenario: ClientScenarioKind, client_dir: &Path, port: u16) -> PathBuf {
   let test1_path = client_dir.join("test1.txt");
   let test2_path = client_dir.join("test2.txt");
@@ -88,58 +88,37 @@ pub fn write_client_config(scenario: ClientScenarioKind, client_dir: &Path, port
   fs::write(&test1_path, "test1 content").expect("Failed to write test1 file");
   fs::write(&test2_path, "test2 content").expect("Failed to write test2 file");
 
-  let host_remote_block = match scenario {
-    ClientScenarioKind::MissingRemoteConfig => String::new(),
+  // Omitting the table entirely is the point of the fallback scenario: the
+  // deployment must still work off `[defaults]` alone.
+  let remote_block = match scenario {
+    ClientScenarioKind::RemoteDefaultsFallback => String::new(),
     _ => format!(
-      r#"[remotes."127.0.0.1"]
+      r#"
+[remotes."127.0.0.1"]
 port = {port}
-timeout = 30
-
-"#,
-      port = port
+"#
     ),
-  };
-
-  let default_remote_block = match scenario {
-    ClientScenarioKind::MissingRemoteConfig => String::new(),
-    _ => format!(
-      r#"[remotes.default]
-port = {port}
-timeout = 30
-
-"#,
-      port = port
-    ),
-  };
-
-  let fallback_remote_block = match scenario {
-    ClientScenarioKind::MissingRemoteConfig => format!(
-      r#"[remotes."198.51.100.1"]
-port = {port}
-timeout = 30
-
-"#,
-      port = port
-    ),
-    _ => String::new(),
   };
 
   let config_content = format!(
-    r#"[packages.test-app]
+    r#"[defaults]
+port = {port}
+connect_timeout = 5
+deploy_timeout = 30
+
+[packages.test-app]
 sources = [
   "{test1}",
   "{test2}",
 ]
-
-{host_remote}{default_remote}{fallback_remote}"#,
+{remote_block}"#,
+    port = port,
     test1 = toml_escape_path(&test1_path),
     test2 = toml_escape_path(&test2_path),
-    host_remote = host_remote_block,
-    default_remote = default_remote_block,
-    fallback_remote = fallback_remote_block,
+    remote_block = remote_block,
   );
 
-  let config_path = client_dir.join("client_config.toml");
+  let config_path = client_dir.join("adeploy.toml");
   fs::write(&config_path, config_content).expect("Failed to write client config file");
 
   if matches!(scenario, ClientScenarioKind::MissingSourceFile) {

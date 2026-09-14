@@ -6,6 +6,7 @@ pub mod config;
 pub mod deploy;
 pub mod deploy_log;
 pub mod error;
+pub mod init;
 pub mod server;
 
 // Include the generated gRPC code

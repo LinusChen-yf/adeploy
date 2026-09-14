@@ -9,9 +9,7 @@ use std::{
 
 use adeploy::{
   client,
-  config::{
-    ClientConfig, ConfigProvider, ConfigProviderImpl, ConfigType, KeyPairPaths, ServerConfig,
-  },
+  config::{ConfigProvider, ConfigProviderImpl, KeyPairPaths, ProjectConfig},
   error::Result as AdeployResult,
   server,
 };
@@ -19,41 +17,30 @@ use log2::*;
 use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
 
+/// Pins the provider to one `adeploy.toml`, bypassing the upward search so the
+/// client and the server can each be handed their own copy.
 #[derive(Clone)]
 struct ConfigProviderMock {
-  client_config_path: PathBuf,
-  server_config_path: PathBuf,
+  config_path: PathBuf,
   key_paths: KeyPairPaths,
 }
 
 impl ConfigProviderMock {
-  fn new(
-    client_config_path: PathBuf,
-    server_config_path: PathBuf,
-    key_paths: KeyPairPaths,
-  ) -> Self {
+  fn new(config_path: PathBuf, key_paths: KeyPairPaths) -> Self {
     Self {
-      client_config_path,
-      server_config_path,
+      config_path,
       key_paths,
     }
   }
 }
 
 impl ConfigProvider for ConfigProviderMock {
-  fn get_config_path(&self, config_type: ConfigType) -> AdeployResult<PathBuf> {
-    match config_type {
-      ConfigType::Client => Ok(self.client_config_path.clone()),
-      ConfigType::Server => Ok(self.server_config_path.clone()),
-    }
+  fn get_config_path(&self) -> AdeployResult<PathBuf> {
+    Ok(self.config_path.clone())
   }
 
-  fn load_client_config(&self, path: &Path) -> AdeployResult<ClientConfig> {
-    ConfigProviderImpl.load_client_config(path)
-  }
-
-  fn load_server_config(&self, path: &Path) -> AdeployResult<ServerConfig> {
-    ConfigProviderImpl.load_server_config(path)
+  fn load_project_config(&self, path: &Path) -> AdeployResult<ProjectConfig> {
+    ConfigProviderImpl::default().load_project_config(path)
   }
 
   fn get_key_paths(&self) -> AdeployResult<KeyPairPaths> {
@@ -167,13 +154,14 @@ fn resolve_expected_outcome(
     (HappyPath, UnauthorizedKey) => Some(CombinedOutcome::ServerError(
       "Client public key not allowed",
     )),
-    (MissingRemoteConfig, StandardSuccess) => Some(CombinedOutcome::ClientError(
-      "No server configuration found for host",
+    // A host without its own [remotes] entry inherits [defaults] and deploys.
+    (RemoteDefaultsFallback, StandardSuccess) => Some(CombinedOutcome::Success(
+      SuccessExpectation::new(true, true, true),
     )),
     (MissingSourceFile, StandardSuccess) => Some(CombinedOutcome::ClientError("Source path")),
-    (MissingKeyMaterial, StandardSuccess) => {
-      Some(CombinedOutcome::ClientError("Failed to load SSH key pair"))
-    }
+    (MissingKeyMaterial, StandardSuccess) => Some(CombinedOutcome::ClientError(
+      "Failed to load signing key pair",
+    )),
     (UnknownPackageName, StandardSuccess) => {
       Some(CombinedOutcome::ClientError("No packages found to deploy"))
     }
@@ -209,12 +197,14 @@ async fn run_case(case: &ScenarioCase) -> Result<(), String> {
   let client_config_path =
     client_scenarios::write_client_config(case.client_kind, &test_setup.client_dir, port);
 
-  let config_provider = build_config_provider(
-    case.client_kind,
-    &test_setup,
-    client_config_path,
-    server_config_path.clone(),
-  );
+  let client_provider = build_config_provider(case.client_kind, &test_setup, client_config_path);
+  let server_provider: Arc<dyn ConfigProvider> = Arc::new(ConfigProviderMock::new(
+    server_config_path,
+    KeyPairPaths::new(
+      test_setup.private_key_path.clone(),
+      test_setup.public_key_path.clone(),
+    ),
+  ));
 
   let requires_server_for_client_error = matches!(
     case.client_kind,
@@ -230,7 +220,6 @@ async fn run_case(case: &ScenarioCase) -> Result<(), String> {
 
   let mut server_handle = None;
   if should_start_server {
-    let server_provider = config_provider.clone();
     server_handle = Some(tokio::spawn(async move {
       let _ = server::start_server(server_provider).await;
     }));
@@ -241,7 +230,7 @@ async fn run_case(case: &ScenarioCase) -> Result<(), String> {
   let deploy_future = client::deploy(
     "127.0.0.1",
     Some(vec![package_name.to_string()]),
-    config_provider.as_ref(),
+    client_provider.as_ref(),
   );
   let deploy_result = timeout(DEPLOY_TIMEOUT, deploy_future)
     .await
@@ -295,7 +284,6 @@ fn build_config_provider(
   client_kind: ClientScenarioKind,
   test_setup: &TestSetup,
   client_config_path: PathBuf,
-  server_config_path: PathBuf,
 ) -> Arc<dyn ConfigProvider> {
   let key_paths = match client_kind {
     ClientScenarioKind::MissingKeyMaterial => KeyPairPaths::new(
@@ -308,11 +296,7 @@ fn build_config_provider(
     ),
   };
 
-  Arc::new(ConfigProviderMock::new(
-    client_config_path,
-    server_config_path,
-    key_paths,
-  ))
+  Arc::new(ConfigProviderMock::new(client_config_path, key_paths))
 }
 
 /// Test setup structure to hold all test resources

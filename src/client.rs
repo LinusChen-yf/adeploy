@@ -1,5 +1,6 @@
 use std::{
   convert::{TryFrom, TryInto},
+  path::PathBuf,
   time::Duration,
 };
 
@@ -13,14 +14,10 @@ use crate::{
     DeployRequest,
   },
   auth::Auth,
-  config::{
-    get_remote_config, ClientConfig, ClientPackageConfig, ConfigProvider, ConfigType, RemoteConfig,
-  },
+  config::{ConfigProvider, LoadedConfig, ResolvedRemote},
   deploy::DeployManager,
   error::{AdeployError, Result},
 };
-
-const DEFAULT_MAX_MESSAGE_SIZE: u64 = 100 * 1024 * 1024;
 
 /// Deploy specific packages using an explicit provider
 pub async fn deploy(
@@ -28,23 +25,23 @@ pub async fn deploy(
   package_names: Option<Vec<String>>,
   provider: &dyn ConfigProvider,
 ) -> Result<()> {
-  let config = load_client_configuration(provider)?;
-  let remote_config = resolve_remote_configuration(&config, host)?;
-  let max_file_size = resolved_max_file_size(remote_config);
-  let mut client = connect_deploy_client(host, remote_config).await?;
+  let loaded = provider.load()?;
+  info!("Loaded configuration from {}", loaded.path.display());
+
+  let remote = loaded.config.resolve_remote(host);
+  let mut client = connect_deploy_client(host, &remote).await?;
   let deploy_manager = DeployManager::new();
   let auth_resources = prepare_auth_resources(provider)?;
-  let packages_to_deploy = select_packages(&config, package_names)?;
+  let packages_to_deploy = select_packages(&loaded, package_names)?;
 
-  for (package_name, package_config) in packages_to_deploy {
+  for package in packages_to_deploy {
     deploy_single_package(
       &deploy_manager,
       &mut client,
       &auth_resources.ssh_auth,
       &auth_resources.public_key,
-      &package_name,
-      package_config,
-      max_file_size,
+      &package,
+      remote.max_file_size,
     )
     .await?;
   }
@@ -57,45 +54,29 @@ struct AuthResources {
   public_key: String,
 }
 
-fn load_client_configuration(provider: &dyn ConfigProvider) -> Result<ClientConfig> {
-  let config_path = provider.get_config_path(ConfigType::Client)?;
-  let config = provider.load_client_config(config_path.as_path())?;
-  info!(
-    "Loading client configuration from {}",
-    config_path.display()
-  );
-  Ok(config)
-}
-
-fn resolve_remote_configuration<'a>(
-  config: &'a ClientConfig,
-  host: &str,
-) -> Result<&'a RemoteConfig> {
-  get_remote_config(config, host).ok_or_else(|| {
-    Box::new(AdeployError::Config(format!(
-      "No server configuration found for host: {}",
-      host
-    )))
-  })
+/// A package selected for deployment, with its sources already resolved to
+/// absolute paths against the directory holding `adeploy.toml`.
+struct SelectedPackage {
+  name: String,
+  sources: Vec<PathBuf>,
 }
 
 async fn connect_deploy_client(
   host: &str,
-  remote_config: &RemoteConfig,
+  remote: &ResolvedRemote,
 ) -> Result<DeployServiceClient<Channel>> {
-  let actual_port = remote_config.port;
-  info!("Connecting to {}:{} for deployment", host, actual_port);
+  info!("Connecting to {}:{} for deployment", host, remote.port);
 
-  let endpoint_uri = format!("http://{}:{}", host, actual_port);
+  let endpoint_uri = format!("http://{}:{}", host, remote.port);
   let endpoint = Channel::from_shared(endpoint_uri)
     .map_err(|e| Box::new(AdeployError::Network(format!("Invalid endpoint: {}", e))))?;
-  let endpoint = configure_endpoint(endpoint, remote_config.timeout);
+  let endpoint = configure_endpoint(endpoint, remote);
   let channel = endpoint
     .connect()
     .await
     .map_err(|e| Box::new(AdeployError::Network(format!("Failed to connect: {}", e))))?;
 
-  let message_limit = clamp_message_limit(resolved_max_file_size(remote_config));
+  let message_limit = clamp_message_limit(remote.max_file_size);
   Ok(
     DeployServiceClient::new(channel)
       .max_decoding_message_size(message_limit)
@@ -110,7 +91,7 @@ fn prepare_auth_resources(provider: &dyn ConfigProvider) -> Result<AuthResources
 
   let keypair = Auth::load_key_pair(&private_key_path.to_string_lossy()).map_err(|e| {
     Box::new(AdeployError::Auth(format!(
-      "Failed to load SSH key pair: {}",
+      "Failed to load signing key pair: {}",
       e
     )))
   })?;
@@ -130,18 +111,23 @@ fn prepare_auth_resources(provider: &dyn ConfigProvider) -> Result<AuthResources
 }
 
 fn select_packages(
-  config: &ClientConfig,
+  loaded: &LoadedConfig,
   package_names: Option<Vec<String>>,
-) -> Result<Vec<(String, &ClientPackageConfig)>> {
+) -> Result<Vec<SelectedPackage>> {
   let Some(names) = package_names else {
     return Err(Box::new(AdeployError::Config(
       "No packages found to deploy".to_string(),
     )));
   };
 
-  let packages: Vec<_> = names
+  let packages: Vec<SelectedPackage> = names
     .into_iter()
-    .filter_map(|name| config.packages.get(&name).map(|pkg| (name, pkg)))
+    .filter_map(|name| {
+      loaded
+        .config
+        .resolved_sources(&name, &loaded.base_dir)
+        .map(|sources| SelectedPackage { name, sources })
+    })
     .collect();
 
   if packages.is_empty() {
@@ -158,14 +144,14 @@ async fn deploy_single_package(
   client: &mut DeployServiceClient<Channel>,
   ssh_auth: &Auth,
   public_key: &str,
-  package_name: &str,
-  package_config: &ClientPackageConfig,
+  package: &SelectedPackage,
   max_file_size: u64,
 ) -> Result<()> {
+  let package_name = package.name.as_str();
   info!("Deploying {}", package_name);
 
   let (archive_data, file_hash) = deploy_manager
-    .package_files(package_name, package_config)
+    .package_files(package_name, &package.sources)
     .await?;
 
   enforce_client_archive_size(&archive_data, max_file_size)?;
@@ -223,20 +209,23 @@ async fn deploy_single_package(
   }
 }
 
-fn configure_endpoint(endpoint: Endpoint, timeout_secs: u64) -> Endpoint {
-  if timeout_secs == 0 {
+/// Apply the connection and request deadlines separately.
+///
+/// A single timeout covering both made a slow upload indistinguishable from an
+/// unreachable host, and forced the connect deadline to be as generous as the
+/// slowest remote install.
+fn configure_endpoint(endpoint: Endpoint, remote: &ResolvedRemote) -> Endpoint {
+  let endpoint = if remote.connect_timeout == 0 {
     endpoint
   } else {
-    let timeout = Duration::from_secs(timeout_secs);
-    endpoint.connect_timeout(timeout).timeout(timeout)
-  }
-}
+    endpoint.connect_timeout(Duration::from_secs(remote.connect_timeout))
+  };
 
-fn resolved_max_file_size(config: &RemoteConfig) -> u64 {
-  config
-    .max_file_size
-    .filter(|value| *value > 0)
-    .unwrap_or(DEFAULT_MAX_MESSAGE_SIZE)
+  if remote.deploy_timeout == 0 {
+    endpoint
+  } else {
+    endpoint.timeout(Duration::from_secs(remote.deploy_timeout))
+  }
 }
 
 fn clamp_message_limit(limit: u64) -> usize {
