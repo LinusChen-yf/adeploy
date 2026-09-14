@@ -1,8 +1,24 @@
 use std::{convert::TryFrom, path::PathBuf, time::Duration};
 
+use async_stream::stream;
 use base64::{engine::general_purpose, Engine as _};
 use log2::*;
+use tokio_stream::Stream;
 use tonic::transport::{Channel, Endpoint};
+use uuid::Uuid;
+
+use crate::{
+  adeploy::{
+    deploy_chunk::Payload, deploy_event::Event, deploy_log::Level as DeployLogLevel,
+    deploy_service_client::DeployServiceClient, DeployChunk, DeployEvent, DeployLog, DeployResult,
+    DeployStart,
+  },
+  auth::{deploy_start_signing_payload, Auth},
+  config::{ConfigProvider, LoadedConfig, ResolvedRemote},
+  deploy::DeployManager,
+  error::{AdeployError, Result},
+  replay::now_ms,
+};
 
 /// Cap on the response, which carries only the server's deploy log.
 ///
@@ -10,16 +26,14 @@ use tonic::transport::{Channel, Endpoint};
 /// server's policy, and it reports its own limit when it refuses one.
 const MAX_RESPONSE_SIZE: usize = 16 * 1024 * 1024;
 
-use crate::{
-  adeploy::{
-    deploy_log::Level as DeployLogLevel, deploy_service_client::DeployServiceClient, DeployLog,
-    DeployRequest,
-  },
-  auth::Auth,
-  config::{ConfigProvider, LoadedConfig, ResolvedRemote},
-  deploy::DeployManager,
-  error::{AdeployError, Result},
-};
+/// Bytes per upload message.
+///
+/// Large enough that per-message overhead is negligible, small enough that
+/// neither end holds much of the archive at once and progress stays granular.
+const CHUNK_SIZE: usize = 1024 * 1024;
+
+/// Report upload progress at each multiple of this percentage.
+const PROGRESS_STEP: u64 = 20;
 
 /// Deploy specific packages using an explicit provider
 pub async fn deploy(
@@ -73,10 +87,12 @@ async fn connect_deploy_client(
   let endpoint = Channel::from_shared(endpoint_uri)
     .map_err(|e| Box::new(AdeployError::Network(format!("Invalid endpoint: {}", e))))?;
   let endpoint = configure_endpoint(endpoint, remote);
-  let channel = endpoint
-    .connect()
-    .await
-    .map_err(|e| Box::new(AdeployError::Network(format!("Failed to connect: {}", e))))?;
+  let channel = endpoint.connect().await.map_err(|e| {
+    Box::new(AdeployError::Network(format!(
+      "Failed to connect to {}:{}: {}",
+      host, remote.port, e
+    )))
+  })?;
 
   Ok(DeployServiceClient::new(channel).max_decoding_message_size(MAX_RESPONSE_SIZE))
 }
@@ -151,19 +167,10 @@ async fn deploy_single_package(
     .package_files(package_name, &package.sources)
     .await?;
 
-  let signature = ssh_auth
-    .sign_data(&archive_data)
-    .map_err(|e| Box::new(AdeployError::Auth(format!("Failed to sign data: {}", e))))?;
+  let start = build_start_message(ssh_auth, public_key, package_name, &archive_data, file_hash)?;
+  let total_size = start.total_size;
 
-  let mut request = tonic::Request::new(DeployRequest {
-    package_name: package_name.to_string(),
-    version: "1.0.0".to_string(),
-    file_data: archive_data,
-    file_hash,
-    signature: general_purpose::STANDARD.encode(&signature),
-    public_key: public_key.to_string(),
-    metadata: std::collections::HashMap::new(),
-  });
+  let mut request = tonic::Request::new(upload_stream(start, archive_data));
 
   // Send the deadline with the request rather than keeping it on the channel.
   // `Endpoint::timeout` is client-side only, so the server kept unpacking and
@@ -175,7 +182,7 @@ async fn deploy_single_package(
   }
 
   let response = match client.deploy(request).await {
-    Ok(resp) => resp,
+    Ok(response) => response,
     Err(status) => {
       if status.code() == tonic::Code::Unauthenticated {
         error!(
@@ -187,29 +194,127 @@ async fn deploy_single_package(
     }
   };
 
-  let deploy_response = response.into_inner();
+  consume_events(response.into_inner(), package_name, total_size).await
+}
 
-  if deploy_response.success {
-    info!(
-      "Deployment succeeded for {} (ID: {})",
-      package_name, deploy_response.deploy_id
-    );
-    for log_line in &deploy_response.logs {
-      log_deploy_server_entry(log_line);
+/// Describe and sign the upload that is about to start.
+fn build_start_message(
+  ssh_auth: &Auth,
+  public_key: &str,
+  package_name: &str,
+  archive_data: &[u8],
+  file_hash: String,
+) -> Result<DeployStart> {
+  let total_size = archive_data.len() as u64;
+  let nonce = Uuid::new_v4().to_string();
+  let timestamp_ms = now_ms();
+
+  // Signing the description rather than only the archive binds these bytes to
+  // this package, this size and this one-time nonce.
+  let payload = deploy_start_signing_payload(
+    package_name,
+    total_size,
+    &file_hash,
+    public_key,
+    &nonce,
+    timestamp_ms,
+  );
+  let signature = ssh_auth
+    .sign_data(&payload)
+    .map_err(|e| Box::new(AdeployError::Auth(format!("Failed to sign request: {}", e))))?;
+
+  Ok(DeployStart {
+    package_name: package_name.to_string(),
+    total_size,
+    file_hash,
+    public_key: public_key.to_string(),
+    nonce,
+    timestamp_ms,
+    signature: general_purpose::STANDARD.encode(&signature),
+  })
+}
+
+/// The opening message followed by the archive, split into chunks.
+fn upload_stream(
+  start: DeployStart,
+  archive_data: Vec<u8>,
+) -> impl Stream<Item = DeployChunk> + Send + 'static {
+  let total_size = start.total_size.max(1);
+
+  stream! {
+    yield DeployChunk { payload: Some(Payload::Start(start)) };
+
+    let mut offset = 0usize;
+    let mut next_report = PROGRESS_STEP;
+
+    while offset < archive_data.len() {
+      let end = (offset + CHUNK_SIZE).min(archive_data.len());
+      let chunk = archive_data[offset..end].to_vec();
+      offset = end;
+
+      yield DeployChunk { payload: Some(Payload::Data(chunk)) };
+
+      let percent = (offset as u64).saturating_mul(100) / total_size;
+      if percent >= next_report {
+        info!("Uploaded {}% ({}/{} bytes)", percent, offset, total_size);
+        while next_report <= percent {
+          next_report += PROGRESS_STEP;
+        }
+      }
     }
-    Ok(())
-  } else {
-    error!(
-      "Deployment failed for {}: {}",
-      package_name, deploy_response.message
-    );
-    for log_line in &deploy_response.logs {
-      log_deploy_server_entry(log_line);
+  }
+}
+
+/// Render the server's events as they arrive, and report the final outcome.
+async fn consume_events(
+  mut events: tonic::Streaming<DeployEvent>,
+  package_name: &str,
+  total_size: u64,
+) -> Result<()> {
+  let mut outcome: Option<DeployResult> = None;
+
+  loop {
+    let message = events
+      .message()
+      .await
+      .map_err(|status| Box::new(AdeployError::Grpc(status)))?;
+
+    let Some(event) = message else { break };
+
+    match event.event {
+      Some(Event::Accepted(accepted)) => {
+        info!(
+          "Server accepted {} ({} bytes), deploy ID {}",
+          package_name, total_size, accepted.deploy_id
+        );
+      }
+      Some(Event::Log(entry)) => log_deploy_server_entry(&entry),
+      Some(Event::Result(result)) => outcome = Some(result),
+      None => {}
     }
-    Err(Box::new(AdeployError::Deploy(format!(
-      "Package {} deployment failed: {}",
-      package_name, deploy_response.message
-    ))))
+  }
+
+  match outcome {
+    Some(result) if result.success => {
+      info!(
+        "Deployment succeeded for {} (ID: {})",
+        package_name, result.deploy_id
+      );
+      Ok(())
+    }
+    Some(result) => {
+      error!("Deployment failed for {}: {}", package_name, result.message);
+      Err(Box::new(AdeployError::Deploy(format!(
+        "Package {} deployment failed: {}",
+        package_name, result.message
+      ))))
+    }
+    // The stream ended without a verdict, which means the server went away
+    // mid-deployment rather than deciding anything.
+    None => Err(Box::new(AdeployError::Deploy(format!(
+      "Package {} deployment ended without a result from the server",
+      package_name
+    )))),
   }
 }
 

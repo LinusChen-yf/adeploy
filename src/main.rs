@@ -11,6 +11,7 @@ mod deploy;
 mod deploy_log;
 mod error;
 mod init;
+mod replay;
 mod server;
 use crate::{
   config::ConfigProvider,

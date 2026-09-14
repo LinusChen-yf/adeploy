@@ -175,6 +175,44 @@ impl Auth {
   }
 }
 
+/// Bytes signed by a `DeployStart`, and verified by the server.
+///
+/// Fields are length-prefixed so they cannot be confused with one another:
+/// without prefixes a package named `a` with hash `bc` would produce the same
+/// bytes as one named `ab` with hash `c`. The leading domain tag keeps a
+/// signature from also being valid for some future message that happens to
+/// serialise the same way.
+///
+/// Covering the description rather than only the archive bytes is what binds an
+/// upload to the package it was meant for: previously `package_name` was
+/// unsigned, so a captured request could be replayed against a different
+/// package's deploy path and hooks.
+pub fn deploy_start_signing_payload(
+  package_name: &str,
+  total_size: u64,
+  file_hash: &str,
+  public_key: &str,
+  nonce: &str,
+  timestamp_ms: i64,
+) -> Vec<u8> {
+  const DOMAIN: &[u8] = b"adeploy:deploy-start:v1";
+
+  let mut payload = Vec::with_capacity(DOMAIN.len() + 128);
+  payload.extend_from_slice(DOMAIN);
+  push_field(&mut payload, package_name.as_bytes());
+  payload.extend_from_slice(&total_size.to_le_bytes());
+  push_field(&mut payload, file_hash.as_bytes());
+  push_field(&mut payload, public_key.as_bytes());
+  push_field(&mut payload, nonce.as_bytes());
+  payload.extend_from_slice(&timestamp_ms.to_le_bytes());
+  payload
+}
+
+fn push_field(buf: &mut Vec<u8>, value: &[u8]) {
+  buf.extend_from_slice(&(value.len() as u64).to_le_bytes());
+  buf.extend_from_slice(value);
+}
+
 impl Default for Auth {
   fn default() -> Self {
     Self::new()

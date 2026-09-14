@@ -4,26 +4,70 @@ package adeploy;
 
 // Deploy service definition
 service DeployService {
-    rpc Deploy(DeployRequest) returns (DeployResponse);
+    // The client opens with a DeployStart describing what it wants to send and
+    // proving who it is, then streams the archive in chunks. The server answers
+    // with live progress and a final result.
+    //
+    // Splitting the description from the payload means the key check runs on a
+    // small message: an unauthorised caller never gets to send a byte of
+    // archive, and the server decides whether to accept a transfer before
+    // committing memory or disk to it.
+    rpc Deploy(stream DeployChunk) returns (stream DeployEvent);
 }
 
-// Deploy request message
-message DeployRequest {
+// One message in the upload stream.
+message DeployChunk {
+    oneof payload {
+        // Exactly the first message of the stream.
+        DeployStart start = 1;
+        // Every subsequent message: a slice of the archive, in order.
+        bytes data = 2;
+    }
+}
+
+// Opening message: what is about to be sent, and who is sending it.
+message DeployStart {
     string package_name = 1;
-    string version = 2;
-    bytes file_data = 3;
-    string file_hash = 4;  // SHA256 hash of file_data for verification
-    string signature = 5;
-    string public_key = 6;
-    map<string, string> metadata = 7;
+    // Size of the whole archive. Advisory: the server still counts what it
+    // actually receives and aborts a stream that exceeds this.
+    uint64 total_size = 2;
+    // SHA256 of the whole archive, verified once the last chunk arrives.
+    string file_hash = 3;
+    // Base64 Ed25519 public key of the client.
+    string public_key = 4;
+    // Random per-request value; the server refuses a nonce it has seen.
+    string nonce = 5;
+    // Unix milliseconds. Bounds how long a captured request stays replayable
+    // and lets the server forget old nonces.
+    int64 timestamp_ms = 6;
+    // Base64 Ed25519 signature over fields 1-6.
+    //
+    // Covering the description rather than only the bytes binds the archive to
+    // the package it was meant for, so a captured request cannot be replayed
+    // against a different package's path and hooks.
+    string signature = 7;
 }
 
-// Deploy response message
-message DeployResponse {
+// Server-to-client event stream.
+message DeployEvent {
+    oneof event {
+        // Sent once the opening message is accepted; the client starts sending.
+        DeployAccepted accepted = 1;
+        // Emitted as the deployment progresses, rather than batched at the end.
+        DeployLog log = 2;
+        // Final outcome, always the last event.
+        DeployResult result = 3;
+    }
+}
+
+message DeployAccepted {
+    string deploy_id = 1;
+}
+
+message DeployResult {
     bool success = 1;
     string message = 2;
     string deploy_id = 3;
-    repeated DeployLog logs = 4;
 }
 
 message DeployLog {
