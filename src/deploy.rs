@@ -12,7 +12,7 @@ use tokio::{process::Command, task::spawn_blocking};
 use uuid::Uuid;
 
 use crate::{
-  config::{ClientPackageConfig, ServerPackageConfig},
+  config::PackageConfig,
   deploy_log::DeployLogEntry,
   error::{AdeployError, Result},
 };
@@ -32,14 +32,18 @@ impl DeployManager {
   }
 
   /// Package files from sources with hash verification
+  ///
+  /// `sources` are already absolute: the caller resolved them against the
+  /// directory holding `adeploy.toml`, so packaging does not depend on the
+  /// working directory.
   pub async fn package_files(
     &self,
     package_name: &str,
-    config: &ClientPackageConfig,
+    sources: &[PathBuf],
   ) -> Result<(Vec<u8>, String)> {
     let package_name = package_name.to_string();
-    let config = config.clone();
-    spawn_blocking(move || Self::package_files_blocking(&package_name, &config))
+    let sources = sources.to_vec();
+    spawn_blocking(move || Self::package_files_blocking(&package_name, &sources))
       .await
       .map_err(|e| {
         Box::new(AdeployError::Deploy(format!(
@@ -49,24 +53,19 @@ impl DeployManager {
       })?
   }
 
-  fn package_files_blocking(
-    package_name: &str,
-    config: &ClientPackageConfig,
-  ) -> Result<(Vec<u8>, String)> {
-    info!("Packaging {} sources: {:?}", package_name, config.sources);
+  fn package_files_blocking(package_name: &str, sources: &[PathBuf]) -> Result<(Vec<u8>, String)> {
+    info!("Packaging {} sources: {:?}", package_name, sources);
 
     let mut archive = Vec::new();
     {
       let encoder = GzEncoder::new(&mut archive, Compression::default());
       let mut tar = Builder::new(encoder);
 
-      for source_path in &config.sources {
-        let path = Path::new(source_path);
-
+      for path in sources {
         if !path.exists() {
           return Err(Box::new(AdeployError::FileSystem(format!(
             "Source path '{}' does not exist",
-            source_path
+            path.display()
           ))));
         }
 
@@ -80,19 +79,21 @@ impl DeployManager {
           tar.append_path_with_name(path, file_name).map_err(|e| {
             Box::new(AdeployError::FileSystem(format!(
               "Failed to add file '{}' to archive: {}",
-              source_path, e
+              path.display(),
+              e
             )))
           })?;
-          info!("Archived file {}", source_path);
+          info!("Archived file {}", path.display());
         } else if path.is_dir() {
           tar.append_dir_all("", path).map_err(|e| {
             Box::new(AdeployError::FileSystem(format!(
               "Failed to add directory '{}' to archive: {}",
-              source_path, e
+              path.display(),
+              e
             )))
           })?;
 
-          info!("Archived directory {}", source_path);
+          info!("Archived directory {}", path.display());
         }
       }
 
@@ -118,14 +119,18 @@ impl DeployManager {
   }
 
   /// Extract and deploy files with hash verification
+  ///
+  /// `deploy_path` is the absolute directory resolved from the package's
+  /// `deploy_path` and the server's `deploy_root`.
   pub async fn extract_files(
     &self,
     archive_data: Vec<u8>,
     expected_hash: &str,
-    config: &ServerPackageConfig,
+    config: &PackageConfig,
     package_name: &str,
+    deploy_path: &Path,
   ) -> Result<()> {
-    info!("Extracting files into {}", config.deploy_path);
+    info!("Extracting files into {}", deploy_path.display());
     info!("Archive size: {} bytes", archive_data.len());
 
     let archive_data = self
@@ -134,23 +139,23 @@ impl DeployManager {
 
     if config.backup_enabled {
       info!("Creating backup snapshot");
-      self.create_backup(config, package_name).await?;
+      self
+        .create_backup(config, package_name, deploy_path)
+        .await?;
     }
 
-    self.ensure_deploy_directory(&config.deploy_path).await?;
+    self.ensure_deploy_directory(deploy_path).await?;
 
-    self
-      .unpack_archive(archive_data, &config.deploy_path)
-      .await?;
+    self.unpack_archive(archive_data, deploy_path).await?;
 
-    info!("Extraction complete: {}", config.deploy_path);
+    info!("Extraction complete: {}", deploy_path.display());
     Ok(())
   }
 
   /// Execute before-deployment script
   pub async fn execute_before_deploy_script(
     &self,
-    config: &ServerPackageConfig,
+    config: &PackageConfig,
   ) -> Result<Vec<DeployLogEntry>> {
     self
       .run_deploy_script(config.before_deploy_script.as_deref(), "Before-deploy")
@@ -160,7 +165,7 @@ impl DeployManager {
   /// Execute after-deployment script
   pub async fn execute_after_deploy_script(
     &self,
-    config: &ServerPackageConfig,
+    config: &PackageConfig,
   ) -> Result<Vec<DeployLogEntry>> {
     self
       .run_deploy_script(config.after_deploy_script.as_deref(), "After-deploy")
@@ -170,20 +175,7 @@ impl DeployManager {
   /// Execute a shell script
   async fn execute_script(&self, script_path: &str) -> Result<Vec<DeployLogEntry>> {
     // Get adeploy executable directory
-    let exe_dir = std::env::current_exe()
-      .map_err(|e| {
-        Box::new(AdeployError::Deploy(format!(
-          "Failed to get current executable path: {}",
-          e
-        )))
-      })?
-      .parent()
-      .ok_or_else(|| {
-        Box::new(AdeployError::Deploy(
-          "Failed to get parent directory of executable".to_string(),
-        ))
-      })?
-      .to_path_buf();
+    let exe_dir = executable_dir()?;
 
     info!(
       "Executing script in adeploy directory: {}",
@@ -241,7 +233,12 @@ impl DeployManager {
   }
 
   /// Create backup of existing deployment
-  async fn create_backup(&self, config: &ServerPackageConfig, package_name: &str) -> Result<()> {
+  async fn create_backup(
+    &self,
+    config: &PackageConfig,
+    package_name: &str,
+    deploy_path: &Path,
+  ) -> Result<()> {
     if !config.backup_enabled {
       warn!("Backup disabled for {}", package_name);
       return Ok(());
@@ -260,17 +257,19 @@ impl DeployManager {
     let backup_name = format!("backup_{}", self.start_time.format("%Y%m%d_%H%M%S"));
     let backup_full_path = backup_dir_path.join(backup_name);
 
-    self.copy_existing_deploy(config, &backup_full_path).await?;
+    self
+      .copy_existing_deploy(deploy_path, &backup_full_path)
+      .await?;
     self.log_backup_contents(&backup_full_path)?;
     Ok(())
   }
 
   /// Copy directory recursively
-  async fn copy_directory(&self, src: &str, dst: &str) -> Result<()> {
-    info!("Copying {} -> {}", src, dst);
+  async fn copy_directory(&self, src: &Path, dst: &Path) -> Result<()> {
+    info!("Copying {} -> {}", src.display(), dst.display());
 
-    let src_path = PathBuf::from(src);
-    let dst_path = PathBuf::from(dst);
+    let src_path = src.to_path_buf();
+    let dst_path = dst.to_path_buf();
 
     spawn_blocking(move || -> Result<()> {
       copy_dir_recursive(&src_path, &dst_path).map_err(|e| {
@@ -289,7 +288,7 @@ impl DeployManager {
       )))
     })??;
 
-    info!("Copied {} -> {}", src, dst);
+    info!("Copied {} -> {}", src.display(), dst.display());
     Ok(())
   }
 }
@@ -352,8 +351,8 @@ impl DeployManager {
     Ok(archive_data)
   }
 
-  async fn ensure_deploy_directory(&self, path: &str) -> Result<()> {
-    let deploy_path = PathBuf::from(path);
+  async fn ensure_deploy_directory(&self, path: &Path) -> Result<()> {
+    let deploy_path = path.to_path_buf();
     spawn_blocking(move || fs::create_dir_all(&deploy_path))
       .await
       .map_err(|e| {
@@ -371,8 +370,8 @@ impl DeployManager {
       })
   }
 
-  async fn unpack_archive(&self, archive_data: Vec<u8>, deploy_path: &str) -> Result<()> {
-    let deploy_path = deploy_path.to_string();
+  async fn unpack_archive(&self, archive_data: Vec<u8>, deploy_path: &Path) -> Result<()> {
+    let deploy_path = deploy_path.to_path_buf();
     spawn_blocking(move || -> Result<()> {
       let decoder = flate2::read::GzDecoder::new(&archive_data[..]);
       let mut archive = tar::Archive::new(decoder);
@@ -396,7 +395,7 @@ impl DeployManager {
 
   fn resolve_backup_directory(
     &self,
-    config: &ServerPackageConfig,
+    config: &PackageConfig,
     package_name: &str,
   ) -> Result<PathBuf> {
     match &config.backup_path {
@@ -404,39 +403,18 @@ impl DeployManager {
         info!("Using custom backup path {}", path);
         Ok(Path::new(path).to_path_buf())
       }
-      None => {
-        let current_exe = std::env::current_exe().map_err(|e| {
-          Box::new(AdeployError::FileSystem(format!(
-            "Failed to get current executable path: {}",
-            e
-          )))
-        })?;
-
-        let current_dir = current_exe.parent().ok_or_else(|| {
-          Box::new(AdeployError::FileSystem(
-            "Failed to get parent directory of executable".to_string(),
-          ))
-        })?;
-
-        Ok(current_dir.join(package_name))
-      }
+      None => Ok(executable_dir()?.join(package_name)),
     }
   }
 
-  async fn copy_existing_deploy(
-    &self,
-    config: &ServerPackageConfig,
-    backup_full_path: &Path,
-  ) -> Result<()> {
-    if Path::new(&config.deploy_path).exists() {
-      self
-        .copy_directory(&config.deploy_path, &backup_full_path.to_string_lossy())
-        .await?;
+  async fn copy_existing_deploy(&self, deploy_path: &Path, backup_full_path: &Path) -> Result<()> {
+    if deploy_path.exists() {
+      self.copy_directory(deploy_path, backup_full_path).await?;
       info!("Backup stored at {}", backup_full_path.display());
     } else {
       info!(
         "No existing deployment at {}; skipping backup",
-        config.deploy_path
+        deploy_path.display()
       );
     }
     Ok(())
@@ -451,6 +429,23 @@ impl DeployManager {
     }
     Ok(())
   }
+}
+
+fn executable_dir() -> Result<PathBuf> {
+  std::env::current_exe()
+    .map_err(|e| {
+      Box::new(AdeployError::Deploy(format!(
+        "Failed to get current executable path: {}",
+        e
+      )))
+    })?
+    .parent()
+    .map(Path::to_path_buf)
+    .ok_or_else(|| {
+      Box::new(AdeployError::Deploy(
+        "Failed to get parent directory of executable".to_string(),
+      ))
+    })
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {

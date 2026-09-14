@@ -10,6 +10,7 @@ mod config;
 mod deploy;
 mod deploy_log;
 mod error;
+mod init;
 mod server;
 use crate::error::{AdeployError, Result};
 
@@ -24,6 +25,10 @@ pub mod adeploy {
 struct Cli {
   #[command(subcommand)]
   command: Option<Commands>,
+
+  /// Path to adeploy.toml; skips the upward search from the working directory
+  #[arg(long, short = 'c', value_name = "PATH", global = true)]
+  config: Option<PathBuf>,
 
   /// Server host (when using default client mode)
   #[arg(value_name = "HOST")]
@@ -50,6 +55,12 @@ enum Commands {
     /// Package names to deploy
     #[arg(value_name = "PACKAGE", num_args = 1..)]
     packages: Vec<String>,
+  },
+  /// Write a starter adeploy.toml into the current directory
+  Init {
+    /// Overwrite an existing adeploy.toml
+    #[arg(long)]
+    force: bool,
   },
 }
 
@@ -137,6 +148,7 @@ fn initialize_logging(cli: &Cli) -> log2::Handle {
 fn run_cli(cli: Cli) -> Result<()> {
   let Cli {
     command,
+    config: config_override,
     host: default_host,
     packages: default_packages,
   } = cli;
@@ -144,11 +156,14 @@ fn run_cli(cli: Cli) -> Result<()> {
   match command {
     Some(Commands::Server { action }) => {
       let action = action.unwrap_or(ServerAction::Run(ServiceRunArgs::default()));
-      handle_server(action)?;
+      handle_server(action, config_override)?;
     }
     Some(Commands::Client { host, packages }) => {
       let runtime = build_runtime()?;
-      runtime.block_on(run_client_mode(&host, packages))?;
+      runtime.block_on(run_client_mode(&host, packages, config_override))?;
+    }
+    Some(Commands::Init { force }) => {
+      init::init_project_config(force)?;
     }
     None => {
       let Some(host) = default_host else {
@@ -161,15 +176,20 @@ fn run_cli(cli: Cli) -> Result<()> {
       }
 
       let runtime = build_runtime()?;
-      runtime.block_on(run_client_mode(&host, default_packages))?;
+      runtime.block_on(run_client_mode(&host, default_packages, config_override))?;
     }
   }
 
   Ok(())
 }
 
-async fn run_client_mode(host: &str, packages: Vec<String>) -> Result<()> {
-  let provider: Arc<dyn config::ConfigProvider> = Arc::new(config::ConfigProviderImpl);
+async fn run_client_mode(
+  host: &str,
+  packages: Vec<String>,
+  config_override: Option<PathBuf>,
+) -> Result<()> {
+  let provider: Arc<dyn config::ConfigProvider> =
+    Arc::new(config::ConfigProviderImpl::with_override(config_override));
 
   client::deploy(host, Some(packages), provider.as_ref()).await
 }
@@ -179,7 +199,8 @@ fn usage_error(message: &str) -> Box<AdeployError> {
     "{message}\n\
      Usage: adeploy <HOST> <PACKAGE> [PACKAGE...]\n\
      \x20  or: adeploy client <HOST> <PACKAGE> [PACKAGE...]\n\
-     \x20  or: adeploy server [run|install|start|stop|status|uninstall]"
+     \x20  or: adeploy server [run|install|start|stop|status|uninstall]\n\
+     \x20  or: adeploy init"
   )))
 }
 
@@ -194,10 +215,11 @@ fn build_runtime() -> Result<tokio::runtime::Runtime> {
     })
 }
 
-fn handle_server(action: ServerAction) -> Result<()> {
+fn handle_server(action: ServerAction, config_override: Option<PathBuf>) -> Result<()> {
   match action {
     ServerAction::Run(opts) => {
-      let provider: Arc<dyn config::ConfigProvider> = Arc::new(config::ConfigProviderImpl);
+      let provider: Arc<dyn config::ConfigProvider> =
+        Arc::new(config::ConfigProviderImpl::with_override(config_override));
       #[cfg(windows)]
       {
         let service_name = opts
