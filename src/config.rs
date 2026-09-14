@@ -69,19 +69,46 @@ pub trait ConfigProvider: Send + Sync {
   }
 }
 
-/// Default provider: searches upward from the working directory, then falls
-/// back to the directory holding the executable.
+/// How `ConfigProviderImpl` locates `adeploy.toml`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Discovery {
+  /// Walk up from the working directory, then fall back to the executable's
+  /// directory. Used by the client so a checkout carries its own config.
+  #[default]
+  Project,
+  /// Use the executable's directory only.
+  ///
+  /// The server must never adopt a project's configuration just because it was
+  /// started from inside a checkout, and the path has to be predictable so the
+  /// file can be created when it does not exist yet.
+  Server,
+}
+
+/// Default provider. Discovery depends on the mode it was built with.
 #[derive(Default, Clone)]
 pub struct ConfigProviderImpl {
   /// Explicit `--config` override; skips discovery entirely when set.
   override_path: Option<PathBuf>,
+  discovery: Discovery,
 }
 
 impl ConfigProviderImpl {
-  /// Pin the provider to an explicit configuration file.
+  /// Provider for client commands: upward search from the working directory.
   pub fn with_override(path: Option<PathBuf>) -> Self {
     Self {
       override_path: path,
+      discovery: Discovery::Project,
+    }
+  }
+
+  /// Provider for the server: the executable's own directory.
+  ///
+  /// The returned path is where the configuration belongs, whether or not it
+  /// exists; callers bootstrap it with `init::ensure_server_config`.
+  pub fn for_server(path: Option<PathBuf>) -> Self {
+    Self {
+      override_path: path,
+      discovery: Discovery::Server,
     }
   }
 }
@@ -89,13 +116,18 @@ impl ConfigProviderImpl {
 impl ConfigProvider for ConfigProviderImpl {
   fn get_config_path(&self) -> Result<PathBuf> {
     if let Some(path) = &self.override_path {
-      if !path.exists() {
+      // The server creates a missing file; a client has nothing to create.
+      if self.discovery == Discovery::Project && !path.exists() {
         return Err(Box::new(AdeployError::Config(format!(
           "Configuration file not found: {}",
           path.display()
         ))));
       }
       return Ok(path.clone());
+    }
+
+    if self.discovery == Discovery::Server {
+      return Ok(executable_dir()?.join(PROJECT_CONFIG_NAME));
     }
 
     // Walk up from the working directory so a repository checkout carries its
@@ -106,8 +138,7 @@ impl ConfigProvider for ConfigProviderImpl {
       }
     }
 
-    // Fall back to the executable's own directory, which is how a deployed
-    // server finds its configuration.
+    // Fall back to the executable's own directory.
     let exe_dir = executable_dir()?;
     let candidate = exe_dir.join(PROJECT_CONFIG_NAME);
     if candidate.exists() {
@@ -592,6 +623,33 @@ deploy_path = "/srv/demo"
   fn find_upwards_returns_none_when_absent() {
     let temp = TempDir::new().expect("temp dir");
     assert!(find_upwards(temp.path(), PROJECT_CONFIG_NAME).is_none());
+  }
+
+  #[test]
+  fn server_discovery_accepts_a_path_that_does_not_exist_yet() {
+    // The server creates its configuration, so a missing file is not an error
+    // the way it is for a client that has nothing to generate.
+    let temp = TempDir::new().expect("temp dir");
+    let missing = temp.path().join("adeploy.toml");
+
+    let resolved = ConfigProviderImpl::for_server(Some(missing.clone()))
+      .get_config_path()
+      .expect("server discovery must tolerate a missing file");
+    assert_eq!(resolved, missing);
+  }
+
+  #[test]
+  fn server_discovery_ignores_the_working_directory() {
+    // Starting the server from inside a project checkout must not make it adopt
+    // that project's configuration.
+    let resolved = ConfigProviderImpl::for_server(None)
+      .get_config_path()
+      .expect("server discovery should resolve");
+
+    assert_eq!(
+      resolved,
+      executable_dir().expect("exe dir").join(PROJECT_CONFIG_NAME)
+    );
   }
 
   #[test]

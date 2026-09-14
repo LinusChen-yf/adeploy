@@ -10,15 +10,28 @@ ADeploy is a lightweight Rust tool for deploying applications across platforms t
 - Optional pre/post deployment scripts and backups
 
 ## Quick Start
+
+On the target machine, the binary is the only thing you have to put there:
+
+```bash
+adeploy server install      # generates adeploy.toml and the deploy root
+adeploy server start
+```
+
+In the project you want to deploy:
+
 ```bash
 adeploy init                       # write a commented adeploy.toml here
-adeploy server                     # start the gRPC server
 adeploy <host> <pkg> [pkg...]      # deploy one or more packages
 adeploy --help                     # list available subcommands and flags
 ```
-Build with `cargo build` first if you do not already have the binary.
 
-`adeploy client <host> <pkg>` is the explicit spelling of the third line; both
+The first deployment is rejected until the client's key is authorized; the
+client prints the key to paste into the server's `allowed_keys`, and the server
+picks it up without a restart.
+
+Build with `cargo build` first if you do not already have the binary.
+`adeploy client <host> <pkg>` is the explicit spelling of the deploy line; both
 forms are equivalent.
 
 ### Running as a Service
@@ -68,8 +81,20 @@ deploy_timeout = 1800
 unresponsive host should fail in seconds, while an upload followed by an
 installer and a service restart may legitimately take minutes.
 
-Server-only settings live under `[server]` in the copy beside the server
-binary — `allowed_keys` (the base64 Ed25519 keys permitted to deploy, which the
-client prints when it is rejected) and `deploy_root` (the base directory that
-relative `deploy_path` values land under). The server reloads this file when it
-changes, so adding a key does not require a restart.
+### On the server
+
+The server generates its own `adeploy.toml` on first run (and during
+`adeploy server install`), creates its deploy root, and reports both at startup
+along with whether any client key is authorized yet. It never overwrites a file
+that already exists.
+
+It reads only the copy beside its own binary, never one found by searching
+upward — starting the server from inside a project checkout must not make it
+adopt that project's configuration. Use `--config <path>` to point it elsewhere.
+
+Server-only settings live under `[server]`: `allowed_keys` (the base64 Ed25519
+keys permitted to deploy, which the client prints when it is rejected) and
+`deploy_root` (the base directory that relative `deploy_path` values land
+under, defaulting to a `deploy` directory beside the binary). The server
+reloads this file when it changes, so adding a key does not require a
+restart.

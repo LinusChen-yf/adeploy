@@ -12,7 +12,10 @@ mod deploy_log;
 mod error;
 mod init;
 mod server;
-use crate::error::{AdeployError, Result};
+use crate::{
+  config::ConfigProvider,
+  error::{AdeployError, Result},
+};
 
 // Generated gRPC bindings
 pub mod adeploy {
@@ -219,7 +222,7 @@ fn handle_server(action: ServerAction, config_override: Option<PathBuf>) -> Resu
   match action {
     ServerAction::Run(opts) => {
       let provider: Arc<dyn config::ConfigProvider> =
-        Arc::new(config::ConfigProviderImpl::with_override(config_override));
+        Arc::new(config::ConfigProviderImpl::for_server(config_override));
       #[cfg(windows)]
       {
         let service_name = opts
@@ -237,6 +240,12 @@ fn handle_server(action: ServerAction, config_override: Option<PathBuf>) -> Resu
       runtime.block_on(server::start_server(provider))?;
     }
     ServerAction::Install(opts) => {
+      // Generate the configuration before registering the service, so the
+      // service starts into a usable state instead of failing on a missing file.
+      let config_path =
+        config::ConfigProviderImpl::for_server(config_override).get_config_path()?;
+      init::ensure_server_config(&config_path)?;
+
       server::install_service(
         &opts.label,
         opts.user,

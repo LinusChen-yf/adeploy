@@ -23,10 +23,11 @@ use crate::{
     DeployRequest, DeployResponse,
   },
   auth::Auth,
-  config::{executable_dir, ConfigProvider, PackageConfig, ProjectConfig},
+  config::{ConfigProvider, PackageConfig, ProjectConfig},
   deploy::DeployManager,
   deploy_log::{DeployLogEntry, LogLevel},
   error::{AdeployError, Result},
+  init,
 };
 
 const DEFAULT_MAX_MESSAGE_SIZE: u64 = 100 * 1024 * 1024;
@@ -65,7 +66,7 @@ impl DeployService for AdeployService {
       }
     };
 
-    let fallback_root = match executable_dir() {
+    let fallback_root = match init::default_deploy_root() {
       Ok(dir) => dir,
       Err(e) => {
         error!("Cannot determine the deploy root: {}", e);
@@ -312,14 +313,13 @@ where
   F: Future<Output = ()> + Send + 'static,
 {
   let config_path = provider.get_config_path()?;
+  let generated = init::ensure_server_config(&config_path)?;
   let config = provider.load_project_config(config_path.as_path())?;
 
   let port = config.defaults.port;
-  info!(
-    "Loaded configuration from {}; listening port {}",
-    config_path.display(),
-    port
-  );
+  let deploy_root = resolve_deploy_root(&config)?;
+  prepare_deploy_root(&deploy_root)?;
+  log_startup_state(&config_path, &config, &deploy_root, generated);
 
   let addr = format!("0.0.0.0:{}", port)
     .parse()
@@ -353,6 +353,63 @@ where
     .map_err(|e| Box::new(AdeployError::Network(format!("Server error: {}", e))))?;
 
   Ok(())
+}
+
+/// Directory that relative `deploy_path` values land under.
+fn resolve_deploy_root(config: &ProjectConfig) -> Result<PathBuf> {
+  match &config.server.deploy_root {
+    Some(root) => Ok(PathBuf::from(root)),
+    None => init::default_deploy_root(),
+  }
+}
+
+/// Create the deploy root up front so the first deployment does not fail on a
+/// missing directory, and so an operator can see where files will land.
+fn prepare_deploy_root(deploy_root: &Path) -> Result<()> {
+  std::fs::create_dir_all(deploy_root).map_err(|e| {
+    Box::new(AdeployError::FileSystem(format!(
+      "Failed to create deploy root {}: {}",
+      deploy_root.display(),
+      e
+    )))
+  })?;
+  Ok(())
+}
+
+/// Report what the server is about to do, and what it still needs.
+///
+/// Everything here was previously only discoverable by reading the config file,
+/// which a freshly installed server does not have until this run creates it.
+fn log_startup_state(
+  config_path: &Path,
+  config: &ProjectConfig,
+  deploy_root: &Path,
+  generated: bool,
+) {
+  if generated {
+    info!("First run: generated {}", config_path.display());
+  }
+  info!("Configuration: {}", config_path.display());
+  info!("Deploy root: {}", deploy_root.display());
+
+  if config.server.allowed_keys.is_empty() {
+    warn!(
+      "No client keys authorized yet. A deploying client will be rejected and will print its public key; add it to `allowed_keys` in {} (reloaded automatically).",
+      config_path.display()
+    );
+  } else {
+    info!(
+      "{} client key(s) authorized",
+      config.server.allowed_keys.len()
+    );
+  }
+
+  if config.packages.is_empty() {
+    warn!(
+      "No packages configured. Add a [packages.<name>] table to {}",
+      config_path.display()
+    );
+  }
 }
 
 fn resolve_message_limit(limit: u64) -> usize {
