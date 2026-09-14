@@ -1,12 +1,14 @@
-use std::{
-  convert::{TryFrom, TryInto},
-  path::PathBuf,
-  time::Duration,
-};
+use std::{convert::TryFrom, path::PathBuf, time::Duration};
 
 use base64::{engine::general_purpose, Engine as _};
 use log2::*;
 use tonic::transport::{Channel, Endpoint};
+
+/// Cap on the response, which carries only the server's deploy log.
+///
+/// The request has no client-side cap: how large an archive may be is the
+/// server's policy, and it reports its own limit when it refuses one.
+const MAX_RESPONSE_SIZE: usize = 16 * 1024 * 1024;
 
 use crate::{
   adeploy::{
@@ -41,7 +43,7 @@ pub async fn deploy(
       &auth_resources.ssh_auth,
       &auth_resources.public_key,
       &package,
-      remote.max_file_size,
+      remote.deploy_timeout,
     )
     .await?;
   }
@@ -76,12 +78,7 @@ async fn connect_deploy_client(
     .await
     .map_err(|e| Box::new(AdeployError::Network(format!("Failed to connect: {}", e))))?;
 
-  let message_limit = clamp_message_limit(remote.max_file_size);
-  Ok(
-    DeployServiceClient::new(channel)
-      .max_decoding_message_size(message_limit)
-      .max_encoding_message_size(message_limit),
-  )
+  Ok(DeployServiceClient::new(channel).max_decoding_message_size(MAX_RESPONSE_SIZE))
 }
 
 fn prepare_auth_resources(provider: &dyn ConfigProvider) -> Result<AuthResources> {
@@ -145,7 +142,7 @@ async fn deploy_single_package(
   ssh_auth: &Auth,
   public_key: &str,
   package: &SelectedPackage,
-  max_file_size: u64,
+  deploy_timeout: u64,
 ) -> Result<()> {
   let package_name = package.name.as_str();
   info!("Deploying {}", package_name);
@@ -154,13 +151,11 @@ async fn deploy_single_package(
     .package_files(package_name, &package.sources)
     .await?;
 
-  enforce_client_archive_size(&archive_data, max_file_size)?;
-
   let signature = ssh_auth
     .sign_data(&archive_data)
     .map_err(|e| Box::new(AdeployError::Auth(format!("Failed to sign data: {}", e))))?;
 
-  let request = tonic::Request::new(DeployRequest {
+  let mut request = tonic::Request::new(DeployRequest {
     package_name: package_name.to_string(),
     version: "1.0.0".to_string(),
     file_data: archive_data,
@@ -169,6 +164,15 @@ async fn deploy_single_package(
     public_key: public_key.to_string(),
     metadata: std::collections::HashMap::new(),
   });
+
+  // Send the deadline with the request rather than keeping it on the channel.
+  // `Endpoint::timeout` is client-side only, so the server kept unpacking and
+  // running hooks after the client had already given up. The `grpc-timeout`
+  // metadata this sets is honoured by tonic on both ends, so the two stop
+  // together and cannot disagree about when.
+  if deploy_timeout > 0 {
+    request.set_timeout(Duration::from_secs(deploy_timeout));
+  }
 
   let response = match client.deploy(request).await {
     Ok(resp) => resp,
@@ -209,43 +213,16 @@ async fn deploy_single_package(
   }
 }
 
-/// Apply the connection and request deadlines separately.
+/// Bound only how long reaching the host may take.
 ///
-/// A single timeout covering both made a slow upload indistinguishable from an
-/// unreachable host, and forced the connect deadline to be as generous as the
-/// slowest remote install.
+/// The deployment deadline rides on the request instead, so the server learns
+/// about it too.
 fn configure_endpoint(endpoint: Endpoint, remote: &ResolvedRemote) -> Endpoint {
-  let endpoint = if remote.connect_timeout == 0 {
+  if remote.connect_timeout == 0 {
     endpoint
   } else {
     endpoint.connect_timeout(Duration::from_secs(remote.connect_timeout))
-  };
-
-  if remote.deploy_timeout == 0 {
-    endpoint
-  } else {
-    endpoint.timeout(Duration::from_secs(remote.deploy_timeout))
   }
-}
-
-fn clamp_message_limit(limit: u64) -> usize {
-  limit
-    .min(usize::MAX as u64)
-    .try_into()
-    .unwrap_or(usize::MAX)
-}
-
-fn enforce_client_archive_size(data: &[u8], limit: u64) -> Result<()> {
-  if limit > 0 {
-    let archive_size = data.len() as u64;
-    if archive_size > limit {
-      return Err(Box::new(AdeployError::Deploy(format!(
-        "Archive size {} exceeds configured max_file_size {}",
-        archive_size, limit
-      ))));
-    }
-  }
-  Ok(())
 }
 
 fn log_deploy_server_entry(entry: &DeployLog) {

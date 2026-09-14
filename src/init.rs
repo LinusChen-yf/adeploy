@@ -6,7 +6,7 @@ use std::{
 use log2::*;
 
 use crate::{
-  config::{executable_dir, Defaults, PROJECT_CONFIG_NAME},
+  config::{executable_dir, ServerSettings, PROJECT_CONFIG_NAME},
   error::{AdeployError, Result},
 };
 
@@ -21,17 +21,20 @@ const TEMPLATE: &str = r#"# adeploy configuration.
 # anywhere inside the checkout. Relative paths below resolve against the
 # directory holding this file, never against the working directory.
 
+# How this client reaches a server. The server reads none of it: the client is
+# the one dialling, so the port and both timeouts belong here.
 [defaults]
-# gRPC port. The server listens on it, the client dials it.
+# Port to dial. Must match the server's [server].listen_port.
 port = 6060
 # Seconds allowed to establish the connection. 0 disables the limit.
 connect_timeout = 5
 # Seconds allowed for the upload plus everything the server does afterwards:
 # unpacking, backups and both hook scripts. Installers and service restarts are
 # slow, so keep this far larger than connect_timeout. 0 disables the limit.
+#
+# Travels with the request as its gRPC deadline, so the server stops at the same
+# moment rather than working on after the client has given up.
 deploy_timeout = 600
-# Largest archive accepted, in bytes. Enforced on both ends. Default 100 MiB.
-max_file_size = 104857600
 
 # A package describes both halves of a deployment: what the client archives and
 # what the server does with it. Rename "demo" to suit, and add more tables for
@@ -61,12 +64,11 @@ backup_enabled = true
 # deploy_timeout = 1800
 
 # Server-local settings. A project checkout leaves this out entirely; it belongs
-# to the copy of this file sitting beside the server binary.
+# to the copy of this file beside the server binary, which generates its own.
 # [server]
-# Base64 Ed25519 public keys allowed to deploy here. The client prints its own
-# key when the server rejects it.
+# listen_port = 6060
+# max_file_size = 104857600
 # allowed_keys = []
-# Root for package deploy_path values that are relative.
 # deploy_root = "/opt"
 "#;
 
@@ -80,14 +82,18 @@ const SERVER_TEMPLATE: &str = r#"# adeploy server configuration, generated on fi
 #
 # This file belongs to this machine, not to any project. It is reloaded
 # automatically when it changes, so edits take effect without a restart.
-
-[defaults]
-# Port this server listens on. Changing it requires a restart.
-port = {port}
-# Largest archive accepted, in bytes. Default 100 MiB.
-max_file_size = {max_file_size}
+#
+# Only [server] is read here. A deploying client brings its own port and
+# timeouts, and nothing a client sends may decide what this server enforces.
 
 [server]
+# Port to bind. Clients must dial this same port. Changing it needs a restart.
+listen_port = {port}
+# Largest archive accepted, in bytes. Default 100 MiB.
+#
+# A request is decoded before the handler that checks allowed_keys runs, so this
+# also bounds what an unauthenticated caller can make this server buffer.
+max_file_size = {max_file_size}
 # Base64 Ed25519 public keys allowed to deploy here. A client that is not
 # listed is rejected and prints its own key, ready to be pasted in below.
 allowed_keys = []
@@ -123,10 +129,10 @@ pub fn ensure_server_config(path: &Path) -> Result<bool> {
     })?;
   }
 
-  let defaults = Defaults::default();
+  let settings = ServerSettings::default();
   let content = SERVER_TEMPLATE
-    .replace("{port}", &defaults.port.to_string())
-    .replace("{max_file_size}", &defaults.max_file_size.to_string())
+    .replace("{port}", &settings.listen_port.to_string())
+    .replace("{max_file_size}", &settings.max_file_size.to_string())
     .replace("{deploy_root}", &toml_string(&default_deploy_root()?));
 
   fs::write(path, content).map_err(|e| {
@@ -208,7 +214,13 @@ mod tests {
     let text = std::fs::read_to_string(&path).expect("generated file should be readable");
     let config: ProjectConfig = toml::from_str(&text).expect("generated config must parse");
 
-    assert_eq!(config.defaults.port, 6060);
+    assert_eq!(config.server.listen_port, 6060);
+    assert_eq!(config.server.max_file_size, 100 * 1024 * 1024);
+    // The server template carries no client settings at all.
+    assert!(
+      !text.contains("[defaults]"),
+      "the server never reads [defaults], so it must not be generated"
+    );
     // Empty on purpose: the key does not exist until a client first runs.
     assert!(config.server.allowed_keys.is_empty());
     // A concrete root is written so deployments do not depend on the implicit
@@ -279,10 +291,6 @@ mod tests {
     assert_eq!(
       from_template.defaults.deploy_timeout,
       from_empty.defaults.deploy_timeout
-    );
-    assert_eq!(
-      from_template.defaults.max_file_size,
-      from_empty.defaults.max_file_size
     );
   }
 }

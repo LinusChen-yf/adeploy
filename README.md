@@ -62,10 +62,9 @@ committed configuration behave identically on every machine.
 
 ```toml
 [defaults]
-port = 6060            # the server listens here, the client dials it
+port = 6060            # port to dial; must match the server's listen_port
 connect_timeout = 5    # seconds to establish the connection
 deploy_timeout = 600   # seconds for upload plus everything the server does
-max_file_size = 104857600
 
 [packages.demo]
 sources = ["./dist/demo"]   # client: what to archive
@@ -77,9 +76,20 @@ backup_enabled = true
 deploy_timeout = 1800
 ```
 
+`[defaults]` and `[remotes.*]` describe how *this client* reaches a server, and
+the server reads neither. That separation is load-bearing: a project's
+configuration travels to the server along with its packages, so nothing a client
+sends may decide what the server enforces. Server policy lives in `[server]`,
+and the parser rejects it anywhere else.
+
 `connect_timeout` and `deploy_timeout` are deliberately separate: reaching an
 unresponsive host should fail in seconds, while an upload followed by an
 installer and a service restart may legitimately take minutes.
+
+`deploy_timeout` travels with the request as its gRPC deadline, so the server
+stops at the same moment the client does. Without it the server carried on
+unpacking and running hooks after the client had already reported a timeout,
+writing files that nobody was waiting for.
 
 ### On the server
 
@@ -92,9 +102,20 @@ It reads only the copy beside its own binary, never one found by searching
 upward — starting the server from inside a project checkout must not make it
 adopt that project's configuration. Use `--config <path>` to point it elsewhere.
 
-Server-only settings live under `[server]`: `allowed_keys` (the base64 Ed25519
-keys permitted to deploy, which the client prints when it is rejected) and
-`deploy_root` (the base directory that relative `deploy_path` values land
-under, defaulting to a `deploy` directory beside the binary). The server
-reloads this file when it changes, so adding a key does not require a
-restart.
+Server-only settings live under `[server]`:
+
+- `listen_port` — the port to bind. Clients dial it through their own `port`;
+  the two are separate fields because they are separate decisions that merely
+  share a default. Changing it requires a restart.
+- `max_file_size` — the largest archive this server accepts. It is the only
+  limit: the client does not pre-check, so the server's answer is the only one.
+  It also bounds what an unauthenticated caller can make the server buffer,
+  because a request is decoded before the handler that checks `allowed_keys`
+  runs.
+- `allowed_keys` — the base64 Ed25519 keys permitted to deploy, which the
+  client prints when it is rejected.
+- `deploy_root` — the base directory that relative `deploy_path` values land
+  under, defaulting to a `deploy` directory beside the binary.
+
+The server reloads this file when it changes, so adding a key does not require
+a restart.
