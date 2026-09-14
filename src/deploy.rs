@@ -156,8 +156,9 @@ impl DeployManager {
     sink
       .info(format!("Extracting files into {}", deploy_path.display()))
       .await;
-    self.ensure_deploy_directory(deploy_path).await?;
-    self.unpack_archive(archive_path, deploy_path).await?;
+    self
+      .swap_into_place(archive_path, deploy_path, config.clean_deploy)
+      .await?;
 
     info!("Extraction complete: {}", deploy_path.display());
     sink.info("Extraction complete").await;
@@ -431,58 +432,33 @@ impl DeployManager {
     Ok(())
   }
 
-  async fn ensure_deploy_directory(&self, path: &Path) -> Result<()> {
-    let deploy_path = path.to_path_buf();
-    spawn_blocking(move || fs::create_dir_all(&deploy_path))
+  /// Build the new deployment beside the old one, then swap it in.
+  ///
+  /// Unpacking straight over `deploy_path` meant a failure part way through
+  /// left a directory that was neither the old deployment nor the new one, and
+  /// a running service could read half-replaced files for as long as the
+  /// extraction took. The new tree is assembled under a sibling name and moved
+  /// into place with a rename, so the only moment anything is inconsistent is
+  /// the gap between two renames.
+  async fn swap_into_place(
+    &self,
+    archive_path: &Path,
+    deploy_path: &Path,
+    clean: bool,
+  ) -> Result<()> {
+    let archive_path = archive_path.to_path_buf();
+    let deploy_path = deploy_path.to_path_buf();
+    // Enough to tell concurrent deployments apart without unwieldy names.
+    let suffix: String = self.deploy_id.chars().take(8).collect();
+
+    spawn_blocking(move || swap_into_place_blocking(&archive_path, &deploy_path, clean, &suffix))
       .await
       .map_err(|e| {
-        Box::new(AdeployError::FileSystem(format!(
-          "Deploy directory task failed: {}",
+        Box::new(AdeployError::Deploy(format!(
+          "Archive extraction task failed: {}",
           e
         )))
       })?
-      .map_err(|e| {
-        error!("Failed to create deploy directory: {}", e);
-        Box::new(AdeployError::FileSystem(format!(
-          "Failed to create deploy directory: {}",
-          e
-        )))
-      })
-  }
-
-  /// Decompress a staged archive straight from disk.
-  async fn unpack_archive(&self, archive_path: &Path, deploy_path: &Path) -> Result<()> {
-    let archive_path = archive_path.to_path_buf();
-    let deploy_path = deploy_path.to_path_buf();
-
-    spawn_blocking(move || -> Result<()> {
-      let file = fs::File::open(&archive_path).map_err(|e| {
-        Box::new(AdeployError::FileSystem(format!(
-          "Failed to open staged archive {}: {}",
-          archive_path.display(),
-          e
-        )))
-      })?;
-
-      let reader = io::BufReader::with_capacity(STREAM_BUFFER_SIZE, file);
-      let decoder = flate2::read::GzDecoder::new(reader);
-      let mut archive = tar::Archive::new(decoder);
-      archive.unpack(&deploy_path).map_err(|e| {
-        Box::new(AdeployError::Deploy(format!(
-          "Failed to extract archive: {}",
-          e
-        )))
-      })?;
-      Ok(())
-    })
-    .await
-    .map_err(|e| {
-      Box::new(AdeployError::Deploy(format!(
-        "Archive extraction task failed: {}",
-        e
-      )))
-    })??;
-    Ok(())
   }
 
   fn resolve_backup_directory(
@@ -520,6 +496,146 @@ impl DeployManager {
       }
     }
     Ok(())
+  }
+}
+
+/// Assemble the new tree, then move it over the old one.
+fn swap_into_place_blocking(
+  archive_path: &Path,
+  deploy_path: &Path,
+  clean: bool,
+  suffix: &str,
+) -> Result<()> {
+  // Siblings rather than a shared staging directory: `rename` cannot cross
+  // filesystems, and a sibling is on the same one by construction.
+  let incoming = sibling_path(deploy_path, "incoming", suffix)?;
+  let previous = sibling_path(deploy_path, "previous", suffix)?;
+
+  if let Some(parent) = deploy_path.parent() {
+    fs::create_dir_all(parent).map_err(|e| {
+      Box::new(AdeployError::FileSystem(format!(
+        "Failed to create {}: {}",
+        parent.display(),
+        e
+      )))
+    })?;
+  }
+
+  // Anything left by a crashed run would otherwise merge into this deployment.
+  remove_directory(&incoming)?;
+  fs::create_dir_all(&incoming).map_err(|e| {
+    Box::new(AdeployError::FileSystem(format!(
+      "Failed to create {}: {}",
+      incoming.display(),
+      e
+    )))
+  })?;
+
+  let assembled = (|| -> Result<()> {
+    if !clean && deploy_path.exists() {
+      // Merge semantics: start from what is there so files the package does
+      // not ship survive, then let the archive overwrite what it does.
+      copy_dir_recursive(deploy_path, &incoming).map_err(|e| {
+        Box::new(AdeployError::FileSystem(format!(
+          "Failed to seed the new deployment from {}: {}",
+          deploy_path.display(),
+          e
+        )))
+      })?;
+    }
+    unpack_archive_into(archive_path, &incoming)
+  })();
+
+  if let Err(e) = assembled {
+    // The live directory has not been touched yet, so there is nothing to undo.
+    let _ = remove_directory(&incoming);
+    return Err(e);
+  }
+
+  let had_existing = deploy_path.exists();
+  if had_existing {
+    fs::rename(deploy_path, &previous).map_err(|e| {
+      let _ = remove_directory(&incoming);
+      Box::new(AdeployError::FileSystem(format!(
+        "Failed to move the existing deployment aside: {}",
+        e
+      )))
+    })?;
+  }
+
+  if let Err(e) = fs::rename(&incoming, deploy_path) {
+    // Put the old deployment back rather than leaving nothing in its place.
+    if had_existing {
+      if let Err(restore) = fs::rename(&previous, deploy_path) {
+        error!(
+          "Failed to restore the previous deployment from {}: {}",
+          previous.display(),
+          restore
+        );
+      }
+    }
+    let _ = remove_directory(&incoming);
+    return Err(Box::new(AdeployError::FileSystem(format!(
+      "Failed to move the new deployment into place: {}",
+      e
+    ))));
+  }
+
+  // The deployment is live at this point, so a cleanup failure is worth
+  // reporting but not worth failing over.
+  if had_existing {
+    if let Err(e) = remove_directory(&previous) {
+      warn!("Failed to remove {}: {}", previous.display(), e);
+    }
+  }
+
+  Ok(())
+}
+
+/// Decompress a staged archive straight from disk into `target`.
+fn unpack_archive_into(archive_path: &Path, target: &Path) -> Result<()> {
+  let file = fs::File::open(archive_path).map_err(|e| {
+    Box::new(AdeployError::FileSystem(format!(
+      "Failed to open staged archive {}: {}",
+      archive_path.display(),
+      e
+    )))
+  })?;
+
+  let reader = io::BufReader::with_capacity(STREAM_BUFFER_SIZE, file);
+  let decoder = flate2::read::GzDecoder::new(reader);
+  let mut archive = tar::Archive::new(decoder);
+  archive.unpack(target).map_err(|e| {
+    Box::new(AdeployError::Deploy(format!(
+      "Failed to extract archive: {}",
+      e
+    )))
+  })?;
+  Ok(())
+}
+
+/// A working directory next to `deploy_path`, on the same filesystem.
+fn sibling_path(deploy_path: &Path, tag: &str, suffix: &str) -> Result<PathBuf> {
+  let name = deploy_path.file_name().ok_or_else(|| {
+    Box::new(AdeployError::FileSystem(format!(
+      "Deploy path {} has no directory name to work beside",
+      deploy_path.display()
+    )))
+  })?;
+
+  Ok(deploy_path.with_file_name(format!("{}.{}-{}", name.to_string_lossy(), tag, suffix)))
+}
+
+/// Remove a directory if it is there, treating absence as success.
+fn remove_directory(path: &Path) -> Result<()> {
+  match fs::remove_dir_all(path) {
+    Ok(()) => Ok(()),
+    Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+    Err(e) => Err(Box::new(AdeployError::FileSystem(format!(
+      "Failed to remove {}: {}",
+      path.display(),
+      e
+    )))),
   }
 }
 
@@ -566,5 +682,157 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
 impl Default for DeployManager {
   fn default() -> Self {
     Self::new()
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use tempfile::TempDir;
+
+  use super::*;
+
+  /// A real tar.gz containing one file, built the way the client would.
+  fn archive_with(dir: &Path, name: &str, contents: &str) -> PathBuf {
+    let source = dir.join("sources");
+    fs::create_dir_all(&source).expect("source dir");
+    fs::write(source.join(name), contents).expect("source file");
+
+    let (bytes, _) =
+      DeployManager::package_files_blocking("demo", &[source]).expect("build archive");
+    let path = dir.join("archive.tar.gz");
+    fs::write(&path, bytes).expect("write archive");
+    path
+  }
+
+  /// Working directories must never outlive the deployment that made them.
+  fn siblings_of(deploy_path: &Path) -> Vec<String> {
+    let parent = deploy_path.parent().expect("parent");
+    let prefix = format!("{}.", deploy_path.file_name().unwrap().to_string_lossy());
+    fs::read_dir(parent)
+      .expect("read parent")
+      .filter_map(|entry| entry.ok())
+      .map(|entry| entry.file_name().to_string_lossy().to_string())
+      .filter(|name| name.starts_with(&prefix))
+      .collect()
+  }
+
+  #[test]
+  fn it_deploys_into_a_directory_that_does_not_exist_yet() {
+    let temp = TempDir::new().expect("temp dir");
+    let archive = archive_with(temp.path(), "app.txt", "v1");
+    let deploy_path = temp.path().join("live");
+
+    swap_into_place_blocking(&archive, &deploy_path, false, "abcd1234").expect("deploy");
+
+    assert_eq!(
+      fs::read_to_string(deploy_path.join("app.txt")).expect("read"),
+      "v1"
+    );
+    assert!(siblings_of(&deploy_path).is_empty());
+  }
+
+  #[test]
+  fn a_second_deployment_replaces_the_first() {
+    let temp = TempDir::new().expect("temp dir");
+    let deploy_path = temp.path().join("live");
+
+    let first = archive_with(&temp.path().join("one"), "app.txt", "v1");
+    swap_into_place_blocking(&first, &deploy_path, false, "1111").expect("first deploy");
+
+    let second = archive_with(&temp.path().join("two"), "app.txt", "v2");
+    swap_into_place_blocking(&second, &deploy_path, false, "2222").expect("second deploy");
+
+    assert_eq!(
+      fs::read_to_string(deploy_path.join("app.txt")).expect("read"),
+      "v2"
+    );
+    assert!(siblings_of(&deploy_path).is_empty());
+  }
+
+  #[test]
+  fn merging_keeps_files_the_package_does_not_ship() {
+    let temp = TempDir::new().expect("temp dir");
+    let deploy_path = temp.path().join("live");
+    fs::create_dir_all(&deploy_path).expect("deploy dir");
+    // Something the deployment did not put there: uploads, logs, a database.
+    fs::write(deploy_path.join("runtime.db"), "keep me").expect("runtime file");
+
+    let archive = archive_with(temp.path(), "app.txt", "v1");
+    swap_into_place_blocking(&archive, &deploy_path, false, "abcd").expect("deploy");
+
+    assert_eq!(
+      fs::read_to_string(deploy_path.join("runtime.db")).expect("read"),
+      "keep me",
+      "the default must not wipe files the package does not ship"
+    );
+    assert!(deploy_path.join("app.txt").exists());
+  }
+
+  #[test]
+  fn cleaning_removes_files_the_package_no_longer_ships() {
+    let temp = TempDir::new().expect("temp dir");
+    let deploy_path = temp.path().join("live");
+    fs::create_dir_all(&deploy_path).expect("deploy dir");
+    fs::write(deploy_path.join("stale.dll"), "old version").expect("stale file");
+
+    let archive = archive_with(temp.path(), "app.txt", "v1");
+    swap_into_place_blocking(&archive, &deploy_path, true, "abcd").expect("deploy");
+
+    assert!(
+      !deploy_path.join("stale.dll").exists(),
+      "clean_deploy must leave only what the package ships"
+    );
+    assert!(deploy_path.join("app.txt").exists());
+  }
+
+  #[test]
+  fn a_failed_extraction_leaves_the_live_deployment_untouched() {
+    let temp = TempDir::new().expect("temp dir");
+    let deploy_path = temp.path().join("live");
+
+    let good = archive_with(&temp.path().join("one"), "app.txt", "v1");
+    swap_into_place_blocking(&good, &deploy_path, false, "1111").expect("first deploy");
+
+    // Not a gzip stream. Its hash is whatever it is, so this stands in for an
+    // archive that passed verification and still cannot be read.
+    let corrupt = temp.path().join("corrupt.tar.gz");
+    fs::write(&corrupt, vec![0x42u8; 4096]).expect("write corrupt archive");
+
+    let failure = swap_into_place_blocking(&corrupt, &deploy_path, false, "2222")
+      .expect_err("a corrupt archive must fail");
+    assert!(
+      failure.to_string().contains("extract"),
+      "the error should say extraction failed, got: {failure}"
+    );
+
+    assert_eq!(
+      fs::read_to_string(deploy_path.join("app.txt")).expect("read"),
+      "v1",
+      "the previous deployment must survive a failed one intact"
+    );
+    assert!(
+      siblings_of(&deploy_path).is_empty(),
+      "a failed deployment must not leave working directories behind"
+    );
+  }
+
+  #[test]
+  fn leftovers_from_a_crashed_run_do_not_merge_into_the_next_one() {
+    let temp = TempDir::new().expect("temp dir");
+    let deploy_path = temp.path().join("live");
+
+    // What a process killed mid-deployment would leave behind.
+    let stranded = sibling_path(&deploy_path, "incoming", "abcd").expect("sibling");
+    fs::create_dir_all(&stranded).expect("stranded dir");
+    fs::write(stranded.join("garbage.txt"), "from a crash").expect("stranded file");
+
+    let archive = archive_with(temp.path(), "app.txt", "v1");
+    swap_into_place_blocking(&archive, &deploy_path, false, "abcd").expect("deploy");
+
+    assert!(
+      !deploy_path.join("garbage.txt").exists(),
+      "a stale working directory must be cleared, not reused"
+    );
+    assert!(deploy_path.join("app.txt").exists());
   }
 }
