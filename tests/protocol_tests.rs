@@ -26,8 +26,10 @@ use adeploy::{
 use base64::{engine::general_purpose, Engine as _};
 use ed25519_dalek::SigningKey;
 use tempfile::TempDir;
-use tokio::{net::TcpListener, time::sleep};
+use tokio::time::sleep;
 use tonic::transport::Channel;
+
+mod common;
 
 const PACKAGE: &str = "test-app";
 
@@ -101,7 +103,7 @@ impl Harness {
       .await
       .expect("package sources");
 
-    let port = free_port().await;
+    let port = common::find_available_port().await;
     let deploy_root = root.join("root");
     let config_path = root.join("adeploy.toml");
     let paired_path = root.join("paired.toml");
@@ -295,15 +297,6 @@ deploy_path = "{PACKAGE}"
     }
     Ok(success)
   }
-}
-
-async fn free_port() -> u16 {
-  TcpListener::bind("127.0.0.1:0")
-    .await
-    .expect("bind")
-    .local_addr()
-    .expect("addr")
-    .port()
 }
 
 #[tokio::test]

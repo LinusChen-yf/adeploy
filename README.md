@@ -23,10 +23,25 @@ In the project you want to deploy:
 
 ```bash
 adeploy init                       # write a commented adeploy.toml here
+adeploy list                       # what this project declares
 adeploy pair <host>                # ask the server to trust this machine
+adeploy <host> <pkg> --dry-run     # what would be sent, without sending it
 adeploy <host> <pkg> [pkg...]      # deploy one or more packages
 adeploy rollback <host> <pkg>      # put the previous deployment back
 adeploy --help                     # list available subcommands and flags
+```
+
+`adeploy list` reads the configuration and nothing else — the package and remote
+names every other command wants, and a mark against any source that is not
+there. `--dry-run` really builds the archive and shows what it holds, so it also
+answers whether packaging works at all:
+
+```
+Would deploy demo to 192.0.2.10:6070
+      app.bin                       878.9 KiB
+      app.conf                      7 B
+  2 file(s), 878.9 KiB packed into 879.3 KiB, sha256 24a33d5e...
+Nothing was sent; drop --dry-run to deploy
 ```
 
 Pairing queues a request; an operator on the server approves it:
