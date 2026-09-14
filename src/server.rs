@@ -86,7 +86,7 @@ impl DeployService for AdeployService {
         allowed_keys,
         package_config,
         deploy_path,
-        config.defaults.max_file_size,
+        config.server.max_file_size,
       )
     };
 
@@ -316,7 +316,7 @@ where
   let generated = init::ensure_server_config(&config_path)?;
   let config = provider.load_project_config(config_path.as_path())?;
 
-  let port = config.defaults.port;
+  let port = config.server.listen_port;
   let deploy_root = resolve_deploy_root(&config)?;
   prepare_deploy_root(&deploy_root)?;
   log_startup_state(&config_path, &config, &deploy_root, generated);
@@ -325,7 +325,7 @@ where
     .parse()
     .map_err(|e| Box::new(AdeployError::Network(format!("Invalid address: {}", e))))?;
 
-  let message_limit = resolve_message_limit(config.defaults.max_file_size);
+  let message_limit = resolve_message_limit(config.server.max_file_size);
   let shared_config = Arc::new(RwLock::new(config));
   let (shutdown_tx, shutdown_rx) = watch::channel(false);
   let _watcher_guard = WatcherGuard {
@@ -506,17 +506,17 @@ fn spawn_config_watcher(
 
           let existing_port = {
             let guard = shared_config.read().await;
-            guard.defaults.port
+            guard.server.listen_port
           };
 
-          if new_config.defaults.port != existing_port {
+          if new_config.server.listen_port != existing_port {
             warn!(
-              "Ignoring server port change from {} to {} in {}",
+              "Ignoring listen_port change from {} to {} in {}; restart to apply",
               existing_port,
-              new_config.defaults.port,
+              new_config.server.listen_port,
               config_path.display()
             );
-            new_config.defaults.port = existing_port;
+            new_config.server.listen_port = existing_port;
           }
 
           {

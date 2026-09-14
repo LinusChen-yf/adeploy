@@ -188,11 +188,9 @@ touch '{}'
   let backup_enabled = !matches!(scenario, BackupDisabled);
 
   let config_content = format!(
-    r#"[defaults]
-port = {port}
+    r#"[server]
+listen_port = {port}
 max_file_size = 1048576
-
-[server]
 allowed_keys = [
   "{allowed_key}"
 ]

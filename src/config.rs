@@ -214,22 +214,28 @@ pub struct ProjectConfig {
   pub server: ServerSettings,
 }
 
-/// Values shared by the client and the server, written once.
+/// Fallback values for `[remotes.*]`.
+///
+/// Every field here describes how *this client* reaches a server. The server
+/// reads none of them: it is the client that dials, so the port and both
+/// timeouts belong to the caller. Keeping server policy out of this table
+/// matters because a project's configuration travels to the server with the
+/// package, and nothing a client sends may decide what the server enforces.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Defaults {
-  /// gRPC port: the server listens on it, the client dials it.
+  /// Port to dial. Must match the server's `[server].listen_port`.
   #[serde(default = "default_port")]
   pub port: u16,
   /// Seconds allowed to establish the connection. 0 disables the limit.
   #[serde(default = "default_connect_timeout")]
   pub connect_timeout: u64,
   /// Seconds allowed for upload plus remote deployment. 0 disables the limit.
+  ///
+  /// Sent to the server as the request's gRPC deadline, so both ends stop at
+  /// the same moment instead of the server working on after the client gave up.
   #[serde(default = "default_deploy_timeout")]
   pub deploy_timeout: u64,
-  /// Upper bound for a deploy archive, in bytes.
-  #[serde(default = "default_max_file_size")]
-  pub max_file_size: u64,
 }
 
 impl Default for Defaults {
@@ -238,7 +244,6 @@ impl Default for Defaults {
       port: default_port(),
       connect_timeout: default_connect_timeout(),
       deploy_timeout: default_deploy_timeout(),
-      max_file_size: default_max_file_size(),
     }
   }
 }
@@ -277,14 +282,24 @@ pub struct RemoteOverride {
   pub connect_timeout: Option<u64>,
   #[serde(default)]
   pub deploy_timeout: Option<u64>,
-  #[serde(default)]
-  pub max_file_size: Option<u64>,
 }
 
 /// Machine-local server settings. Not meaningful in a project checkout.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// This is the only table the server takes policy from. Everything else in a
+/// configuration may have come from a client.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerSettings {
+  /// Port to bind. Changing it requires a restart.
+  #[serde(default = "default_port")]
+  pub listen_port: u16,
+  /// Largest archive this server accepts, in bytes.
+  ///
+  /// A request is decoded before the handler that checks `allowed_keys` runs,
+  /// so this bounds what an unauthenticated caller can make the server buffer.
+  #[serde(default = "default_max_file_size")]
+  pub max_file_size: u64,
   /// Base64 Ed25519 public keys permitted to deploy.
   #[serde(default)]
   pub allowed_keys: Vec<String>,
@@ -293,13 +308,23 @@ pub struct ServerSettings {
   pub deploy_root: Option<String>,
 }
 
+impl Default for ServerSettings {
+  fn default() -> Self {
+    Self {
+      listen_port: default_port(),
+      max_file_size: default_max_file_size(),
+      allowed_keys: Vec::new(),
+      deploy_root: None,
+    }
+  }
+}
+
 /// A remote's settings after `[defaults]` and `[remotes.*]` are merged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedRemote {
   pub port: u16,
   pub connect_timeout: u64,
   pub deploy_timeout: u64,
-  pub max_file_size: u64,
 }
 
 impl ProjectConfig {
@@ -321,9 +346,6 @@ impl ProjectConfig {
       deploy_timeout: over
         .and_then(|o| o.deploy_timeout)
         .unwrap_or(self.defaults.deploy_timeout),
-      max_file_size: over
-        .and_then(|o| o.max_file_size)
-        .unwrap_or(self.defaults.max_file_size),
     }
   }
 
@@ -482,9 +504,47 @@ mod tests {
     assert_eq!(config.defaults.port, 6060);
     assert_eq!(config.defaults.connect_timeout, 5);
     assert_eq!(config.defaults.deploy_timeout, 600);
-    assert_eq!(config.defaults.max_file_size, 100 * 1024 * 1024);
     assert!(config.packages.is_empty());
     assert!(config.server.allowed_keys.is_empty());
+  }
+
+  #[test]
+  fn server_policy_has_its_own_defaults() {
+    let config = parse("");
+
+    assert_eq!(config.server.listen_port, 6060);
+    assert_eq!(config.server.max_file_size, 100 * 1024 * 1024);
+    assert!(config.server.deploy_root.is_none());
+  }
+
+  #[test]
+  fn client_tables_cannot_carry_server_policy() {
+    // A project's configuration travels to the server with its packages, so the
+    // parser must refuse server policy written into a client table rather than
+    // quietly ignoring it.
+    for text in [
+      "[defaults]\nmax_file_size = 1\n",
+      "[defaults]\nlisten_port = 1\n",
+      "[remotes.default]\nmax_file_size = 1\n",
+      "[defaults]\nallowed_keys = []\n",
+    ] {
+      assert!(
+        toml::from_str::<ProjectConfig>(text).is_err(),
+        "server policy must be rejected in a client table: {text}"
+      );
+    }
+  }
+
+  #[test]
+  fn server_tables_cannot_carry_client_settings() {
+    // The mirror image: the server never dials, so a connect timeout there is a
+    // mistake worth reporting.
+    for text in ["[server]\nconnect_timeout = 5\n", "[server]\nport = 6060\n"] {
+      assert!(
+        toml::from_str::<ProjectConfig>(text).is_err(),
+        "client settings must be rejected in [server]: {text}"
+      );
+    }
   }
 
   #[test]
@@ -524,6 +584,16 @@ deploy_timeout = 30
     let fallback = config.resolve_remote("10.0.0.2");
     assert_eq!(fallback.port, 2000);
     assert_eq!(fallback.deploy_timeout, 600);
+  }
+
+  #[test]
+  fn listen_port_is_independent_of_the_dial_port() {
+    // They are different concepts that happen to share a default, so a config
+    // setting one must not move the other.
+    let config = parse("[defaults]\nport = 7000\n\n[server]\nlisten_port = 8000\n");
+
+    assert_eq!(config.resolve_remote("anywhere").port, 7000);
+    assert_eq!(config.server.listen_port, 8000);
   }
 
   #[test]
