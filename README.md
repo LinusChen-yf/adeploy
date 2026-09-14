@@ -5,7 +5,8 @@ ADeploy is a lightweight Rust tool for deploying applications across platforms t
 ## Highlights
 - Cross-platform deployment (Linux, macOS, Windows)
 - Language-agnostic packaging with tar/flate2
-- Ed25519 signing with a server-side key allowlist
+- Ed25519 signing with a server-side key allowlist, checked before any upload
+- Chunked uploads with live progress and server logs streamed back as they happen
 - One `adeploy.toml` per project, committed alongside the code it deploys
 - Optional pre/post deployment scripts and backups
 
@@ -30,6 +31,21 @@ The first deployment is rejected until the client's key is authorized; the
 client prints the key to paste into the server's `allowed_keys`, and the server
 picks it up without a restart.
 
+A deployment reports itself as it goes, rather than after it finishes:
+
+```
+Server accepted demo (6001142 bytes), deploy ID a708af0a-...
+Uploaded 34% (2097152/6001142 bytes)
+...
+Uploaded 100% (6001142/6001142 bytes)
+Running Before-deploy script /opt/adeploy/stop.sh
+stopping service                     <- the hook's own output, line by line
+installing dependencies
+Before-deploy script succeeded
+Extracting files into /opt/adeploy/deploy/demo
+Deployment succeeded for demo
+```
+
 Build with `cargo build` first if you do not already have the binary.
 `adeploy client <host> <pkg>` is the explicit spelling of the deploy line; both
 forms are equivalent.
@@ -44,6 +60,25 @@ adeploy server stop                    # stop the running service
 adeploy server uninstall               # remove the service definition
 ```
 Pass `--label <name>` to customise the service identifier (defaults to `adeploy`). Add `--no-autostart` to skip starting on boot or `--disable-restart-on-failure` to prevent automatic restarts when the service exits with an error.
+
+## How a deployment travels
+
+The client opens with a small signed message describing what it is about to
+send — package name, size, SHA256, its public key, a nonce and a timestamp —
+and only streams the archive once the server has accepted it. The signature
+covers that whole description, not just the archive bytes, so an intercepted
+request cannot be pointed at a different package, and the nonce and timestamp
+stop it being replayed at all.
+
+Two things follow from checking the key before the payload. An unauthorized
+caller never gets to send an archive, and the server writes what it does
+receive straight to a staging file rather than holding it in memory, so its
+memory does not grow with the size of the package. The staged file is removed
+once the deployment ends, however it ends.
+
+The server also counts the bytes it actually receives: the declared size is a
+claim from the client, so a stream that runs past it is cut off and one that
+stops short is refused.
 
 ## Configuration
 

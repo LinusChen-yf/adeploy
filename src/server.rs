@@ -4,108 +4,177 @@ use std::{
   ffi::OsString,
   future::Future,
   path::{Path, PathBuf},
+  pin::Pin,
   sync::Arc,
   time::Duration,
 };
 
+use async_stream::try_stream;
 use base64::{engine::general_purpose, Engine as _};
 use log2::*;
 use service_manager::{
   ServiceInstallCtx, ServiceLabel, ServiceLevel, ServiceManager, ServiceStartCtx, ServiceStatus,
   ServiceStatusCtx, ServiceStopCtx, ServiceUninstallCtx,
 };
-use tokio::sync::{watch, RwLock};
-use tonic::{transport::Server, Request, Response, Status};
+use tokio::{
+  io::AsyncWriteExt,
+  sync::{mpsc, watch, RwLock},
+};
+use tokio_stream::Stream;
+use tonic::{transport::Server, Request, Response, Status, Streaming};
 
 use crate::{
   adeploy::{
+    deploy_chunk::Payload,
+    deploy_event::Event,
     deploy_service_server::{DeployService, DeployServiceServer},
-    DeployRequest, DeployResponse,
+    DeployAccepted, DeployChunk, DeployEvent, DeployLog, DeployResult, DeployStart,
   },
-  auth::Auth,
+  auth::{deploy_start_signing_payload, Auth},
   config::{ConfigProvider, PackageConfig, ProjectConfig},
   deploy::DeployManager,
-  deploy_log::{DeployLogEntry, LogLevel},
+  deploy_log::{DeployLogEntry, LogLevel, LogSink},
   error::{AdeployError, Result},
   init,
+  replay::ReplayGuard,
 };
 
 const DEFAULT_MAX_MESSAGE_SIZE: u64 = 100 * 1024 * 1024;
+
+/// Directory under the deploy root where uploads land before they are trusted.
+const STAGING_DIR: &str = ".staging";
+
+/// Buffer for the server-to-client event stream.
+const EVENT_CHANNEL_SIZE: usize = 256;
 
 /// ADeploy gRPC service implementation
 #[derive(Clone)]
 pub struct AdeployService {
   config: Arc<RwLock<ProjectConfig>>,
+  replay: Arc<ReplayGuard>,
 }
 
 impl AdeployService {
   pub fn new(config: Arc<RwLock<ProjectConfig>>) -> Self {
-    Self { config }
+    Self {
+      config,
+      replay: Arc::new(ReplayGuard::new()),
+    }
   }
+}
+
+/// An opening message that passed every check, with the policy it resolved to.
+struct AcceptedDeploy {
+  start: DeployStart,
+  package_config: PackageConfig,
+  deploy_path: PathBuf,
+  staging_dir: PathBuf,
+}
+
+/// An upload written to disk, removed when it goes out of scope.
+struct StagedArchive {
+  path: PathBuf,
+}
+
+impl Drop for StagedArchive {
+  fn drop(&mut self) {
+    if let Err(e) = std::fs::remove_file(&self.path) {
+      if e.kind() != std::io::ErrorKind::NotFound {
+        warn!(
+          "Failed to remove staged archive {}: {}",
+          self.path.display(),
+          e
+        );
+      }
+    }
+  }
+}
+
+/// One turn of the event loop that interleaves progress with the deployment.
+enum DeployStep {
+  Log(DeployLogEntry),
+  Finished(Result<()>),
 }
 
 #[tonic::async_trait]
 impl DeployService for AdeployService {
+  type DeployStream =
+    Pin<Box<dyn Stream<Item = std::result::Result<DeployEvent, Status>> + Send + 'static>>;
+
   async fn deploy(
     &self,
-    request: Request<DeployRequest>,
-  ) -> std::result::Result<Response<DeployResponse>, Status> {
-    let mut req = request.into_inner();
+    request: Request<Streaming<DeployChunk>>,
+  ) -> std::result::Result<Response<Self::DeployStream>, Status> {
+    let mut inbound = request.into_inner();
 
-    info!("Received deploy request for {}", req.package_name);
+    // The opening message is checked before any response stream exists, so a
+    // caller that fails authorisation gets a plain gRPC status and never sends
+    // a byte of archive. Only this small message is decoded beforehand.
+    let start = read_start_message(&mut inbound).await?;
+    let accepted = self.authorize(start).await?;
 
-    // Verify signature against allowlist
-    let signature = match general_purpose::STANDARD.decode(&req.signature) {
-      Ok(sig) => sig,
-      Err(e) => {
-        error!("Invalid signature format: {}", e);
-        return Err(Status::invalid_argument(format!(
-          "Invalid signature: {}",
-          e
-        )));
-      }
-    };
+    let deploy_manager = DeployManager::new();
+    info!(
+      "Accepted deployment {} for {} ({} bytes)",
+      deploy_manager.deploy_id, accepted.start.package_name, accepted.start.total_size
+    );
 
-    let fallback_root = match init::default_deploy_root() {
-      Ok(dir) => dir,
-      Err(e) => {
-        error!("Cannot determine the deploy root: {}", e);
-        return Err(Status::internal(format!(
-          "Cannot determine deploy root: {}",
-          e
-        )));
-      }
-    };
+    let stream = deployment_stream(deploy_manager, accepted, inbound);
+    Ok(Response::new(Box::pin(stream) as Self::DeployStream))
+  }
+}
 
-    let (allowed_keys, package_config, deploy_path, max_file_size) = {
+impl AdeployService {
+  /// Check who is calling and what they are asking for, before accepting bytes.
+  async fn authorize(&self, start: DeployStart) -> std::result::Result<AcceptedDeploy, Status> {
+    info!("Deploy request for {} from a client", start.package_name);
+
+    let fallback_root = init::default_deploy_root().map_err(|e| {
+      error!("Cannot determine the deploy root: {}", e);
+      Status::internal(format!("Cannot determine deploy root: {}", e))
+    })?;
+
+    let (allowed_keys, package_config, deploy_path, max_file_size, deploy_root) = {
       let config = self.config.read().await;
-      let allowed_keys = config.server.allowed_keys.clone();
-      let package_config = config.packages.get(&req.package_name).cloned();
-      let deploy_path = config.resolve_deploy_path(&req.package_name, &fallback_root);
       (
-        allowed_keys,
-        package_config,
-        deploy_path,
+        config.server.allowed_keys.clone(),
+        config.packages.get(&start.package_name).cloned(),
+        config.resolve_deploy_path(&start.package_name, &fallback_root),
         config.server.max_file_size,
+        resolve_deploy_root(&config).unwrap_or_else(|_| fallback_root.clone()),
       )
     };
 
-    // Ensure the provided public key is allowed
-    let is_allowed = allowed_keys
+    let presented_key = start.public_key.trim();
+    if !allowed_keys
       .iter()
-      .any(|allowed_key| allowed_key == &req.public_key);
-
-    if !is_allowed {
-      error!("Public key not allowed for {}", req.package_name);
+      .any(|allowed| allowed.trim() == presented_key)
+    {
+      error!("Public key not allowed for {}", start.package_name);
       return Err(Status::unauthenticated("Client public key not allowed"));
     }
 
-    match Auth::verify_signature(&req.public_key, &req.file_data, &signature) {
-      Ok(valid) => {
-        if !valid {
-          error!("Signature verification failed for {}", req.package_name);
-          return Err(Status::unauthenticated("Invalid Ed25519 signature"));
-        }
+    let signature = general_purpose::STANDARD
+      .decode(&start.signature)
+      .map_err(|e| {
+        error!("Invalid signature format: {}", e);
+        Status::invalid_argument(format!("Invalid signature: {}", e))
+      })?;
+
+    let payload = deploy_start_signing_payload(
+      &start.package_name,
+      start.total_size,
+      &start.file_hash,
+      &start.public_key,
+      &start.nonce,
+      start.timestamp_ms,
+    );
+
+    match Auth::verify_signature(&start.public_key, &payload, &signature) {
+      Ok(true) => {}
+      Ok(false) => {
+        error!("Signature verification failed for {}", start.package_name);
+        return Err(Status::unauthenticated("Invalid Ed25519 signature"));
       }
       Err(e) => {
         error!("Ed25519 signature verification error: {}", e);
@@ -113,191 +182,274 @@ impl DeployService for AdeployService {
       }
     }
 
-    // Ensure package configuration exists
+    // Only now is the nonce worth remembering: an unsigned one could be
+    // invented by anyone, and recording it would let a stranger burn a value a
+    // legitimate client might later use.
+    if let Err(rejection) = self.replay.admit(&start.nonce, start.timestamp_ms) {
+      error!(
+        "Rejected {} for {}: {}",
+        start.package_name,
+        presented_key,
+        rejection.message()
+      );
+      return Err(Status::unauthenticated(rejection.message()));
+    }
+
+    if max_file_size > 0 && start.total_size > max_file_size {
+      error!(
+        "Declared size {} for {} exceeds max_file_size {}",
+        start.total_size, start.package_name, max_file_size
+      );
+      return Err(Status::resource_exhausted(format!(
+        "Declared archive size {} exceeds configured max_file_size {}",
+        start.total_size, max_file_size
+      )));
+    }
+
     let (package_config, deploy_path) = match (package_config, deploy_path) {
       (Some(config), Some(path)) => (config, path),
       _ => {
-        error!("Package {} is not configured", req.package_name);
+        error!("Package {} is not configured", start.package_name);
         return Err(Status::not_found(format!(
           "Package '{}' not configured",
-          req.package_name
+          start.package_name
         )));
       }
     };
 
-    if max_file_size > 0 && req.file_data.len() as u64 > max_file_size {
-      error!(
-        "Payload for {} exceeds configured max_file_size {}",
-        req.package_name, max_file_size
-      );
-      return Err(Status::resource_exhausted(format!(
-        "Archive size exceeds configured max_file_size ({} bytes)",
-        max_file_size
-      )));
-    }
+    Ok(AcceptedDeploy {
+      start,
+      package_config,
+      deploy_path,
+      staging_dir: deploy_root.join(STAGING_DIR),
+    })
+  }
+}
 
-    let package_name = req.package_name.clone();
-    let file_hash = req.file_hash.clone();
-    let file_data = std::mem::take(&mut req.file_data);
+/// The first message of the stream, which must describe the upload.
+async fn read_start_message(
+  inbound: &mut Streaming<DeployChunk>,
+) -> std::result::Result<DeployStart, Status> {
+  match inbound.message().await? {
+    Some(DeployChunk {
+      payload: Some(Payload::Start(start)),
+    }) => Ok(start),
+    Some(_) => Err(Status::invalid_argument(
+      "The first message must be a DeployStart",
+    )),
+    None => Err(Status::invalid_argument(
+      "Stream closed before the opening message",
+    )),
+  }
+}
 
-    // Initialize deployment manager
-    let deploy_manager = DeployManager::new();
+/// Drive the upload and the deployment, reporting progress as it happens.
+///
+/// The work runs inside the response stream rather than in a spawned task, so
+/// a client that disconnects or whose deadline expires takes the deployment
+/// down with it. A detached task would keep unpacking with nobody listening.
+fn deployment_stream(
+  deploy_manager: DeployManager,
+  accepted: AcceptedDeploy,
+  mut inbound: Streaming<DeployChunk>,
+) -> impl Stream<Item = std::result::Result<DeployEvent, Status>> + Send + 'static {
+  try_stream! {
     let deploy_id = deploy_manager.deploy_id.clone();
+    yield accepted_event(&deploy_id);
 
-    info!("Starting deployment {} for {}", deploy_id, package_name);
+    let staged = receive_archive(&mut inbound, &accepted, &deploy_id).await?;
 
-    // Execute deployment synchronously for now
-    // TODO: Implement proper async deployment with Send-safe types
-    match Self::execute_deployment(
-      &deploy_manager,
-      &package_config,
-      file_data,
-      file_hash,
-      &package_name,
-      &deploy_path,
-    )
-    .await
-    {
-      Ok(logs) => {
-        info!("Deployment {} completed for {}", deploy_id, package_name);
+    let (sender, mut receiver) = mpsc::channel(EVENT_CHANNEL_SIZE);
+    let sink = LogSink::new(sender);
+    let work = execute_deployment(&deploy_manager, &accepted, &staged.path, &sink);
+    tokio::pin!(work);
 
-        Ok(Response::new(DeployResponse {
-          success: true,
-          message: "Deployment completed successfully".to_string(),
-          deploy_id,
-          logs: Self::encode_logs(logs),
-        }))
-      }
-      Err(e) => {
-        error!(
-          "Deployment {} failed for {}: {}",
-          deploy_id, package_name, e
-        );
+    loop {
+      let step = tokio::select! {
+        Some(entry) = receiver.recv() => DeployStep::Log(entry),
+        outcome = &mut work => DeployStep::Finished(outcome),
+      };
 
-        // Always collect logs on failure
-        let mut logs = vec![DeployLogEntry::error(format!("Deployment failed: {}", e))];
+      match step {
+        DeployStep::Log(entry) => yield log_event(entry),
+        DeployStep::Finished(outcome) => {
+          // Whatever the work produced before returning still belongs to the
+          // client, including the entries explaining a failure.
+          while let Ok(entry) = receiver.try_recv() {
+            yield log_event(entry);
+          }
 
-        // Include additional details when available
-        if let AdeployError::Deploy(msg) = e.as_ref() {
-          logs.push(DeployLogEntry::error(format!("Details: {}", msg)));
+          match outcome {
+            Ok(()) => {
+              info!("Deployment {} completed for {}", deploy_id, accepted.start.package_name);
+              yield result_event(true, "Deployment completed successfully", &deploy_id);
+            }
+            Err(e) => {
+              error!("Deployment {} failed for {}: {}", deploy_id, accepted.start.package_name, e);
+              yield log_event(DeployLogEntry::error(format!("Deployment failed: {}", e)));
+              yield result_event(false, &e.to_string(), &deploy_id);
+            }
+          }
+          break;
         }
-
-        Ok(Response::new(DeployResponse {
-          success: false,
-          message: e.to_string(),
-          deploy_id,
-          logs: Self::encode_logs(logs),
-        }))
       }
     }
   }
 }
 
-impl AdeployService {
-  fn encode_logs(logs: Vec<DeployLogEntry>) -> Vec<crate::adeploy::DeployLog> {
-    logs
-      .into_iter()
-      .map(|entry| crate::adeploy::DeployLog {
-        level: Self::map_log_level(entry.level) as i32,
-        message: entry.message,
-      })
-      .collect()
-  }
+/// Write the incoming chunks to disk, holding the declared size to account.
+async fn receive_archive(
+  inbound: &mut Streaming<DeployChunk>,
+  accepted: &AcceptedDeploy,
+  deploy_id: &str,
+) -> std::result::Result<StagedArchive, Status> {
+  tokio::fs::create_dir_all(&accepted.staging_dir)
+    .await
+    .map_err(|e| {
+      Status::internal(format!(
+        "Failed to create staging directory {}: {}",
+        accepted.staging_dir.display(),
+        e
+      ))
+    })?;
 
-  fn map_log_level(level: LogLevel) -> crate::adeploy::deploy_log::Level {
-    match level {
-      LogLevel::Info => crate::adeploy::deploy_log::Level::Info,
-      LogLevel::Warn => crate::adeploy::deploy_log::Level::Warn,
-      LogLevel::Error => crate::adeploy::deploy_log::Level::Error,
-    }
-  }
+  let path = accepted.staging_dir.join(format!("{}.tar.gz", deploy_id));
+  let staged = StagedArchive { path };
 
-  async fn execute_deployment(
-    deploy_manager: &DeployManager,
-    package_config: &PackageConfig,
-    file_data: Vec<u8>,
-    file_hash: String,
-    package_name: &str,
-    deploy_path: &Path,
-  ) -> Result<Vec<DeployLogEntry>> {
-    let mut logs = Vec::new();
-    logs.push(DeployLogEntry::info(format!(
-      "[{}] Starting deployment execution",
-      deploy_manager.deploy_id
-    )));
+  let mut file = tokio::fs::File::create(&staged.path).await.map_err(|e| {
+    Status::internal(format!(
+      "Failed to create staged archive {}: {}",
+      staged.path.display(),
+      e
+    ))
+  })?;
 
-    // Run before-deploy hook
-    logs.push(DeployLogEntry::info("Running Before-deploy script..."));
-    match deploy_manager
-      .execute_before_deploy_script(package_config)
-      .await
-    {
-      Ok(pre_logs) => {
-        logs.extend(pre_logs);
-        logs.push(DeployLogEntry::info("Before-deploy script succeeded"));
+  let mut received: u64 = 0;
+  while let Some(chunk) = inbound.message().await? {
+    match chunk.payload {
+      Some(Payload::Data(bytes)) => {
+        received = received.saturating_add(bytes.len() as u64);
+        // The declared size is a claim, not a fact, so the stream is measured
+        // as it arrives rather than trusted to stop where it said it would.
+        if received > accepted.start.total_size {
+          return Err(Status::invalid_argument(format!(
+            "Stream exceeded the declared size of {} bytes",
+            accepted.start.total_size
+          )));
+        }
+        file
+          .write_all(&bytes)
+          .await
+          .map_err(|e| Status::internal(format!("Failed to write staged archive: {}", e)))?;
       }
-      Err(e) => {
-        error!("Before-deploy script failed: {}", e);
-        logs.push(DeployLogEntry::error(format!(
-          "Before-deploy script failed: {}",
-          e
-        )));
-        return Err(e);
-      }
-    }
-
-    // Extract archive and verify hash
-    logs.push(DeployLogEntry::info("Extracting files..."));
-    match deploy_manager
-      .extract_files(
-        file_data,
-        &file_hash,
-        package_config,
-        package_name,
-        deploy_path,
-      )
-      .await
-    {
-      Ok(()) => {
-        logs.push(DeployLogEntry::info(
-          "Files extracted and deployed successfully",
+      Some(Payload::Start(_)) => {
+        return Err(Status::invalid_argument(
+          "Only the first message may be a DeployStart",
         ));
       }
-      Err(e) => {
-        error!("File extraction failed: {}", e);
-        logs.push(DeployLogEntry::error(format!(
-          "File extraction failed: {}",
-          e
-        )));
-        return Err(e);
-      }
+      None => {}
     }
+  }
 
-    // Run after-deploy hook
-    logs.push(DeployLogEntry::info("Running After-deploy script..."));
-    match deploy_manager
-      .execute_after_deploy_script(package_config)
-      .await
-    {
-      Ok(post_logs) => {
-        logs.extend(post_logs);
-        logs.push(DeployLogEntry::info("After-deploy script succeeded"));
-      }
-      Err(e) => {
-        error!("After-deploy script failed: {}", e);
-        logs.push(DeployLogEntry::error(format!(
-          "After-deploy script failed: {}",
-          e
-        )));
-        // Deployment succeeds even if the After-deploy script fails
-      }
-    }
+  file
+    .flush()
+    .await
+    .map_err(|e| Status::internal(format!("Failed to flush staged archive: {}", e)))?;
+  drop(file);
 
-    logs.push(DeployLogEntry::info(format!(
+  if received != accepted.start.total_size {
+    return Err(Status::invalid_argument(format!(
+      "Stream ended after {} of the {} declared bytes",
+      received, accepted.start.total_size
+    )));
+  }
+
+  info!("Staged {} bytes at {}", received, staged.path.display());
+  Ok(staged)
+}
+
+/// Run the hooks and the extraction, reporting each stage through `sink`.
+async fn execute_deployment(
+  deploy_manager: &DeployManager,
+  accepted: &AcceptedDeploy,
+  archive_path: &Path,
+  sink: &LogSink,
+) -> Result<()> {
+  sink
+    .info(format!(
+      "[{}] Starting deployment execution",
+      deploy_manager.deploy_id
+    ))
+    .await;
+
+  deploy_manager
+    .execute_before_deploy_script(&accepted.package_config, sink)
+    .await?;
+
+  deploy_manager
+    .extract_files(
+      archive_path,
+      &accepted.start.file_hash,
+      &accepted.package_config,
+      &accepted.start.package_name,
+      &accepted.deploy_path,
+      sink,
+    )
+    .await?;
+
+  // A failed after-deploy hook has never failed the deployment: the files are
+  // already in place, and reverting them is not this stage's job.
+  if let Err(e) = deploy_manager
+    .execute_after_deploy_script(&accepted.package_config, sink)
+    .await
+  {
+    warn!("After-deploy script failed: {}", e);
+    sink
+      .warn(format!("After-deploy script failed: {}", e))
+      .await;
+  }
+
+  sink
+    .info(format!(
       "[{}] Deployment completed successfully",
       deploy_manager.deploy_id
-    )));
-    Ok(logs)
+    ))
+    .await;
+  Ok(())
+}
+
+fn accepted_event(deploy_id: &str) -> DeployEvent {
+  DeployEvent {
+    event: Some(Event::Accepted(DeployAccepted {
+      deploy_id: deploy_id.to_string(),
+    })),
+  }
+}
+
+fn log_event(entry: DeployLogEntry) -> DeployEvent {
+  DeployEvent {
+    event: Some(Event::Log(DeployLog {
+      level: map_log_level(entry.level) as i32,
+      message: entry.message,
+    })),
+  }
+}
+
+fn result_event(success: bool, message: &str, deploy_id: &str) -> DeployEvent {
+  DeployEvent {
+    event: Some(Event::Result(DeployResult {
+      success,
+      message: message.to_string(),
+      deploy_id: deploy_id.to_string(),
+    })),
+  }
+}
+
+fn map_log_level(level: LogLevel) -> crate::adeploy::deploy_log::Level {
+  match level {
+    LogLevel::Info => crate::adeploy::deploy_log::Level::Info,
+    LogLevel::Warn => crate::adeploy::deploy_log::Level::Warn,
+    LogLevel::Error => crate::adeploy::deploy_log::Level::Error,
   }
 }
 

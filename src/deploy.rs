@@ -1,6 +1,8 @@
 use std::{
   fs, io,
+  io::Read,
   path::{Path, PathBuf},
+  process::Stdio,
 };
 
 use chrono::{DateTime, Utc};
@@ -8,14 +10,21 @@ use flate2::{write::GzEncoder, Compression};
 use log2::*;
 use sha2::{Digest, Sha256};
 use tar::Builder;
-use tokio::{process::Command, task::spawn_blocking};
+use tokio::{
+  io::{AsyncBufReadExt, BufReader},
+  process::Command,
+  task::spawn_blocking,
+};
 use uuid::Uuid;
 
 use crate::{
   config::PackageConfig,
-  deploy_log::DeployLogEntry,
+  deploy_log::LogSink,
   error::{AdeployError, Result},
 };
+
+/// Read size when hashing or decompressing a staged archive.
+const STREAM_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Deployment manager
 pub struct DeployManager {
@@ -118,37 +127,40 @@ impl DeployManager {
     Ok((archive, hash))
   }
 
-  /// Extract and deploy files with hash verification
+  /// Verify and unpack an archive that was streamed to disk.
   ///
-  /// `deploy_path` is the absolute directory resolved from the package's
-  /// `deploy_path` and the server's `deploy_root`.
+  /// The archive stays on disk throughout: it is hashed and decompressed in
+  /// fixed-size reads, so the server's memory does not grow with the size of
+  /// the package being deployed.
   pub async fn extract_files(
     &self,
-    archive_data: Vec<u8>,
+    archive_path: &Path,
     expected_hash: &str,
     config: &PackageConfig,
     package_name: &str,
     deploy_path: &Path,
+    sink: &LogSink,
   ) -> Result<()> {
-    info!("Extracting files into {}", deploy_path.display());
-    info!("Archive size: {} bytes", archive_data.len());
-
-    let archive_data = self
-      .verify_archive_hash(archive_data, expected_hash)
+    sink.info("Verifying archive hash").await;
+    self
+      .verify_archive_hash(archive_path, expected_hash)
       .await?;
 
     if config.backup_enabled {
-      info!("Creating backup snapshot");
+      sink.info("Creating backup snapshot").await;
       self
         .create_backup(config, package_name, deploy_path)
         .await?;
     }
 
+    sink
+      .info(format!("Extracting files into {}", deploy_path.display()))
+      .await;
     self.ensure_deploy_directory(deploy_path).await?;
-
-    self.unpack_archive(archive_data, deploy_path).await?;
+    self.unpack_archive(archive_path, deploy_path).await?;
 
     info!("Extraction complete: {}", deploy_path.display());
+    sink.info("Extraction complete").await;
     Ok(())
   }
 
@@ -156,9 +168,14 @@ impl DeployManager {
   pub async fn execute_before_deploy_script(
     &self,
     config: &PackageConfig,
-  ) -> Result<Vec<DeployLogEntry>> {
+    sink: &LogSink,
+  ) -> Result<()> {
     self
-      .run_deploy_script(config.before_deploy_script.as_deref(), "Before-deploy")
+      .run_deploy_script(
+        config.before_deploy_script.as_deref(),
+        "Before-deploy",
+        sink,
+      )
       .await
   }
 
@@ -166,15 +183,19 @@ impl DeployManager {
   pub async fn execute_after_deploy_script(
     &self,
     config: &PackageConfig,
-  ) -> Result<Vec<DeployLogEntry>> {
+    sink: &LogSink,
+  ) -> Result<()> {
     self
-      .run_deploy_script(config.after_deploy_script.as_deref(), "After-deploy")
+      .run_deploy_script(config.after_deploy_script.as_deref(), "After-deploy", sink)
       .await
   }
 
-  /// Execute a shell script
-  async fn execute_script(&self, script_path: &str) -> Result<Vec<DeployLogEntry>> {
-    // Get adeploy executable directory
+  /// Run a hook, forwarding its output as it is produced.
+  ///
+  /// Output used to be collected with `Command::output()`, which waits for the
+  /// process to exit. An installer that ran for minutes therefore produced
+  /// nothing until it finished, which is indistinguishable from a hang.
+  async fn execute_script(&self, script_path: &str, sink: &LogSink) -> Result<()> {
     let exe_dir = executable_dir()?;
 
     info!(
@@ -192,35 +213,69 @@ impl DeployManager {
       cmd
     };
 
-    // Set working directory to adeploy executable directory
-    command.current_dir(&exe_dir);
+    command
+      .current_dir(&exe_dir)
+      .stdout(Stdio::piped())
+      .stderr(Stdio::piped());
 
-    let output = command.output().await.map_err(|e| {
+    let mut child = command.spawn().map_err(|e| {
       Box::new(AdeployError::Deploy(format!(
         "Failed to execute script '{}': {}",
         script_path, e
       )))
     })?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = child.stdout.take().ok_or_else(|| {
+      Box::new(AdeployError::Deploy(
+        "Failed to capture script stdout".to_string(),
+      ))
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+      Box::new(AdeployError::Deploy(
+        "Failed to capture script stderr".to_string(),
+      ))
+    })?;
 
-    let mut logs: Vec<DeployLogEntry> = vec![];
-    if !stdout.is_empty() {
-      info!("Script stdout: {}", stdout.trim_end());
-      logs.extend(stdout.lines().map(DeployLogEntry::info));
-    }
-    if !stderr.is_empty() {
-      warn!("Script stderr: {}", stderr.trim_end());
-      logs.extend(
-        stderr
-          .lines()
-          .map(|s| DeployLogEntry::warn(format!("STDERR: {}", s))),
-      );
+    let mut stdout_lines = BufReader::new(stdout).lines();
+    let mut stderr_lines = BufReader::new(stderr).lines();
+    let (mut stdout_done, mut stderr_done) = (false, false);
+
+    while !(stdout_done && stderr_done) {
+      tokio::select! {
+        line = stdout_lines.next_line(), if !stdout_done => match line {
+          Ok(Some(line)) => {
+            info!("Script stdout: {}", line);
+            sink.info(line).await;
+          }
+          Ok(None) => stdout_done = true,
+          Err(e) => {
+            warn!("Failed to read script stdout: {}", e);
+            stdout_done = true;
+          }
+        },
+        line = stderr_lines.next_line(), if !stderr_done => match line {
+          Ok(Some(line)) => {
+            warn!("Script stderr: {}", line);
+            sink.warn(format!("STDERR: {}", line)).await;
+          }
+          Ok(None) => stderr_done = true,
+          Err(e) => {
+            warn!("Failed to read script stderr: {}", e);
+            stderr_done = true;
+          }
+        },
+      }
     }
 
-    if !output.status.success() {
-      let exit_code = output.status.code().unwrap_or(-1);
+    let status = child.wait().await.map_err(|e| {
+      Box::new(AdeployError::Deploy(format!(
+        "Failed to wait for script '{}': {}",
+        script_path, e
+      )))
+    })?;
+
+    if !status.success() {
+      let exit_code = status.code().unwrap_or(-1);
       error!("Script {} failed with exit code {}", script_path, exit_code);
       return Err(Box::new(AdeployError::Deploy(format!(
         "Script '{}' execution failed with exit code: {}",
@@ -229,7 +284,7 @@ impl DeployManager {
     }
 
     info!("Script {} completed", script_path);
-    Ok(logs)
+    Ok(())
   }
 
   /// Create backup of existing deployment
@@ -298,17 +353,23 @@ impl DeployManager {
     &self,
     script_path: Option<&str>,
     stage_name: &str,
-  ) -> Result<Vec<DeployLogEntry>> {
+    sink: &LogSink,
+  ) -> Result<()> {
     let Some(path) = script_path else {
       info!("No {} script configured", stage_name);
-      return Ok(vec![]);
+      return Ok(());
     };
 
     info!("Running {} script {}", stage_name, path);
-    match self.execute_script(path).await {
-      Ok(logs) => {
+    sink
+      .info(format!("Running {} script {}", stage_name, path))
+      .await;
+
+    match self.execute_script(path, sink).await {
+      Ok(()) => {
         info!("{} script succeeded", stage_name);
-        Ok(logs)
+        sink.info(format!("{} script succeeded", stage_name)).await;
+        Ok(())
       }
       Err(e) => {
         error!("{} script failed: {}", stage_name, e);
@@ -317,17 +378,36 @@ impl DeployManager {
     }
   }
 
-  async fn verify_archive_hash(
-    &self,
-    archive_data: Vec<u8>,
-    expected_hash: &str,
-  ) -> Result<Vec<u8>> {
+  /// Hash a staged archive without loading it into memory.
+  async fn verify_archive_hash(&self, archive_path: &Path, expected_hash: &str) -> Result<()> {
+    let archive_path = archive_path.to_path_buf();
     let expected_hash = expected_hash.to_string();
-    let (archive_data, actual_hash) = spawn_blocking(move || -> Result<(Vec<u8>, String)> {
+
+    let actual_hash = spawn_blocking(move || -> Result<String> {
+      let mut file = fs::File::open(&archive_path).map_err(|e| {
+        Box::new(AdeployError::FileSystem(format!(
+          "Failed to open staged archive {}: {}",
+          archive_path.display(),
+          e
+        )))
+      })?;
+
       let mut hasher = Sha256::new();
-      hasher.update(&archive_data);
-      let actual_hash = format!("{:x}", hasher.finalize());
-      Ok((archive_data, actual_hash))
+      let mut buffer = vec![0u8; STREAM_BUFFER_SIZE];
+      loop {
+        let read = file.read(&mut buffer).map_err(|e| {
+          Box::new(AdeployError::FileSystem(format!(
+            "Failed to read staged archive: {}",
+            e
+          )))
+        })?;
+        if read == 0 {
+          break;
+        }
+        hasher.update(&buffer[..read]);
+      }
+
+      Ok(format!("{:x}", hasher.finalize()))
     })
     .await
     .map_err(|e| {
@@ -348,7 +428,7 @@ impl DeployManager {
       ))));
     }
 
-    Ok(archive_data)
+    Ok(())
   }
 
   async fn ensure_deploy_directory(&self, path: &Path) -> Result<()> {
@@ -370,10 +450,22 @@ impl DeployManager {
       })
   }
 
-  async fn unpack_archive(&self, archive_data: Vec<u8>, deploy_path: &Path) -> Result<()> {
+  /// Decompress a staged archive straight from disk.
+  async fn unpack_archive(&self, archive_path: &Path, deploy_path: &Path) -> Result<()> {
+    let archive_path = archive_path.to_path_buf();
     let deploy_path = deploy_path.to_path_buf();
+
     spawn_blocking(move || -> Result<()> {
-      let decoder = flate2::read::GzDecoder::new(&archive_data[..]);
+      let file = fs::File::open(&archive_path).map_err(|e| {
+        Box::new(AdeployError::FileSystem(format!(
+          "Failed to open staged archive {}: {}",
+          archive_path.display(),
+          e
+        )))
+      })?;
+
+      let reader = io::BufReader::with_capacity(STREAM_BUFFER_SIZE, file);
+      let decoder = flate2::read::GzDecoder::new(reader);
       let mut archive = tar::Archive::new(decoder);
       archive.unpack(&deploy_path).map_err(|e| {
         Box::new(AdeployError::Deploy(format!(
