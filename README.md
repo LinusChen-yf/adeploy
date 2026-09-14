@@ -87,6 +87,21 @@ The queue is bounded and deduplicated by key, so a client polling while it waits
 cannot fill it, and filling it at all needs that many distinct keys — which an
 operator looking at a full queue can see.
 
+## Replacing a deployment
+
+The new tree is assembled under a sibling directory and moved into place with a
+rename. Unpacking straight over the deploy path meant a failure part way through
+left a directory that was neither the old deployment nor the new one, and a
+running service could read half-replaced files for as long as extraction took.
+A failed deployment now leaves the live one exactly as it was.
+
+`clean_deploy` decides what the new tree starts from. Off by default, the
+existing directory is copied in first, so files the package does not ship —
+uploads, logs, a database — survive; the archive then overwrites what it does
+ship. Turned on, the new tree contains only what the archive holds, so files
+dropped from a package stop lingering on the server. That is usually what you
+want for a directory that is entirely build output.
+
 ## How a deployment travels
 
 The client opens with a small signed message describing what it is about to
@@ -130,6 +145,7 @@ deploy_timeout = 600   # seconds for upload plus everything the server does
 [packages.demo]
 sources = ["./dist/demo"]   # client: what to archive
 deploy_path = "demo"        # server: where to unpack, under deploy_root
+clean_deploy = false        # server: replace the directory rather than merge
 backup_enabled = true
 
 # Per-host overrides; list only what differs from [defaults].

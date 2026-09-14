@@ -44,6 +44,10 @@ deploy_timeout = 600
 sources = ["./dist/demo"]
 # Server: where to unpack. A relative path lands under the server's deploy_root.
 deploy_path = "demo"
+# Server: replace the deploy directory instead of merging into it, so files
+# dropped from the package stop lingering. Leave it off if the directory also
+# holds things the package does not ship, such as uploads or a database.
+# clean_deploy = false
 # Server: snapshot the existing directory before unpacking.
 backup_enabled = true
 # Server: where snapshots go. Defaults to a directory named after the package,
@@ -105,6 +109,7 @@ deploy_root = {deploy_root}
 # client deploys. Remove the comment markers and adjust to taste.
 # [packages.demo]
 # deploy_path = "demo"
+# clean_deploy = false
 # backup_enabled = true
 # before_deploy_script = "systemctl stop demo"
 # after_deploy_script = "systemctl start demo"

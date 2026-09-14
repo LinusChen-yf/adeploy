@@ -206,6 +206,35 @@ deploy_path = "{PACKAGE}"
     self.signed_start(PACKAGE, self.archive.len() as u64, now_ms(), None)
   }
 
+  /// A correctly signed message describing a body other than the harness one.
+  fn start_message_for(&self, body: &[u8]) -> DeployStart {
+    use ed25519_dalek::Signer;
+    use sha2::{Digest, Sha256};
+
+    let file_hash = format!("{:x}", Sha256::digest(body));
+    let total_size = body.len() as u64;
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let timestamp_ms = now_ms();
+    let payload = deploy_start_signing_payload(
+      PACKAGE,
+      total_size,
+      &file_hash,
+      &self.public_key,
+      &nonce,
+      timestamp_ms,
+    );
+
+    DeployStart {
+      package_name: PACKAGE.to_string(),
+      total_size,
+      file_hash,
+      public_key: self.public_key.clone(),
+      nonce,
+      timestamp_ms,
+      signature: general_purpose::STANDARD.encode(self.signing_key.sign(&payload).to_bytes()),
+    }
+  }
+
   /// An opening message signed over the given values.
   ///
   /// `claimed_package` replaces the package name *after* signing, which is how
@@ -573,4 +602,42 @@ async fn pairing_reports_a_key_the_allowlist_already_names() {
     .expect("load store")
     .pending
     .is_empty());
+}
+
+#[tokio::test]
+async fn a_corrupt_archive_leaves_the_live_deployment_intact() {
+  let harness = Harness::start().await;
+  let deployed = harness.deploy_root.join(PACKAGE).join("payload.txt");
+
+  assert!(harness
+    .send(harness.start_message(), harness.archive.clone())
+    .await
+    .expect("first deployment"));
+  assert_eq!(std::fs::read_to_string(&deployed).expect("read"), "payload");
+
+  // Bytes that hash to exactly what they claim, and are still not a gzip
+  // stream: verification passes and extraction is what fails, part way in.
+  let corrupt = vec![0x42u8; 8192];
+  let success = harness
+    .send(harness.start_message_for(&corrupt), corrupt)
+    .await
+    .expect("the stream itself completes");
+
+  assert!(!success, "a corrupt archive must not report success");
+  assert_eq!(
+    std::fs::read_to_string(&deployed).expect("read"),
+    "payload",
+    "the previous deployment must survive a failed one"
+  );
+
+  let leftovers: Vec<String> = std::fs::read_dir(&harness.deploy_root)
+    .expect("read deploy root")
+    .filter_map(|entry| entry.ok())
+    .map(|entry| entry.file_name().to_string_lossy().to_string())
+    .filter(|name| name.starts_with(&format!("{PACKAGE}.")))
+    .collect();
+  assert!(
+    leftovers.is_empty(),
+    "no working directories should be left behind, found: {leftovers:?}"
+  );
 }
