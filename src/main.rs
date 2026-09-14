@@ -11,11 +11,13 @@ mod deploy;
 mod deploy_log;
 mod error;
 mod init;
+mod pairing;
 mod replay;
 mod server;
 use crate::{
   config::ConfigProvider,
   error::{AdeployError, Result},
+  pairing::PairStore,
 };
 
 // Generated gRPC bindings
@@ -66,6 +68,11 @@ enum Commands {
     #[arg(long)]
     force: bool,
   },
+  /// Ask a server to trust this machine's key
+  Pair {
+    /// Server host
+    host: String,
+  },
 }
 
 #[derive(Subcommand)]
@@ -82,6 +89,22 @@ enum ServerAction {
   Stop(ServiceTargetArgs),
   /// Show the current service status
   Status(ServiceTargetArgs),
+  /// List clients waiting to be approved
+  Pending,
+  /// Approve a waiting client, by list position or fingerprint
+  Approve(PairSelectorArgs),
+  /// Refuse a waiting client
+  Reject(PairSelectorArgs),
+  /// List the clients this server trusts
+  Keys,
+  /// Withdraw approval from a client
+  Revoke(PairSelectorArgs),
+}
+
+#[derive(Args, Clone)]
+struct PairSelectorArgs {
+  /// Position in the list, or a fingerprint (a unique prefix is enough)
+  selector: String,
 }
 
 #[derive(Args, Clone, Default)]
@@ -169,6 +192,10 @@ fn run_cli(cli: Cli) -> Result<()> {
     Some(Commands::Init { force }) => {
       init::init_project_config(force)?;
     }
+    Some(Commands::Pair { host }) => {
+      let runtime = build_runtime()?;
+      runtime.block_on(run_pair_mode(&host, config_override))?;
+    }
     None => {
       let Some(host) = default_host else {
         return Err(usage_error("Host is required when not using subcommands"));
@@ -185,6 +212,13 @@ fn run_cli(cli: Cli) -> Result<()> {
   }
 
   Ok(())
+}
+
+async fn run_pair_mode(host: &str, config_override: Option<PathBuf>) -> Result<()> {
+  let provider: Arc<dyn config::ConfigProvider> =
+    Arc::new(config::ConfigProviderImpl::with_override(config_override));
+
+  client::pair(host, provider.as_ref()).await
 }
 
 async fn run_client_mode(
@@ -204,8 +238,25 @@ fn usage_error(message: &str) -> Box<AdeployError> {
      Usage: adeploy <HOST> <PACKAGE> [PACKAGE...]\n\
      \x20  or: adeploy client <HOST> <PACKAGE> [PACKAGE...]\n\
      \x20  or: adeploy server [run|install|start|stop|status|uninstall]\n\
+     \x20  or: adeploy server [pending|approve|reject|keys|revoke]\n\
+     \x20  or: adeploy pair <HOST>\n\
      \x20  or: adeploy init"
   )))
+}
+
+/// Where this server keeps its approvals: beside its configuration.
+fn pair_store_path(config_override: Option<PathBuf>) -> Result<PathBuf> {
+  let config_path = config::ConfigProviderImpl::for_server(config_override).get_config_path()?;
+  Ok(
+    config_path
+      .parent()
+      .map(|parent| parent.join(pairing::PAIRED_FILE_NAME))
+      .unwrap_or_else(|| PathBuf::from(pairing::PAIRED_FILE_NAME)),
+  )
+}
+
+fn load_pair_store(config_override: Option<PathBuf>) -> Result<PairStore> {
+  PairStore::load(&pair_store_path(config_override)?)
 }
 
 fn build_runtime() -> Result<tokio::runtime::Runtime> {
@@ -284,6 +335,51 @@ fn handle_server(action: ServerAction, config_override: Option<PathBuf>) -> Resu
         opts.label,
         if opts.user { "user" } else { "system" }
       );
+    }
+    ServerAction::Pending => {
+      let store = load_pair_store(config_override)?;
+      if store.pending.is_empty() {
+        info!("No clients are waiting for approval");
+      } else {
+        info!("Clients waiting for approval:");
+        for (position, client) in store.pending.iter().enumerate() {
+          info!("  {}. {}", position + 1, client.describe());
+        }
+        info!("Approve one with `adeploy server approve <number|fingerprint>`");
+      }
+    }
+    ServerAction::Approve(opts) => {
+      let path = pair_store_path(config_override)?;
+      let mut store = PairStore::load(&path)?;
+      let client = store.approve(&opts.selector)?;
+      store.save(&path)?;
+      info!("Approved {}", client.describe());
+      info!("It can deploy now; the server picks this up without a restart");
+    }
+    ServerAction::Reject(opts) => {
+      let path = pair_store_path(config_override)?;
+      let mut store = PairStore::load(&path)?;
+      let client = store.reject(&opts.selector)?;
+      store.save(&path)?;
+      info!("Rejected {}", client.describe());
+    }
+    ServerAction::Keys => {
+      let store = load_pair_store(config_override)?;
+      if store.approved.is_empty() {
+        info!("No clients have been approved through pairing");
+      } else {
+        info!("Approved clients:");
+        for (position, client) in store.approved.iter().enumerate() {
+          info!("  {}. {}", position + 1, client.describe());
+        }
+      }
+    }
+    ServerAction::Revoke(opts) => {
+      let path = pair_store_path(config_override)?;
+      let mut store = PairStore::load(&path)?;
+      let client = store.revoke(&opts.selector)?;
+      store.save(&path)?;
+      info!("Revoked {}", client.describe());
     }
     ServerAction::Status(opts) => {
       let status = server::service_status(&opts.label, opts.user)?;

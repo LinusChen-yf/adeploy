@@ -13,12 +13,13 @@ use std::{
 use adeploy::{
   adeploy::{
     deploy_chunk::Payload, deploy_event::Event, deploy_service_client::DeployServiceClient,
-    DeployChunk, DeployStart,
+    DeployChunk, DeployStart, PairRequest, PairState,
   },
-  auth::{deploy_start_signing_payload, Auth},
+  auth::{deploy_start_signing_payload, fingerprint, pair_signing_payload, Auth},
   config::{ConfigProvider, ConfigProviderImpl, KeyPairPaths, ProjectConfig},
   deploy::DeployManager,
   error::Result as AdeployResult,
+  pairing::PairStore,
   replay::now_ms,
   server,
 };
@@ -54,6 +55,7 @@ struct Harness {
   _temp: TempDir,
   port: u16,
   deploy_root: PathBuf,
+  paired_path: PathBuf,
   public_key: String,
   signing_key: SigningKey,
   archive: Vec<u8>,
@@ -63,6 +65,15 @@ struct Harness {
 impl Harness {
   /// A running server that trusts one key, plus a real archive to send it.
   async fn start() -> Self {
+    Self::start_with(true).await
+  }
+
+  /// A running server that trusts nobody, so pairing is the only way in.
+  async fn start_untrusted() -> Self {
+    Self::start_with(false).await
+  }
+
+  async fn start_with(trusted: bool) -> Self {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path();
 
@@ -93,12 +104,18 @@ impl Harness {
     let port = free_port().await;
     let deploy_root = root.join("root");
     let config_path = root.join("adeploy.toml");
+    let paired_path = root.join("paired.toml");
+    let allowlist = if trusted {
+      format!("[\"{public_key}\"]")
+    } else {
+      "[]".to_string()
+    };
     std::fs::write(
       &config_path,
       format!(
         r#"[server]
 listen_port = {port}
-allowed_keys = ["{public_key}"]
+allowed_keys = {allowlist}
 deploy_root = "{deploy_root}"
 
 [packages.{PACKAGE}]
@@ -122,11 +139,60 @@ deploy_path = "{PACKAGE}"
       _temp: temp,
       port,
       deploy_root,
+      paired_path,
       public_key,
       signing_key,
       archive,
       file_hash,
     }
+  }
+
+  /// Send a pairing request signed with the harness key.
+  async fn request_pairing(&self, name: &str) -> Result<(PairState, String), tonic::Status> {
+    self
+      .send_pairing(name, &self.public_key, &self.signing_key)
+      .await
+  }
+
+  /// Send a pairing request presenting `public_key`, signed with `signer`.
+  async fn send_pairing(
+    &self,
+    name: &str,
+    public_key: &str,
+    signer: &SigningKey,
+  ) -> Result<(PairState, String), tonic::Status> {
+    use ed25519_dalek::Signer;
+
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let timestamp_ms = now_ms();
+    let payload = pair_signing_payload(public_key, name, &nonce, timestamp_ms);
+
+    let response = self
+      .client()
+      .await
+      .pair(tonic::Request::new(PairRequest {
+        public_key: public_key.to_string(),
+        client_name: name.to_string(),
+        nonce,
+        timestamp_ms,
+        signature: general_purpose::STANDARD.encode(signer.sign(&payload).to_bytes()),
+      }))
+      .await?
+      .into_inner();
+
+    Ok((
+      PairState::try_from(response.state).unwrap_or(PairState::Unspecified),
+      response.fingerprint,
+    ))
+  }
+
+  /// Approve everything waiting, the way an operator would.
+  fn approve_all_pending(&self) {
+    let mut store = PairStore::load(&self.paired_path).expect("load store");
+    while !store.pending.is_empty() {
+      store.approve("1").expect("approve");
+    }
+    store.save(&self.paired_path).expect("save store");
   }
 
   async fn client(&self) -> DeployServiceClient<Channel> {
@@ -391,4 +457,120 @@ async fn an_unknown_key_never_gets_to_send_an_archive() {
     !harness.deploy_root.join(PACKAGE).exists(),
     "nothing should have been written for an unauthorised caller"
   );
+}
+
+#[tokio::test]
+async fn pairing_queues_a_key_that_cannot_yet_deploy() {
+  let harness = Harness::start_untrusted().await;
+
+  let (state, server_fingerprint) = harness
+    .request_pairing("dev-box")
+    .await
+    .expect("pairing request should be accepted");
+
+  assert_eq!(state, PairState::Pending);
+  assert_eq!(
+    server_fingerprint,
+    fingerprint(&harness.public_key),
+    "both ends must derive the same fingerprint, or comparing them proves nothing"
+  );
+
+  // Queued is not trusted: the whole point is that a human decides.
+  let status = harness
+    .send(harness.start_message(), harness.archive.clone())
+    .await
+    .expect_err("a queued key must not be able to deploy");
+  assert_eq!(status.code(), tonic::Code::Unauthenticated);
+}
+
+#[tokio::test]
+async fn an_approved_key_can_deploy_without_restarting_the_server() {
+  let harness = Harness::start_untrusted().await;
+  harness
+    .request_pairing("dev-box")
+    .await
+    .expect("pairing request");
+
+  harness.approve_all_pending();
+
+  // The server was never restarted; it reads approvals per request.
+  let success = harness
+    .send(harness.start_message(), harness.archive.clone())
+    .await
+    .expect("an approved key should be able to deploy");
+  assert!(success);
+}
+
+#[tokio::test]
+async fn a_pairing_request_must_be_signed_by_the_key_it_presents() {
+  let harness = Harness::start_untrusted().await;
+
+  // Someone else's public key, signed with our own: this is how a stranger
+  // would fill an operator's queue with keys they do not control.
+  let temp = tempfile::tempdir().expect("temp dir");
+  let other_public = temp.path().join("other.pub");
+  let other_private = temp.path().join("other");
+  Auth::generate_key_pair(
+    &other_public.to_string_lossy(),
+    &other_private.to_string_lossy(),
+  )
+  .expect("key pair");
+  let stranger_key = std::fs::read_to_string(&other_public)
+    .expect("read")
+    .trim()
+    .to_string();
+
+  let status = harness
+    .send_pairing("impostor", &stranger_key, &harness.signing_key)
+    .await
+    .expect_err("a request not signed by its own key must be refused");
+
+  assert_eq!(status.code(), tonic::Code::Unauthenticated);
+  assert!(
+    PairStore::load(&harness.paired_path)
+      .expect("load store")
+      .pending
+      .is_empty(),
+    "nothing should have been queued"
+  );
+}
+
+#[tokio::test]
+async fn repeating_a_pairing_request_does_not_queue_it_twice() {
+  let harness = Harness::start_untrusted().await;
+
+  for _ in 0..3 {
+    let (state, _) = harness
+      .request_pairing("dev-box")
+      .await
+      .expect("pairing request");
+    assert_eq!(state, PairState::Pending);
+  }
+
+  let store = PairStore::load(&harness.paired_path).expect("load store");
+  assert_eq!(
+    store.pending.len(),
+    1,
+    "a client polling while it waits must not fill the queue"
+  );
+}
+
+#[tokio::test]
+async fn pairing_reports_a_key_the_allowlist_already_names() {
+  let harness = Harness::start().await;
+
+  let (state, _) = harness
+    .request_pairing("dev-box")
+    .await
+    .expect("pairing request");
+
+  assert_eq!(
+    state,
+    PairState::Approved,
+    "a key already in allowed_keys should be told so rather than queued"
+  );
+  assert!(PairStore::load(&harness.paired_path)
+    .expect("load store")
+    .pending
+    .is_empty());
 }
