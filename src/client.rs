@@ -11,9 +11,9 @@ use crate::{
   adeploy::{
     deploy_chunk::Payload, deploy_event::Event, deploy_log::Level as DeployLogLevel,
     deploy_service_client::DeployServiceClient, DeployChunk, DeployEvent, DeployLog, DeployResult,
-    DeployStart,
+    DeployStart, PairRequest, PairState,
   },
-  auth::{deploy_start_signing_payload, Auth},
+  auth::{deploy_start_signing_payload, fingerprint, pair_signing_payload, Auth},
   config::{ConfigProvider, LoadedConfig, ResolvedRemote},
   deploy::DeployManager,
   error::{AdeployError, Result},
@@ -70,6 +70,88 @@ struct AuthResources {
   public_key: String,
 }
 
+/// Ask `host` to trust this machine's key.
+///
+/// Deliberately a separate command rather than something a failed deployment
+/// does on its own: joining a server is a decision, and the operator on the
+/// other end has to be told to expect it.
+pub async fn pair(host: &str, provider: &dyn ConfigProvider) -> Result<()> {
+  let loaded = provider.load()?;
+  let remote = loaded.config.resolve_remote(host);
+  let auth = prepare_auth_resources(provider)?;
+
+  let key_fingerprint = fingerprint(&auth.public_key);
+  let client_name = local_hostname();
+
+  info!("Pairing with {}:{} as {}", host, remote.port, client_name);
+  info!("This machine's key fingerprint: {}", key_fingerprint);
+
+  let nonce = Uuid::new_v4().to_string();
+  let timestamp_ms = now_ms();
+  let payload = pair_signing_payload(&auth.public_key, &client_name, &nonce, timestamp_ms);
+  let signature = auth
+    .ssh_auth
+    .sign_data(&payload)
+    .map_err(|e| Box::new(AdeployError::Auth(format!("Failed to sign request: {}", e))))?;
+
+  let mut client = connect_deploy_client(host, &remote).await?;
+  let response = client
+    .pair(tonic::Request::new(PairRequest {
+      public_key: auth.public_key.clone(),
+      client_name,
+      nonce,
+      timestamp_ms,
+      signature: general_purpose::STANDARD.encode(&signature),
+    }))
+    .await
+    .map_err(|status| Box::new(AdeployError::Grpc(status)))?
+    .into_inner();
+
+  report_pair_state(
+    host,
+    &response.state,
+    &response.fingerprint,
+    &response.message,
+  );
+  Ok(())
+}
+
+fn report_pair_state(host: &str, state: &i32, server_fingerprint: &str, message: &str) {
+  match PairState::try_from(*state).unwrap_or(PairState::Unspecified) {
+    PairState::Approved => {
+      info!(
+        "{} already trusts this machine; deployments will work",
+        host
+      );
+    }
+    PairState::Pending => {
+      info!("Request queued on {}: {}", host, message);
+      warn!(
+        "Approve it on {} with:  adeploy server approve {}",
+        host, server_fingerprint
+      );
+      warn!("Check that fingerprint matches the one printed above before approving");
+    }
+    PairState::Rejected => {
+      error!("{} has refused this key: {}", host, message);
+    }
+    PairState::Unspecified => {
+      warn!(
+        "{} returned an unrecognised pairing state: {}",
+        host, message
+      );
+    }
+  }
+}
+
+/// Name shown in the server's pending list.
+fn local_hostname() -> String {
+  hostname::get()
+    .ok()
+    .and_then(|name| name.into_string().ok())
+    .unwrap_or_else(|| "unknown-host".to_string())
+}
+
 /// A package selected for deployment, with its sources already resolved to
 /// absolute paths against the directory holding `adeploy.toml`.
 struct SelectedPackage {
@@ -81,7 +163,7 @@ async fn connect_deploy_client(
   host: &str,
   remote: &ResolvedRemote,
 ) -> Result<DeployServiceClient<Channel>> {
-  info!("Connecting to {}:{} for deployment", host, remote.port);
+  info!("Connecting to {}:{}", host, remote.port);
 
   let endpoint_uri = format!("http://{}:{}", host, remote.port);
   let endpoint = Channel::from_shared(endpoint_uri)
@@ -186,9 +268,10 @@ async fn deploy_single_package(
     Err(status) => {
       if status.code() == tonic::Code::Unauthenticated {
         error!(
-          "Deployment rejected (unauthenticated). Add this public key to the server's `allowed_keys`: {}",
-          public_key.trim()
+          "Deployment rejected (unauthenticated). This machine's key fingerprint is {}",
+          fingerprint(public_key)
         );
+        error!("Run `adeploy pair <host>` to request access, then have an operator approve it");
       }
       return Err(Box::new(AdeployError::Grpc(status)));
     }

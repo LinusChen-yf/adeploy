@@ -23,13 +23,23 @@ In the project you want to deploy:
 
 ```bash
 adeploy init                       # write a commented adeploy.toml here
+adeploy pair <host>                # ask the server to trust this machine
 adeploy <host> <pkg> [pkg...]      # deploy one or more packages
 adeploy --help                     # list available subcommands and flags
 ```
 
-The first deployment is rejected until the client's key is authorized; the
-client prints the key to paste into the server's `allowed_keys`, and the server
-picks it up without a restart.
+Pairing queues a request; an operator on the server approves it:
+
+```bash
+adeploy server pending             # who is waiting, and from where
+adeploy server approve 1           # by position, or by fingerprint
+```
+
+Both ends print the same key fingerprint. Compare them before approving — that
+comparison is what makes the approval mean anything, rather than trusting
+whoever reached the queue first. `adeploy server keys` lists who is trusted and
+`adeploy server revoke` withdraws it. The running server picks all of this up
+without a restart.
 
 A deployment reports itself as it goes, rather than after it finishes:
 
@@ -60,6 +70,22 @@ adeploy server stop                    # stop the running service
 adeploy server uninstall               # remove the service definition
 ```
 Pass `--label <name>` to customise the service identifier (defaults to `adeploy`). Add `--no-autostart` to skip starting on boot or `--disable-restart-on-failure` to prevent automatic restarts when the service exits with an error.
+
+## Pairing
+
+`Pair` is the one method that cannot require a key, since establishing one is
+the point. A request is self-signed, which proves the sender holds the key it is
+presenting — enough to stop anyone queueing keys they do not control — and then
+waits for a human. Nothing is trusted until someone approves it.
+
+Approvals live in `paired.toml` beside the server binary, written by the tool.
+They are kept out of `adeploy.toml` so the server never rewrites a file an
+operator hand-edited, losing their comments and layout. `allowed_keys` still
+works and is simply unioned with what has been approved.
+
+The queue is bounded and deduplicated by key, so a client polling while it waits
+cannot fill it, and filling it at all needs that many distinct keys — which an
+operator looking at a full queue can see.
 
 ## How a deployment travels
 

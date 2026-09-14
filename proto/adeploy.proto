@@ -4,6 +4,13 @@ package adeploy;
 
 // Deploy service definition
 service DeployService {
+    // Ask a server to trust this client's key.
+    //
+    // The only method that cannot require a key, since establishing one is the
+    // point. A request proves possession of the key it presents and is queued
+    // for a human to approve; nothing is trusted until they do.
+    rpc Pair(PairRequest) returns (PairResponse);
+
     // The client opens with a DeployStart describing what it wants to send and
     // proving who it is, then streams the archive in chunks. The server answers
     // with live progress and a final result.
@@ -79,4 +86,38 @@ message DeployLog {
     }
     Level level = 1;
     string message = 2;
+}
+
+// Ask to be trusted by a server.
+message PairRequest {
+    // Base64 Ed25519 public key the client wants approved.
+    string public_key = 1;
+    // Name the operator will see in the pending list, usually the hostname.
+    string client_name = 2;
+    string nonce = 3;
+    int64 timestamp_ms = 4;
+    // Base64 Ed25519 signature over fields 1-4, made with the key in field 1.
+    //
+    // Self-signed: it proves the sender holds the key it is asking to have
+    // approved, so nobody can fill an operator's queue with keys they do not
+    // control.
+    string signature = 5;
+}
+
+message PairResponse {
+    PairState state = 1;
+    // Server's view of the key, for the operator to compare against the
+    // client's own output before approving.
+    string fingerprint = 2;
+    string message = 3;
+}
+
+enum PairState {
+    PAIR_STATE_UNSPECIFIED = 0;
+    // Queued, waiting for someone to run `adeploy server approve`.
+    PAIR_STATE_PENDING = 1;
+    // Already trusted; the client can deploy.
+    PAIR_STATE_APPROVED = 2;
+    // Explicitly refused by an operator.
+    PAIR_STATE_REJECTED = 3;
 }

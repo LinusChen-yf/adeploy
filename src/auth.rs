@@ -8,6 +8,7 @@ use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use log2::*;
 use rand_core::OsRng;
+use sha2::{Digest, Sha256};
 
 use crate::error::{AdeployError, Result};
 
@@ -206,6 +207,41 @@ pub fn deploy_start_signing_payload(
   push_field(&mut payload, nonce.as_bytes());
   payload.extend_from_slice(&timestamp_ms.to_le_bytes());
   payload
+}
+
+/// Bytes self-signed by a `PairRequest`.
+///
+/// A pairing request cannot be checked against a key the server already knows,
+/// so the signature proves only that the sender holds the key it is presenting.
+/// That is enough to keep anyone from queueing keys they do not control.
+pub fn pair_signing_payload(
+  public_key: &str,
+  client_name: &str,
+  nonce: &str,
+  timestamp_ms: i64,
+) -> Vec<u8> {
+  const DOMAIN: &[u8] = b"adeploy:pair:v1";
+
+  let mut payload = Vec::with_capacity(DOMAIN.len() + 96);
+  payload.extend_from_slice(DOMAIN);
+  push_field(&mut payload, public_key.as_bytes());
+  push_field(&mut payload, client_name.as_bytes());
+  push_field(&mut payload, nonce.as_bytes());
+  payload.extend_from_slice(&timestamp_ms.to_le_bytes());
+  payload
+}
+
+/// A short, comparable name for a public key, in the style of SSH.
+///
+/// Printed by the client and shown in the server's pending list so an operator
+/// can tell that the request they are approving came from the machine in front
+/// of them, rather than whoever reached the queue first.
+pub fn fingerprint(public_key: &str) -> String {
+  let digest = Sha256::digest(public_key.trim().as_bytes());
+  format!(
+    "SHA256:{}",
+    base64::engine::general_purpose::STANDARD_NO_PAD.encode(digest)
+  )
 }
 
 fn push_field(buf: &mut Vec<u8>, value: &[u8]) {

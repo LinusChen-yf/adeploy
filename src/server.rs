@@ -28,14 +28,16 @@ use crate::{
     deploy_chunk::Payload,
     deploy_event::Event,
     deploy_service_server::{DeployService, DeployServiceServer},
-    DeployAccepted, DeployChunk, DeployEvent, DeployLog, DeployResult, DeployStart,
+    DeployAccepted, DeployChunk, DeployEvent, DeployLog, DeployResult, DeployStart, PairRequest,
+    PairResponse, PairState,
   },
-  auth::{deploy_start_signing_payload, Auth},
+  auth::{deploy_start_signing_payload, fingerprint, pair_signing_payload, Auth},
   config::{ConfigProvider, PackageConfig, ProjectConfig},
   deploy::DeployManager,
   deploy_log::{DeployLogEntry, LogLevel, LogSink},
   error::{AdeployError, Result},
   init,
+  pairing::{PairOutcome, PairStore, PAIRED_FILE_NAME},
   replay::ReplayGuard,
 };
 
@@ -52,13 +54,36 @@ const EVENT_CHANNEL_SIZE: usize = 256;
 pub struct AdeployService {
   config: Arc<RwLock<ProjectConfig>>,
   replay: Arc<ReplayGuard>,
+  /// Where approvals live. Read on each request rather than cached, because
+  /// `adeploy server approve` is a separate process editing the same file.
+  paired_path: PathBuf,
+  /// Serialises this server's own read-modify-write of that file.
+  pair_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AdeployService {
-  pub fn new(config: Arc<RwLock<ProjectConfig>>) -> Self {
+  pub fn new(config: Arc<RwLock<ProjectConfig>>, paired_path: PathBuf) -> Self {
     Self {
       config,
       replay: Arc::new(ReplayGuard::new()),
+      paired_path,
+      pair_lock: Arc::new(tokio::sync::Mutex::new(())),
+    }
+  }
+
+  /// Keys trusted right now: the configured allowlist plus approved pairings.
+  fn is_trusted(&self, allowed_keys: &[String], public_key: &str) -> bool {
+    let key = public_key.trim();
+    if allowed_keys.iter().any(|allowed| allowed.trim() == key) {
+      return true;
+    }
+
+    match PairStore::load(&self.paired_path) {
+      Ok(store) => store.is_approved(key),
+      Err(e) => {
+        error!("Failed to read {}: {}", self.paired_path.display(), e);
+        false
+      }
     }
   }
 }
@@ -122,6 +147,118 @@ impl DeployService for AdeployService {
     let stream = deployment_stream(deploy_manager, accepted, inbound);
     Ok(Response::new(Box::pin(stream) as Self::DeployStream))
   }
+
+  async fn pair(
+    &self,
+    request: Request<PairRequest>,
+  ) -> std::result::Result<Response<PairResponse>, Status> {
+    let client_address = request.remote_addr().map(|address| address.to_string());
+    let request = request.into_inner();
+
+    // Nothing here is trusted yet, so the request must at least prove it holds
+    // the key it is presenting before it earns a slot in the operator's queue.
+    let signature = general_purpose::STANDARD
+      .decode(&request.signature)
+      .map_err(|e| Status::invalid_argument(format!("Invalid signature: {}", e)))?;
+
+    let payload = pair_signing_payload(
+      &request.public_key,
+      &request.client_name,
+      &request.nonce,
+      request.timestamp_ms,
+    );
+
+    match Auth::verify_signature(&request.public_key, &payload, &signature) {
+      Ok(true) => {}
+      Ok(false) => {
+        error!("Pairing request failed its own signature check");
+        return Err(Status::unauthenticated(
+          "Pairing request is not signed by the key it presents",
+        ));
+      }
+      Err(e) => {
+        error!("Pairing signature verification error: {}", e);
+        return Err(Status::unauthenticated(format!("Auth error: {}", e)));
+      }
+    }
+
+    if let Err(rejection) = self.replay.admit(&request.nonce, request.timestamp_ms) {
+      return Err(Status::unauthenticated(rejection.message()));
+    }
+
+    let allowed_keys = {
+      let config = self.config.read().await;
+      config.server.allowed_keys.clone()
+    };
+    let key_fingerprint = fingerprint(&request.public_key);
+
+    if allowed_keys
+      .iter()
+      .any(|allowed| allowed.trim() == request.public_key.trim())
+    {
+      return Ok(Response::new(PairResponse {
+        state: PairState::Approved as i32,
+        fingerprint: key_fingerprint,
+        message: "Already listed in the server's allowed_keys".to_string(),
+      }));
+    }
+
+    let _guard = self.pair_lock.lock().await;
+    let mut store = PairStore::load(&self.paired_path)
+      .map_err(|e| Status::internal(format!("Failed to read the pairing store: {}", e)))?;
+
+    let outcome = store.request(
+      &request.public_key,
+      &request.client_name,
+      client_address.clone(),
+    );
+
+    if matches!(outcome, PairOutcome::Queued | PairOutcome::AlreadyPending) {
+      store
+        .save(&self.paired_path)
+        .map_err(|e| Status::internal(format!("Failed to record the request: {}", e)))?;
+    }
+
+    let response = match outcome {
+      PairOutcome::Queued => {
+        info!(
+          "Pairing requested by {} from {} ({})",
+          request.client_name,
+          client_address.as_deref().unwrap_or("an unknown address"),
+          key_fingerprint
+        );
+        warn!("Run `adeploy server pending` to review it");
+        PairResponse {
+          state: PairState::Pending as i32,
+          fingerprint: key_fingerprint,
+          message: "Queued for approval".to_string(),
+        }
+      }
+      PairOutcome::AlreadyPending => PairResponse {
+        state: PairState::Pending as i32,
+        fingerprint: key_fingerprint,
+        message: "Already waiting for approval".to_string(),
+      },
+      PairOutcome::AlreadyApproved => PairResponse {
+        state: PairState::Approved as i32,
+        fingerprint: key_fingerprint,
+        message: "Already approved".to_string(),
+      },
+      PairOutcome::Rejected => PairResponse {
+        state: PairState::Rejected as i32,
+        fingerprint: key_fingerprint,
+        message: "This key was refused by an operator".to_string(),
+      },
+      PairOutcome::QueueFull => {
+        error!("Pairing queue is full; refusing {}", key_fingerprint);
+        return Err(Status::resource_exhausted(
+          "The server's pairing queue is full; ask an operator to review it",
+        ));
+      }
+    };
+
+    Ok(Response::new(response))
+  }
 }
 
 impl AdeployService {
@@ -146,11 +283,12 @@ impl AdeployService {
     };
 
     let presented_key = start.public_key.trim();
-    if !allowed_keys
-      .iter()
-      .any(|allowed| allowed.trim() == presented_key)
-    {
-      error!("Public key not allowed for {}", start.package_name);
+    if !self.is_trusted(&allowed_keys, presented_key) {
+      error!(
+        "Public key not allowed for {} ({})",
+        start.package_name,
+        fingerprint(presented_key)
+      );
       return Err(Status::unauthenticated("Client public key not allowed"));
     }
 
@@ -477,6 +615,13 @@ where
     .parse()
     .map_err(|e| Box::new(AdeployError::Network(format!("Invalid address: {}", e))))?;
 
+  // Beside the configuration, which is beside the binary in a real install and
+  // inside the temporary directory under test.
+  let paired_path = config_path
+    .parent()
+    .map(|parent| parent.join(PAIRED_FILE_NAME))
+    .unwrap_or_else(|| PathBuf::from(PAIRED_FILE_NAME));
+
   let message_limit = resolve_message_limit(config.server.max_file_size);
   let shared_config = Arc::new(RwLock::new(config));
   let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -490,7 +635,7 @@ where
     shutdown_rx,
   );
 
-  let adeploy_service = AdeployService::new(shared_config);
+  let adeploy_service = AdeployService::new(shared_config, paired_path);
 
   info!("Binding ADeploy server on {}", addr);
 
