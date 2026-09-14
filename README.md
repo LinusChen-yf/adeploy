@@ -8,7 +8,7 @@ ADeploy is a lightweight Rust tool for deploying applications across platforms t
 - Ed25519 signing with a server-side key allowlist, checked before any upload
 - Chunked uploads with live progress and server logs streamed back as they happen
 - One `adeploy.toml` per project, committed alongside the code it deploys
-- Optional pre/post deployment scripts and backups
+- Optional pre/post deployment scripts, snapshots, and rollback to any of them
 
 ## Quick Start
 
@@ -25,6 +25,7 @@ In the project you want to deploy:
 adeploy init                       # write a commented adeploy.toml here
 adeploy pair <host>                # ask the server to trust this machine
 adeploy <host> <pkg> [pkg...]      # deploy one or more packages
+adeploy rollback <host> <pkg>      # put the previous deployment back
 adeploy --help                     # list available subcommands and flags
 ```
 
@@ -86,6 +87,25 @@ works and is simply unioned with what has been approved.
 The queue is bounded and deduplicated by key, so a client polling while it waits
 cannot fill it, and filling it at all needs that many distinct keys — which an
 operator looking at a full queue can see.
+
+## Rolling back
+
+A deployment with `backup_enabled` snapshots the directory before replacing it.
+Those snapshots are what rollback restores:
+
+```bash
+adeploy rollback <host> <pkg> --list          # what is available
+adeploy rollback <host> <pkg>                 # the most recent snapshot
+adeploy rollback <host> <pkg> --to backup_20260914_100512
+```
+
+Rolling back runs the same before and after hooks a deployment does, because
+putting files back has the same requirement: the service holding them has to
+stop first and start after. It also snapshots the current state before
+replacing it, so a rollback can itself be undone.
+
+Snapshots live under `<deploy_root>/.backups/<package>` unless `backup_path`
+says otherwise.
 
 ## Replacing a deployment
 

@@ -73,6 +73,19 @@ enum Commands {
     /// Server host
     host: String,
   },
+  /// Put a previous deployment back
+  Rollback {
+    /// Server host
+    host: String,
+    /// Package to roll back
+    package: String,
+    /// Show the available snapshots instead of restoring one
+    #[arg(long)]
+    list: bool,
+    /// Snapshot to restore; defaults to the most recent
+    #[arg(long, value_name = "NAME")]
+    to: Option<String>,
+  },
 }
 
 #[derive(Subcommand)]
@@ -196,6 +209,21 @@ fn run_cli(cli: Cli) -> Result<()> {
       let runtime = build_runtime()?;
       runtime.block_on(run_pair_mode(&host, config_override))?;
     }
+    Some(Commands::Rollback {
+      host,
+      package,
+      list,
+      to,
+    }) => {
+      let runtime = build_runtime()?;
+      runtime.block_on(run_rollback_mode(
+        &host,
+        &package,
+        list,
+        to,
+        config_override,
+      ))?;
+    }
     None => {
       let Some(host) = default_host else {
         return Err(usage_error("Host is required when not using subcommands"));
@@ -221,6 +249,23 @@ async fn run_pair_mode(host: &str, config_override: Option<PathBuf>) -> Result<(
   client::pair(host, provider.as_ref()).await
 }
 
+async fn run_rollback_mode(
+  host: &str,
+  package: &str,
+  list: bool,
+  to: Option<String>,
+  config_override: Option<PathBuf>,
+) -> Result<()> {
+  let provider: Arc<dyn config::ConfigProvider> =
+    Arc::new(config::ConfigProviderImpl::with_override(config_override));
+
+  if list {
+    client::list_backups(host, package, provider.as_ref()).await
+  } else {
+    client::rollback(host, package, to, provider.as_ref()).await
+  }
+}
+
 async fn run_client_mode(
   host: &str,
   packages: Vec<String>,
@@ -240,6 +285,7 @@ fn usage_error(message: &str) -> Box<AdeployError> {
      \x20  or: adeploy server [run|install|start|stop|status|uninstall]\n\
      \x20  or: adeploy server [pending|approve|reject|keys|revoke]\n\
      \x20  or: adeploy pair <HOST>\n\
+     \x20  or: adeploy rollback <HOST> <PACKAGE> [--list] [--to NAME]\n\
      \x20  or: adeploy init"
   )))
 }
