@@ -110,11 +110,18 @@ struct ServiceTargetArgs {
 
 fn main() {
   let cli = Cli::parse();
-  let _log_handle = initialize_logging(&cli);
-  if let Err(err) = run_cli(cli) {
-    error!("{err}");
-    process::exit(1);
-  }
+  let mut log_handle = initialize_logging(&cli);
+  let code = match run_cli(cli) {
+    Ok(()) => 0,
+    Err(err) => {
+      error!("{err}");
+      1
+    }
+  };
+  // log2 hands records to a writer thread, and `process::exit` skips destructors,
+  // so drain the queue explicitly instead of relying on `Handle::drop`.
+  log_handle.stop();
+  process::exit(code);
 }
 
 fn initialize_logging(cli: &Cli) -> log2::Handle {
@@ -141,38 +148,39 @@ fn run_cli(cli: Cli) -> Result<()> {
     }
     Some(Commands::Client { host, packages }) => {
       let runtime = build_runtime()?;
-      runtime.block_on(run_client_mode(&host, packages));
+      runtime.block_on(run_client_mode(&host, packages))?;
     }
     None => {
-      let host = default_host
-        .unwrap_or_else(|| usage_and_exit("Host is required when not using subcommands"));
+      let Some(host) = default_host else {
+        return Err(usage_error("Host is required when not using subcommands"));
+      };
       if default_packages.is_empty() {
-        usage_and_exit("At least one package is required when not using subcommands");
+        return Err(usage_error(
+          "At least one package is required when not using subcommands",
+        ));
       }
 
       let runtime = build_runtime()?;
-      runtime.block_on(run_client_mode(&host, default_packages));
+      runtime.block_on(run_client_mode(&host, default_packages))?;
     }
   }
 
   Ok(())
 }
 
-async fn run_client_mode(host: &str, packages: Vec<String>) {
+async fn run_client_mode(host: &str, packages: Vec<String>) -> Result<()> {
   let provider: Arc<dyn config::ConfigProvider> = Arc::new(config::ConfigProviderImpl);
 
-  if let Err(e) = client::deploy(host, Some(packages), provider.as_ref()).await {
-    error!("{}", e);
-    std::process::exit(1);
-  }
+  client::deploy(host, Some(packages), provider.as_ref()).await
 }
 
-fn usage_and_exit(message: &str) -> ! {
-  error!("{message}");
-  error!("Usage: adeploy <HOST> <PACKAGE> [PACKAGE...]");
-  error!("   or: adeploy client <HOST> <PACKAGE> [PACKAGE...]");
-  error!("   or: adeploy server [run|install|start|stop|status|uninstall]");
-  std::process::exit(1);
+fn usage_error(message: &str) -> Box<AdeployError> {
+  Box::new(AdeployError::Config(format!(
+    "{message}\n\
+     Usage: adeploy <HOST> <PACKAGE> [PACKAGE...]\n\
+     \x20  or: adeploy client <HOST> <PACKAGE> [PACKAGE...]\n\
+     \x20  or: adeploy server [run|install|start|stop|status|uninstall]"
+  )))
 }
 
 fn build_runtime() -> Result<tokio::runtime::Runtime> {
@@ -207,68 +215,46 @@ fn handle_server(action: ServerAction) -> Result<()> {
       runtime.block_on(server::start_server(provider))?;
     }
     ServerAction::Install(opts) => {
-      if let Err(e) = server::install_service(
+      server::install_service(
         &opts.label,
         opts.user,
         !opts.no_autostart,
         opts.disable_restart_on_failure,
         opts.working_directory.clone(),
         opts.username.clone(),
-      ) {
-        error!("{e}");
-        process::exit(1);
-      } else {
-        info!(
-          "Installed ADeploy service '{}' at {} level",
-          opts.label,
-          if opts.user { "user" } else { "system" }
-        );
-      }
+      )?;
+      info!(
+        "Installed ADeploy service '{}' at {} level",
+        opts.label,
+        if opts.user { "user" } else { "system" }
+      );
     }
     ServerAction::Uninstall(opts) => {
-      if let Err(e) = server::uninstall_service(&opts.label, opts.user) {
-        error!("{e}");
-        process::exit(1);
-      } else {
-        info!(
-          "Uninstalled ADeploy service '{}' at {} level",
-          opts.label,
-          if opts.user { "user" } else { "system" }
-        );
-      }
+      server::uninstall_service(&opts.label, opts.user)?;
+      info!(
+        "Uninstalled ADeploy service '{}' at {} level",
+        opts.label,
+        if opts.user { "user" } else { "system" }
+      );
     }
     ServerAction::Start(opts) => {
-      if let Err(e) = server::start_service(&opts.label, opts.user) {
-        error!("{e}");
-        process::exit(1);
-      } else {
-        info!(
-          "Started ADeploy service '{}' at {} level",
-          opts.label,
-          if opts.user { "user" } else { "system" }
-        );
-      }
+      server::start_service(&opts.label, opts.user)?;
+      info!(
+        "Started ADeploy service '{}' at {} level",
+        opts.label,
+        if opts.user { "user" } else { "system" }
+      );
     }
     ServerAction::Stop(opts) => {
-      if let Err(e) = server::stop_service(&opts.label, opts.user) {
-        error!("{e}");
-        process::exit(1);
-      } else {
-        info!(
-          "Stopped ADeploy service '{}' at {} level",
-          opts.label,
-          if opts.user { "user" } else { "system" }
-        );
-      }
+      server::stop_service(&opts.label, opts.user)?;
+      info!(
+        "Stopped ADeploy service '{}' at {} level",
+        opts.label,
+        if opts.user { "user" } else { "system" }
+      );
     }
     ServerAction::Status(opts) => {
-      let status = match server::service_status(&opts.label, opts.user) {
-        Ok(status) => status,
-        Err(e) => {
-          error!("{e}");
-          process::exit(1);
-        }
-      };
+      let status = server::service_status(&opts.label, opts.user)?;
 
       info!(
         "Service '{}'(level: {}) status: {}",
