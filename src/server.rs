@@ -1,5 +1,4 @@
 use std::{
-  convert::TryInto,
   env,
   ffi::OsString,
   future::Future,
@@ -44,7 +43,13 @@ use crate::{
   replay::ReplayGuard,
 };
 
-const DEFAULT_MAX_MESSAGE_SIZE: u64 = 100 * 1024 * 1024;
+/// Ceiling on one inbound message.
+///
+/// Chunked uploads mean the largest message is a single chunk, not the whole
+/// archive, so this bounds what any one message can allocate without bounding
+/// how large a package may be. Comfortably above the client's chunk size, and
+/// far below what a whole archive used to be allowed to reach.
+const MAX_INBOUND_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
 
 /// Directory under the deploy root where uploads land before they are trusted.
 const STAGING_DIR: &str = ".staging";
@@ -484,22 +489,6 @@ impl AdeployService {
       )
       .await?;
 
-    let max_file_size = {
-      let config = self.config.read().await;
-      config.server.max_file_size
-    };
-
-    if max_file_size > 0 && start.total_size > max_file_size {
-      error!(
-        "Declared size {} for {} exceeds max_file_size {}",
-        start.total_size, start.package_name, max_file_size
-      );
-      return Err(Status::resource_exhausted(format!(
-        "Declared archive size {} exceeds configured max_file_size {}",
-        start.total_size, max_file_size
-      )));
-    }
-
     let context = self.package_context(&start.package_name).await?;
 
     Ok(AcceptedDeploy {
@@ -885,7 +874,6 @@ where
     .map(|parent| parent.join(PAIRED_FILE_NAME))
     .unwrap_or_else(|| PathBuf::from(PAIRED_FILE_NAME));
 
-  let message_limit = resolve_message_limit(config.server.max_file_size);
   let shared_config = Arc::new(RwLock::new(config));
   let (shutdown_tx, shutdown_rx) = watch::channel(false);
   let _watcher_guard = WatcherGuard {
@@ -905,8 +893,8 @@ where
   Server::builder()
     .add_service(
       DeployServiceServer::new(adeploy_service)
-        .max_decoding_message_size(message_limit)
-        .max_encoding_message_size(message_limit),
+        .max_decoding_message_size(MAX_INBOUND_MESSAGE_SIZE)
+        .max_encoding_message_size(MAX_INBOUND_MESSAGE_SIZE),
     ) // 100 MB
     .serve_with_shutdown(addr, shutdown)
     .await
@@ -970,18 +958,6 @@ fn log_startup_state(
       config_path.display()
     );
   }
-}
-
-fn resolve_message_limit(limit: u64) -> usize {
-  let limit = if limit == 0 {
-    DEFAULT_MAX_MESSAGE_SIZE
-  } else {
-    limit
-  };
-  limit
-    .min(usize::MAX as u64)
-    .try_into()
-    .unwrap_or(usize::MAX)
 }
 
 fn spawn_config_watcher(
