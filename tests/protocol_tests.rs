@@ -67,15 +67,20 @@ struct Harness {
 impl Harness {
   /// A running server that trusts one key, plus a real archive to send it.
   async fn start() -> Self {
-    Self::start_with(true).await
+    Self::start_with(true, false).await
   }
 
   /// A running server that trusts nobody, so pairing is the only way in.
   async fn start_untrusted() -> Self {
-    Self::start_with(false).await
+    Self::start_with(false, false).await
   }
 
-  async fn start_with(trusted: bool) -> Self {
+  /// A trusted server whose before-deploy hook outlasts any sane deadline.
+  async fn start_slow() -> Self {
+    Self::start_with(true, true).await
+  }
+
+  async fn start_with(trusted: bool, slow_hook: bool) -> Self {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path();
 
@@ -112,6 +117,31 @@ impl Harness {
     } else {
       "[]".to_string()
     };
+
+    // A hook that outlasts the deadline is the clearest way to ask whether the
+    // server actually stops, rather than finishing with nobody listening.
+    let hook = if slow_hook {
+      let (name, body) = if cfg!(target_os = "windows") {
+        ("slow.cmd", "@echo off\r\ntimeout /T 30 /NOBREAK > nul\r\n")
+      } else {
+        ("slow.sh", "#!/bin/sh\nsleep 30\n")
+      };
+      let script = root.join(name);
+      std::fs::write(&script, body).expect("hook script");
+      #[cfg(unix)]
+      {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).expect("hook permissions");
+      }
+      format!(
+        "before_deploy_script = \"{}\"\n",
+        script.to_string_lossy().replace('\\', "\\\\")
+      )
+    } else {
+      String::new()
+    };
     std::fs::write(
       &config_path,
       format!(
@@ -122,7 +152,7 @@ deploy_root = "{deploy_root}"
 
 [packages.{PACKAGE}]
 deploy_path = "{PACKAGE}"
-"#,
+{hook}"#,
         deploy_root = deploy_root.to_string_lossy().replace('\\', "\\\\"),
       ),
     )
@@ -274,6 +304,26 @@ deploy_path = "{PACKAGE}"
 
   /// Send an opening message followed by `body`, and collect the outcome.
   async fn send(&self, start: DeployStart, body: Vec<u8>) -> Result<bool, tonic::Status> {
+    self.send_within(start, body, None).await
+  }
+
+  /// Send with a gRPC deadline, returning the final result message.
+  async fn send_within(
+    &self,
+    start: DeployStart,
+    body: Vec<u8>,
+    deadline: Option<Duration>,
+  ) -> Result<bool, tonic::Status> {
+    let (success, _) = self.send_reporting(start, body, deadline).await?;
+    Ok(success)
+  }
+
+  async fn send_reporting(
+    &self,
+    start: DeployStart,
+    body: Vec<u8>,
+    deadline: Option<Duration>,
+  ) -> Result<(bool, String), tonic::Status> {
     let mut client = self.client().await;
     let mut chunks = vec![DeployChunk {
       payload: Some(Payload::Start(start)),
@@ -284,18 +334,22 @@ deploy_path = "{PACKAGE}"
       });
     }
 
-    let mut events = client
-      .deploy(tokio_stream::iter(chunks))
-      .await?
-      .into_inner();
+    let mut request = tonic::Request::new(tokio_stream::iter(chunks));
+    if let Some(deadline) = deadline {
+      request.set_timeout(deadline);
+    }
+
+    let mut events = client.deploy(request).await?.into_inner();
 
     let mut success = false;
+    let mut message = String::new();
     while let Some(event) = events.message().await? {
       if let Some(Event::Result(result)) = event.event {
         success = result.success;
+        message = result.message;
       }
     }
-    Ok(success)
+    Ok((success, message))
   }
 }
 
@@ -632,5 +686,40 @@ async fn a_corrupt_archive_leaves_the_live_deployment_intact() {
   assert!(
     leftovers.is_empty(),
     "no working directories should be left behind, found: {leftovers:?}"
+  );
+}
+
+#[tokio::test]
+async fn a_deployment_that_outlasts_its_deadline_is_stopped() {
+  // tonic applies `grpc-timeout` to the future that produces the response, and
+  // for a streaming method that resolves as soon as the handler hands back the
+  // stream - before any of the work it opened. The deadline went unenforced for
+  // exactly that reason once already, silently, which is why this exists.
+  let harness = Harness::start_slow().await;
+
+  let (success, message) = harness
+    .send_reporting(
+      harness.start_message(),
+      harness.archive.clone(),
+      Some(Duration::from_secs(1)),
+    )
+    .await
+    .expect("the stream itself completes");
+
+  assert!(
+    !success,
+    "a deployment past its deadline must not report success"
+  );
+  assert!(
+    message.contains("Deadline"),
+    "the server should say why it stopped, got: {message}"
+  );
+
+  // The hook runs for 30 seconds. If the deadline were not enforced, the
+  // deployment would carry on and eventually unpack.
+  sleep(Duration::from_secs(2)).await;
+  assert!(
+    !harness.deploy_root.join(PACKAGE).exists(),
+    "nothing should have been unpacked after the deadline passed"
   );
 }
