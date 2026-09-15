@@ -122,7 +122,9 @@ impl Harness {
     // server actually stops, rather than finishing with nobody listening.
     let hook = if slow_hook {
       let (name, body) = if cfg!(target_os = "windows") {
-        ("slow.cmd", "@echo off\r\ntimeout /T 30 /NOBREAK > nul\r\n")
+        // `timeout` needs a console and exits 1 when stdin is redirected, which
+        // a hook's always is, so the script would fail instead of sleeping.
+        ("slow.cmd", "@echo off\r\nping -n 31 127.0.0.1 > nul\r\n")
       } else {
         ("slow.sh", "#!/bin/sh\nsleep 30\n")
       };
