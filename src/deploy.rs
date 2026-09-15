@@ -494,6 +494,57 @@ impl DeployManager {
   }
 }
 
+/// One file inside an archive, as it will land on the server.
+#[derive(Debug, Clone)]
+pub struct ArchiveEntry {
+  pub path: String,
+  pub size: u64,
+}
+
+/// Read back what an archive holds.
+///
+/// Listing the built archive rather than walking the sources again means a
+/// preview cannot disagree with what would actually be sent, and proves the
+/// archive is readable in the first place.
+pub fn describe_archive(archive: &[u8]) -> Result<Vec<ArchiveEntry>> {
+  let decoder = flate2::read::GzDecoder::new(archive);
+  let mut tar = tar::Archive::new(decoder);
+
+  let entries = tar.entries().map_err(|e| {
+    Box::new(AdeployError::Deploy(format!(
+      "Failed to read the archive: {}",
+      e
+    )))
+  })?;
+
+  let mut listed = Vec::new();
+  for entry in entries {
+    let entry = entry.map_err(|e| {
+      Box::new(AdeployError::Deploy(format!(
+        "Failed to read an archive entry: {}",
+        e
+      )))
+    })?;
+
+    // Directories carry no payload and only add noise to a preview.
+    if entry.header().entry_type().is_dir() {
+      continue;
+    }
+
+    let path = entry
+      .path()
+      .map(|path| path.to_string_lossy().to_string())
+      .unwrap_or_else(|_| "<unreadable path>".to_string());
+
+    listed.push(ArchiveEntry {
+      path,
+      size: entry.header().size().unwrap_or(0),
+    });
+  }
+
+  Ok(listed)
+}
+
 /// Where one package lives on this server.
 ///
 /// Bundled because these three always travel together, and passing them
@@ -1070,5 +1121,33 @@ mod tests {
     let resolved = backup_directory(&config, "demo", Path::new("/srv/adeploy"));
 
     assert_eq!(resolved, PathBuf::from("/var/backups/demo"));
+  }
+
+  #[test]
+  fn an_archive_lists_the_files_it_holds() {
+    let temp = TempDir::new().expect("temp dir");
+    let source = temp.path().join("sources");
+    fs::create_dir_all(source.join("nested")).expect("dirs");
+    fs::write(source.join("app.txt"), "1234567890").expect("file");
+    fs::write(source.join("nested/lib.txt"), "abc").expect("nested file");
+
+    let (archive, _) =
+      DeployManager::package_files_blocking("demo", &[source]).expect("build archive");
+    let mut entries = describe_archive(&archive).expect("describe");
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+
+    // Directories carry no payload, so a preview lists only real files.
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].path, "app.txt");
+    assert_eq!(entries[0].size, 10);
+    assert_eq!(entries[1].path, "nested/lib.txt");
+    assert_eq!(entries[1].size, 3);
+  }
+
+  #[test]
+  fn describing_something_that_is_not_an_archive_is_an_error() {
+    // A preview must not claim an archive is fine when it cannot be read.
+    let failure = describe_archive(&[0x42u8; 512]).expect_err("not a gzip stream");
+    assert!(failure.to_string().contains("archive"));
   }
 }

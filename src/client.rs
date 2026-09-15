@@ -18,7 +18,7 @@ use crate::{
     rollback_signing_payload, Auth,
   },
   config::{ConfigProvider, LoadedConfig, ResolvedRemote},
-  deploy::DeployManager,
+  deploy::{describe_archive, DeployManager},
   error::{AdeployError, Result},
   replay::now_ms,
 };
@@ -71,6 +71,104 @@ pub async fn deploy(
 struct AuthResources {
   ssh_auth: Auth,
   public_key: String,
+}
+
+/// Show what this project declares, without contacting anything.
+///
+/// The package and remote names are the arguments every other command takes,
+/// and reading them out of the file by hand is the sort of friction that makes
+/// a tool feel heavier than it is.
+pub fn list(provider: &dyn ConfigProvider) -> Result<()> {
+  let loaded = provider.load()?;
+  info!("Configuration: {}", loaded.path.display());
+
+  if loaded.config.packages.is_empty() {
+    warn!("No packages are declared; add a [packages.<name>] table");
+  } else {
+    info!("Packages:");
+    let mut names: Vec<&String> = loaded.config.packages.keys().collect();
+    names.sort();
+    for name in names {
+      let sources = loaded
+        .config
+        .resolved_sources(name, &loaded.base_dir)
+        .unwrap_or_default();
+
+      info!("  {}", name);
+      for source in sources {
+        // A source that is not there is the most common reason packaging
+        // fails, and it costs nothing to say so before anyone tries.
+        let marker = if source.exists() { "" } else { "   (missing)" };
+        info!("      {}{}", source.display(), marker);
+      }
+    }
+  }
+
+  info!("Remotes:");
+  // Looking up "default" answers what a host with no entry of its own gets,
+  // whether that comes from [remotes.default] or straight from [defaults].
+  let fallback = loaded.config.resolve_remote("default");
+  info!(
+    "  {:<16}  port {}  connect {}s  deploy {}s",
+    "(any other host)", fallback.port, fallback.connect_timeout, fallback.deploy_timeout
+  );
+
+  let mut hosts: Vec<&String> = loaded
+    .config
+    .remotes
+    .keys()
+    .filter(|host| host.as_str() != "default")
+    .collect();
+  hosts.sort();
+  for host in hosts {
+    let remote = loaded.config.resolve_remote(host);
+    info!(
+      "  {:<16}  port {}  connect {}s  deploy {}s",
+      host, remote.port, remote.connect_timeout, remote.deploy_timeout
+    );
+  }
+
+  Ok(())
+}
+
+/// Package everything that would be sent, and report it without sending.
+///
+/// The archive is really built, so this also answers whether it can be.
+pub async fn dry_run(
+  host: &str,
+  package_names: Option<Vec<String>>,
+  provider: &dyn ConfigProvider,
+) -> Result<()> {
+  let loaded = provider.load()?;
+  info!("Loaded configuration from {}", loaded.path.display());
+
+  let remote = loaded.config.resolve_remote(host);
+  let deploy_manager = DeployManager::new();
+  let packages = select_packages(&loaded, package_names)?;
+
+  for package in packages {
+    let (archive, hash) = deploy_manager
+      .package_files(&package.name, &package.sources)
+      .await?;
+
+    let entries = describe_archive(&archive)?;
+    let uncompressed: u64 = entries.iter().map(|entry| entry.size).sum();
+
+    info!("Would deploy {} to {}:{}", package.name, host, remote.port);
+    for entry in &entries {
+      info!("      {:<48}  {}", entry.path, format_size(entry.size));
+    }
+    info!(
+      "  {} file(s), {} packed into {}, sha256 {}",
+      entries.len(),
+      format_size(uncompressed),
+      format_size(archive.len() as u64),
+      hash
+    );
+  }
+
+  info!("Nothing was sent; drop --dry-run to deploy");
+  Ok(())
 }
 
 /// Show which snapshots `host` holds for `package`.
