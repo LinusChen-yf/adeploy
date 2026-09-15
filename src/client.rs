@@ -3,7 +3,7 @@ use std::{convert::TryFrom, path::PathBuf, time::Duration};
 use async_stream::stream;
 use base64::{engine::general_purpose, Engine as _};
 use log2::*;
-use tokio::time::{timeout_at, Instant};
+use tokio::time::timeout;
 use tokio_stream::Stream;
 use tonic::transport::{Channel, Endpoint};
 use uuid::Uuid;
@@ -39,6 +39,12 @@ const CHUNK_SIZE: usize = 1024 * 1024;
 /// Report upload progress at each multiple of this percentage.
 const PROGRESS_STEP: u64 = 20;
 
+/// How often the client checks that the server is still there, and how long a
+/// ping may go unanswered. A dead link during a long deployment would otherwise
+/// look exactly like a slow one.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// How long past the deadline the client keeps listening.
 ///
 /// Both ends hold the same deadline, and the client's clock starts fractionally
@@ -70,7 +76,7 @@ pub async fn deploy(
       &auth_resources.ssh_auth,
       &auth_resources.public_key,
       &package,
-      remote.deploy_timeout,
+      &remote,
     )
     .await?;
   }
@@ -249,6 +255,7 @@ pub async fn rollback(
     &auth.public_key,
     &nonce,
     timestamp_ms,
+    remote.deploy_timeout,
   );
   let signature = sign(&auth, &payload)?;
 
@@ -262,19 +269,15 @@ pub async fn rollback(
   }
 
   let mut client = connect_deploy_client(host, &remote).await?;
-  let mut request = tonic::Request::new(RollbackRequest {
+  let request = tonic::Request::new(RollbackRequest {
     package_name: package.to_string(),
     backup_name,
     public_key: auth.public_key.clone(),
     nonce,
     timestamp_ms,
+    deploy_timeout_secs: remote.deploy_timeout,
     signature,
   });
-  let deadline = deploy_deadline(remote.deploy_timeout);
-  if remote.deploy_timeout > 0 {
-    request.set_timeout(Duration::from_secs(remote.deploy_timeout));
-  }
-
   let response = client
     .rollback(request)
     .await
@@ -284,7 +287,7 @@ pub async fn rollback(
     response.into_inner(),
     package,
     Operation::Rollback,
-    deadline,
+    silence_limit(remote.deploy_timeout),
   )
   .await
 }
@@ -500,7 +503,7 @@ async fn deploy_single_package(
   ssh_auth: &Auth,
   public_key: &str,
   package: &SelectedPackage,
-  deploy_timeout: u64,
+  remote: &ResolvedRemote,
 ) -> Result<()> {
   let package_name = package.name.as_str();
   info!("Deploying {}", package_name);
@@ -509,21 +512,23 @@ async fn deploy_single_package(
     .package_files(package_name, &package.sources)
     .await?;
 
-  let start = build_start_message(ssh_auth, public_key, package_name, &archive_data, file_hash)?;
+  let start = build_start_message(
+    ssh_auth,
+    public_key,
+    package_name,
+    &archive_data,
+    file_hash,
+    remote,
+  )?;
   let total_size = start.total_size;
 
-  let mut request = tonic::Request::new(upload_stream(start, archive_data));
+  let request = tonic::Request::new(upload_stream(start, archive_data));
 
   // Send the deadline with the request rather than keeping it on the channel.
   // `Endpoint::timeout` is client-side only, so the server kept unpacking and
   // running hooks after the client had already given up. The `grpc-timeout`
   // metadata this sets is honoured by tonic on both ends, so the two stop
   // together and cannot disagree about when.
-  let deadline = deploy_deadline(deploy_timeout);
-  if deploy_timeout > 0 {
-    request.set_timeout(Duration::from_secs(deploy_timeout));
-  }
-
   let response = match client.deploy(request).await {
     Ok(response) => response,
     Err(status) => {
@@ -542,15 +547,20 @@ async fn deploy_single_package(
     response.into_inner(),
     package_name,
     Operation::Deploy { total_size },
-    deadline,
+    silence_limit(remote.deploy_timeout),
   )
   .await
 }
 
-/// When a deployment must be finished by, if a limit is configured.
-fn deploy_deadline(deploy_timeout: u64) -> Option<Instant> {
-  (deploy_timeout > 0)
-    .then(|| Instant::now() + Duration::from_secs(deploy_timeout) + DEADLINE_GRACE)
+/// How long the client tolerates hearing nothing at all from the server.
+///
+/// Measured between events rather than from the start, because the client
+/// cannot see the moment the server considered the upload finished, which is
+/// where the server's own deploy deadline begins. The grace lets the server's
+/// verdict arrive first, leaving this as what it should be: a backstop for a
+/// server that has stopped answering altogether.
+fn silence_limit(deploy_timeout: u64) -> Option<Duration> {
+  (deploy_timeout > 0).then(|| Duration::from_secs(deploy_timeout) + DEADLINE_GRACE)
 }
 
 /// Describe and sign the upload that is about to start.
@@ -560,6 +570,7 @@ fn build_start_message(
   package_name: &str,
   archive_data: &[u8],
   file_hash: String,
+  remote: &ResolvedRemote,
 ) -> Result<DeployStart> {
   let total_size = archive_data.len() as u64;
   let nonce = Uuid::new_v4().to_string();
@@ -574,6 +585,7 @@ fn build_start_message(
     public_key,
     &nonce,
     timestamp_ms,
+    remote.deploy_timeout,
   );
   let signature = ssh_auth
     .sign_data(&payload)
@@ -586,6 +598,7 @@ fn build_start_message(
     public_key: public_key.to_string(),
     nonce,
     timestamp_ms,
+    deploy_timeout_secs: remote.deploy_timeout,
     signature: general_purpose::STANDARD.encode(&signature),
   })
 }
@@ -672,18 +685,19 @@ async fn consume_events(
   mut events: tonic::Streaming<DeployEvent>,
   package_name: &str,
   operation: Operation,
-  deadline: Option<Instant>,
+  silence_limit: Option<Duration>,
 ) -> Result<()> {
   let mut outcome: Option<DeployResult> = None;
 
   loop {
-    let next = match deadline {
-      Some(instant) => match timeout_at(instant, events.message()).await {
+    let next = match silence_limit {
+      Some(limit) => match timeout(limit, events.message()).await {
         Ok(next) => next,
         Err(_) => {
           return Err(Box::new(AdeployError::Deploy(format!(
-            "{} exceeded deploy_timeout with no answer from the server",
-            package_name
+            "{} heard nothing from the server for {}s",
+            package_name,
+            limit.as_secs()
           ))))
         }
       },
@@ -724,11 +738,17 @@ async fn consume_events(
   }
 }
 
-/// Bound only how long reaching the host may take.
+/// Bound how long reaching the host may take, and keep the link checked.
 ///
-/// The deployment deadline rides on the request instead, so the server learns
-/// about it too.
+/// The upload is not given a deadline of its own: a broken connection is an
+/// error already, and a silently dead one is what the keepalive pings are for.
+/// The deployment deadline travels in the request instead, so the server
+/// applies the same one from the moment the last byte lands.
 fn configure_endpoint(endpoint: Endpoint, remote: &ResolvedRemote) -> Endpoint {
+  let endpoint = endpoint
+    .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
+    .keep_alive_timeout(KEEPALIVE_TIMEOUT);
+
   if remote.connect_timeout == 0 {
     endpoint
   } else {

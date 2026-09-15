@@ -230,10 +230,14 @@ pub struct Defaults {
   /// Seconds allowed to establish the connection. 0 disables the limit.
   #[serde(default = "default_connect_timeout")]
   pub connect_timeout: u64,
-  /// Seconds allowed for upload plus remote deployment. 0 disables the limit.
+  /// Seconds the server may spend deploying, measured from the moment the last
+  /// byte arrives. 0 disables the limit.
   ///
-  /// Sent to the server as the request's gRPC deadline, so both ends stop at
-  /// the same moment instead of the server working on after the client gave up.
+  /// Covers the hooks, verification, backup and the swap - not the upload, so
+  /// it can be sized for what the hooks do rather than for the larger of two
+  /// unrelated things. The upload needs no limit of its own: a broken
+  /// connection is an error already, and a silently dead one is caught by
+  /// HTTP/2 keepalive.
   #[serde(default = "default_deploy_timeout")]
   pub deploy_timeout: u64,
 }

@@ -62,6 +62,8 @@ struct Harness {
   signing_key: SigningKey,
   archive: Vec<u8>,
   file_hash: String,
+  /// Carried in every start message; 0 leaves the phase unbounded.
+  deploy_timeout_secs: u64,
 }
 
 impl Harness {
@@ -77,7 +79,9 @@ impl Harness {
 
   /// A trusted server whose before-deploy hook outlasts any sane deadline.
   async fn start_slow() -> Self {
-    Self::start_with(true, true).await
+    let mut harness = Self::start_with(true, true).await;
+    harness.deploy_timeout_secs = 1;
+    harness
   }
 
   async fn start_with(trusted: bool, slow_hook: bool) -> Self {
@@ -178,6 +182,9 @@ deploy_path = "{PACKAGE}"
       signing_key,
       archive,
       file_hash,
+      // Long enough that nothing in these tests trips it by accident; the
+      // deadline test sets its own.
+      deploy_timeout_secs: 0,
     }
   }
 
@@ -256,6 +263,7 @@ deploy_path = "{PACKAGE}"
       &self.public_key,
       &nonce,
       timestamp_ms,
+      self.deploy_timeout_secs,
     );
 
     DeployStart {
@@ -265,6 +273,7 @@ deploy_path = "{PACKAGE}"
       public_key: self.public_key.clone(),
       nonce,
       timestamp_ms,
+      deploy_timeout_secs: self.deploy_timeout_secs,
       signature: general_purpose::STANDARD.encode(self.signing_key.sign(&payload).to_bytes()),
     }
   }
@@ -290,6 +299,7 @@ deploy_path = "{PACKAGE}"
       &self.public_key,
       &nonce,
       timestamp_ms,
+      self.deploy_timeout_secs,
     );
     let signature = self.signing_key.sign(&payload);
 
@@ -300,31 +310,22 @@ deploy_path = "{PACKAGE}"
       public_key: self.public_key.clone(),
       nonce,
       timestamp_ms,
+      deploy_timeout_secs: self.deploy_timeout_secs,
       signature: general_purpose::STANDARD.encode(signature.to_bytes()),
     }
   }
 
   /// Send an opening message followed by `body`, and collect the outcome.
   async fn send(&self, start: DeployStart, body: Vec<u8>) -> Result<bool, tonic::Status> {
-    self.send_within(start, body, None).await
-  }
-
-  /// Send with a gRPC deadline, returning the final result message.
-  async fn send_within(
-    &self,
-    start: DeployStart,
-    body: Vec<u8>,
-    deadline: Option<Duration>,
-  ) -> Result<bool, tonic::Status> {
-    let (success, _) = self.send_reporting(start, body, deadline).await?;
+    let (success, _) = self.send_reporting(start, body).await?;
     Ok(success)
   }
 
+  /// Send, returning the final result flag and its message.
   async fn send_reporting(
     &self,
     start: DeployStart,
     body: Vec<u8>,
-    deadline: Option<Duration>,
   ) -> Result<(bool, String), tonic::Status> {
     let mut client = self.client().await;
     let mut chunks = vec![DeployChunk {
@@ -336,12 +337,10 @@ deploy_path = "{PACKAGE}"
       });
     }
 
-    let mut request = tonic::Request::new(tokio_stream::iter(chunks));
-    if let Some(deadline) = deadline {
-      request.set_timeout(deadline);
-    }
-
-    let mut events = client.deploy(request).await?.into_inner();
+    let mut events = client
+      .deploy(tonic::Request::new(tokio_stream::iter(chunks)))
+      .await?
+      .into_inner();
 
     let mut success = false;
     let mut message = String::new();
@@ -513,6 +512,7 @@ async fn an_unknown_key_never_gets_to_send_an_archive() {
     &stranger_public,
     &nonce,
     timestamp_ms,
+    0,
   );
 
   let start = DeployStart {
@@ -522,6 +522,7 @@ async fn an_unknown_key_never_gets_to_send_an_archive() {
     public_key: stranger_public,
     nonce,
     timestamp_ms,
+    deploy_timeout_secs: 0,
     signature: general_purpose::STANDARD.encode(stranger_key.sign(&payload).to_bytes()),
   };
 
@@ -700,11 +701,7 @@ async fn a_deployment_that_outlasts_its_deadline_is_stopped() {
   let harness = Harness::start_slow().await;
 
   let (success, message) = harness
-    .send_reporting(
-      harness.start_message(),
-      harness.archive.clone(),
-      Some(Duration::from_secs(1)),
-    )
+    .send_reporting(harness.start_message(), harness.archive.clone())
     .await
     .expect("the stream itself completes");
 
@@ -723,5 +720,45 @@ async fn a_deployment_that_outlasts_its_deadline_is_stopped() {
   assert!(
     !harness.deploy_root.join(PACKAGE).exists(),
     "nothing should have been unpacked after the deadline passed"
+  );
+}
+
+#[tokio::test]
+async fn a_slow_transfer_is_not_cut_off_for_taking_long() {
+  // Nothing bounds the upload, and this is what says so: a transfer that takes
+  // far longer than the deployment budget must still be allowed to finish,
+  // which would not hold if anyone reintroduced a limit that counted it.
+  let mut harness = Harness::start().await;
+  harness.deploy_timeout_secs = 1;
+  let start = harness.start_message();
+  let body = harness.archive.clone();
+
+  let outbound = async_stream::stream! {
+    yield DeployChunk { payload: Some(Payload::Start(start)) };
+    for piece in body.chunks(32) {
+      // Slow, but never silent for longer than the bound allows.
+      sleep(Duration::from_millis(50)).await;
+      yield DeployChunk { payload: Some(Payload::Data(piece.to_vec())) };
+    }
+  };
+
+  let mut events = harness
+    .client()
+    .await
+    .deploy(tonic::Request::new(outbound))
+    .await
+    .expect("accepted")
+    .into_inner();
+
+  let mut success = false;
+  while let Some(event) = events.message().await.expect("no transport error") {
+    if let Some(Event::Result(result)) = event.event {
+      success = result.success;
+    }
+  }
+
+  assert!(
+    success,
+    "a transfer outlasting the deployment budget must still be allowed to finish"
   );
 }

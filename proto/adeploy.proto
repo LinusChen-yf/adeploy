@@ -53,7 +53,16 @@ message DeployStart {
     // Unix milliseconds. Bounds how long a captured request stays replayable
     // and lets the server forget old nonces.
     int64 timestamp_ms = 6;
-    // Base64 Ed25519 signature over fields 1-6.
+    // Seconds the server may spend deploying, measured from the moment the last
+    // byte arrives. Carried here rather than as a gRPC deadline because that is
+    // absolute from the start of the request, and so would have to cover the
+    // upload as well.
+    //
+    // The upload itself is not bounded here. A broken connection surfaces as a
+    // transport error, and a silently dead one is caught by HTTP/2 keepalive,
+    // which needs no value tuned per package or per link.
+    uint64 deploy_timeout_secs = 9;
+    // Base64 Ed25519 signature over fields 1-6 and 9.
     //
     // Covering the description rather than only the bytes binds the archive to
     // the package it was meant for, so a captured request cannot be replayed
@@ -157,6 +166,9 @@ message RollbackRequest {
     string public_key = 3;
     string nonce = 4;
     int64 timestamp_ms = 5;
-    // Base64 Ed25519 signature over fields 1-5.
+    // Seconds the server may spend restoring. There is nothing to upload, so
+    // this starts as soon as the request is accepted.
+    uint64 deploy_timeout_secs = 7;
+    // Base64 Ed25519 signature over fields 1-5 and 7.
     string signature = 6;
 }
