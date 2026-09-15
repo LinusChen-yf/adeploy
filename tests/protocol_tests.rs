@@ -247,37 +247,6 @@ deploy_path = "{PACKAGE}"
     self.signed_start(PACKAGE, self.archive.len() as u64, now_ms(), None)
   }
 
-  /// A correctly signed message that bounds how long the transfer may stall.
-  fn start_message_stalling_after(&self, transfer_timeout_secs: u64) -> DeployStart {
-    use ed25519_dalek::Signer;
-
-    let total_size = self.archive.len() as u64;
-    let nonce = uuid::Uuid::new_v4().to_string();
-    let timestamp_ms = now_ms();
-    let payload = deploy_start_signing_payload(
-      PACKAGE,
-      total_size,
-      &self.file_hash,
-      &self.public_key,
-      &nonce,
-      timestamp_ms,
-      transfer_timeout_secs,
-      self.deploy_timeout_secs,
-    );
-
-    DeployStart {
-      package_name: PACKAGE.to_string(),
-      total_size,
-      file_hash: self.file_hash.clone(),
-      public_key: self.public_key.clone(),
-      nonce,
-      timestamp_ms,
-      transfer_timeout_secs,
-      deploy_timeout_secs: self.deploy_timeout_secs,
-      signature: general_purpose::STANDARD.encode(self.signing_key.sign(&payload).to_bytes()),
-    }
-  }
-
   /// A correctly signed message describing a body other than the harness one.
   fn start_message_for(&self, body: &[u8]) -> DeployStart {
     use ed25519_dalek::Signer;
@@ -294,7 +263,6 @@ deploy_path = "{PACKAGE}"
       &self.public_key,
       &nonce,
       timestamp_ms,
-      0,
       self.deploy_timeout_secs,
     );
 
@@ -305,7 +273,6 @@ deploy_path = "{PACKAGE}"
       public_key: self.public_key.clone(),
       nonce,
       timestamp_ms,
-      transfer_timeout_secs: 0,
       deploy_timeout_secs: self.deploy_timeout_secs,
       signature: general_purpose::STANDARD.encode(self.signing_key.sign(&payload).to_bytes()),
     }
@@ -332,7 +299,6 @@ deploy_path = "{PACKAGE}"
       &self.public_key,
       &nonce,
       timestamp_ms,
-      0,
       self.deploy_timeout_secs,
     );
     let signature = self.signing_key.sign(&payload);
@@ -344,7 +310,6 @@ deploy_path = "{PACKAGE}"
       public_key: self.public_key.clone(),
       nonce,
       timestamp_ms,
-      transfer_timeout_secs: 0,
       deploy_timeout_secs: self.deploy_timeout_secs,
       signature: general_purpose::STANDARD.encode(signature.to_bytes()),
     }
@@ -548,7 +513,6 @@ async fn an_unknown_key_never_gets_to_send_an_archive() {
     &nonce,
     timestamp_ms,
     0,
-    0,
   );
 
   let start = DeployStart {
@@ -558,7 +522,6 @@ async fn an_unknown_key_never_gets_to_send_an_archive() {
     public_key: stranger_public,
     nonce,
     timestamp_ms,
-    transfer_timeout_secs: 0,
     deploy_timeout_secs: 0,
     signature: general_purpose::STANDARD.encode(stranger_key.sign(&payload).to_bytes()),
   };
@@ -761,54 +724,13 @@ async fn a_deployment_that_outlasts_its_deadline_is_stopped() {
 }
 
 #[tokio::test]
-async fn a_transfer_that_goes_quiet_is_cut_off() {
-  let harness = Harness::start().await;
-
-  // One chunk, then silence while the connection stays open. Bounding the gap
-  // rather than the total is what lets a large package take as long as it
-  // needs while a dead link still gets noticed.
-  let start = harness.start_message_stalling_after(1);
-  let head = harness.archive[..64].to_vec();
-  let outbound = async_stream::stream! {
-    yield DeployChunk { payload: Some(Payload::Start(start)) };
-    yield DeployChunk { payload: Some(Payload::Data(head)) };
-    sleep(Duration::from_secs(30)).await;
-  };
-
-  let mut events = harness
-    .client()
-    .await
-    .deploy(tonic::Request::new(outbound))
-    .await
-    .expect("the server accepts the opening message")
-    .into_inner();
-
-  let status = loop {
-    match events.message().await {
-      Ok(Some(_)) => continue,
-      Ok(None) => panic!("the stream ended without reporting the stall"),
-      Err(status) => break status,
-    }
-  };
-
-  assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
-  assert!(
-    status.message().contains("No data received"),
-    "the refusal should say the transfer went quiet, got: {}",
-    status.message()
-  );
-  assert!(
-    !harness.deploy_root.join(PACKAGE).exists(),
-    "a transfer that never finished must not have been deployed"
-  );
-}
-
-#[tokio::test]
-async fn a_large_transfer_is_not_cut_off_for_taking_long() {
-  // The mirror of the case above: the bound is on silence, so a package that
-  // simply takes a while to send must not trip it.
-  let harness = Harness::start().await;
-  let start = harness.start_message_stalling_after(2);
+async fn a_slow_transfer_is_not_cut_off_for_taking_long() {
+  // Nothing bounds the upload, and this is what says so: a transfer that takes
+  // far longer than the deployment budget must still be allowed to finish,
+  // which would not hold if anyone reintroduced a limit that counted it.
+  let mut harness = Harness::start().await;
+  harness.deploy_timeout_secs = 1;
+  let start = harness.start_message();
   let body = harness.archive.clone();
 
   let outbound = async_stream::stream! {
@@ -837,6 +759,6 @@ async fn a_large_transfer_is_not_cut_off_for_taking_long() {
 
   assert!(
     success,
-    "a slow but live transfer must be allowed to finish"
+    "a transfer outlasting the deployment budget must still be allowed to finish"
   );
 }

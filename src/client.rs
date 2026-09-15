@@ -39,6 +39,12 @@ const CHUNK_SIZE: usize = 1024 * 1024;
 /// Report upload progress at each multiple of this percentage.
 const PROGRESS_STEP: u64 = 20;
 
+/// How often the client checks that the server is still there, and how long a
+/// ping may go unanswered. A dead link during a long deployment would otherwise
+/// look exactly like a slow one.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// How long past the deadline the client keeps listening.
 ///
 /// Both ends hold the same deadline, and the client's clock starts fractionally
@@ -579,7 +585,6 @@ fn build_start_message(
     public_key,
     &nonce,
     timestamp_ms,
-    remote.transfer_timeout,
     remote.deploy_timeout,
   );
   let signature = ssh_auth
@@ -593,7 +598,6 @@ fn build_start_message(
     public_key: public_key.to_string(),
     nonce,
     timestamp_ms,
-    transfer_timeout_secs: remote.transfer_timeout,
     deploy_timeout_secs: remote.deploy_timeout,
     signature: general_purpose::STANDARD.encode(&signature),
   })
@@ -734,11 +738,17 @@ async fn consume_events(
   }
 }
 
-/// Bound only how long reaching the host may take.
+/// Bound how long reaching the host may take, and keep the link checked.
 ///
-/// The deployment deadline rides on the request instead, so the server learns
-/// about it too.
+/// The upload is not given a deadline of its own: a broken connection is an
+/// error already, and a silently dead one is what the keepalive pings are for.
+/// The deployment deadline travels in the request instead, so the server
+/// applies the same one from the moment the last byte lands.
 fn configure_endpoint(endpoint: Endpoint, remote: &ResolvedRemote) -> Endpoint {
+  let endpoint = endpoint
+    .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
+    .keep_alive_timeout(KEEPALIVE_TIMEOUT);
+
   if remote.connect_timeout == 0 {
     endpoint
   } else {

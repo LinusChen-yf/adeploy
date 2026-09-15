@@ -175,7 +175,6 @@ committed configuration behave identically on every machine.
 [defaults]
 port = 6060            # port to dial; must match the server's listen_port
 connect_timeout = 5    # seconds to establish the connection
-transfer_timeout = 60  # seconds the upload may go without moving data
 deploy_timeout = 60    # seconds for the server's work, from the last byte
 
 [packages.demo]
@@ -195,26 +194,19 @@ configuration travels to the server along with its packages, so nothing a client
 sends may decide what the server enforces. Server policy lives in `[server]`,
 and the parser rejects it anywhere else.
 
-The three phases are bounded separately, because they fail for unrelated
-reasons and scale with unrelated things:
-
-| | bounds | sized for |
-|---|---|---|
-| `connect_timeout` | establishing the connection | reaching a host that is up |
-| `transfer_timeout` | the upload going **quiet** | a link that is alive |
-| `deploy_timeout` | the server's work, from the last byte | what your hooks do |
-
-`transfer_timeout` is a gap, not a budget. How long a transfer legitimately
-takes depends on the size of the package and the speed of the link, so a total
-would have to be revisited every time either changed — the same trap a single
-combined timeout sets. A link that has gone quiet for a minute has gone quiet
-regardless of both.
-
 `deploy_timeout` starts when the last byte arrives, so it never has to leave
-room for the upload. The server is told the value and stops at it too, rather
-than working on after the client has given up. It cuts both ways: too low a
-value aborts a deployment that was going to succeed, part way through, so raise
-it for a package whose hooks run an installer or restart a service.
+room for the upload — size it for what your hooks do. The server is told the
+value and stops at it too, rather than working on after the client has given
+up. It cuts both ways: too low a value aborts a deployment that was going to
+succeed, part way through, so raise it for a package whose hooks run an
+installer or restart a service.
+
+The upload itself has no timeout, and does not need one. How long a transfer
+legitimately takes depends on the package and the link, so any limit would have
+to be revisited whenever either changed. A connection that breaks reports an
+error on its own; a connection that is silently gone — a suspended machine, a
+pulled cable, an expired NAT entry — is what HTTP/2 keepalive is for, and both
+ends enable it.
 
 ### On the server
 

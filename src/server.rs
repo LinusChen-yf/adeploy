@@ -58,6 +58,19 @@ const STAGING_DIR: &str = ".staging";
 /// Buffer for the server-to-client event stream.
 const EVENT_CHANNEL_SIZE: usize = 256;
 
+/// How often the server checks that an idle peer is still there.
+///
+/// A connection that breaks reports an error on its own; one that is silently
+/// gone - a suspended machine, a pulled cable, an expired NAT entry - sends
+/// nothing at all, and a server that is only reading would wait forever. This
+/// is the transport's own answer to that question, so no value has to be tuned
+/// per package or per link.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long a keepalive ping may go unanswered before the connection is torn
+/// down.
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Longest a client may ask the server to wait for any one phase.
 ///
 /// The timeouts arrive from the client, which is fine because they can only
@@ -162,27 +175,6 @@ async fn expire_at(deadline: Option<Instant>) {
   match deadline {
     Some(instant) => sleep_until(instant).await,
     None => std::future::pending().await,
-  }
-}
-
-/// Wait for one message, giving up if none arrives within `stall`.
-///
-/// A gap rather than a budget: how long a transfer legitimately takes depends
-/// on the size of the package and the speed of the link, but a link that has
-/// gone quiet for a minute has gone quiet regardless of either.
-async fn next_chunk(
-  inbound: &mut Streaming<DeployChunk>,
-  stall: Option<Duration>,
-) -> std::result::Result<Option<DeployChunk>, Status> {
-  match stall {
-    Some(limit) => match tokio::time::timeout(limit, inbound.message()).await {
-      Ok(message) => message,
-      Err(_) => Err(Status::deadline_exceeded(format!(
-        "No data received for {}s",
-        limit.as_secs()
-      ))),
-    },
-    None => inbound.message().await,
   }
 }
 
@@ -535,7 +527,6 @@ impl AdeployService {
       &start.public_key,
       &start.nonce,
       start.timestamp_ms,
-      start.transfer_timeout_secs,
       start.deploy_timeout_secs,
     );
     self
@@ -587,14 +578,13 @@ fn deployment_stream(
   accepted: AcceptedDeploy,
   mut inbound: Streaming<DeployChunk>,
 ) -> impl Stream<Item = std::result::Result<DeployEvent, Status>> + Send + 'static {
-  let transfer_stall = client_timeout(accepted.start.transfer_timeout_secs);
   let deploy_limit = client_timeout(accepted.start.deploy_timeout_secs);
 
   try_stream! {
     let deploy_id = deploy_manager.deploy_id.clone();
     yield accepted_event(&deploy_id);
 
-    let staged = receive_archive(&mut inbound, &accepted, &deploy_id, transfer_stall).await?;
+    let staged = receive_archive(&mut inbound, &accepted, &deploy_id).await?;
 
     // The deployment budget starts here, once the last byte is in. Measuring it
     // from the start of the request would have made it cover the upload too,
@@ -778,7 +768,6 @@ async fn receive_archive(
   inbound: &mut Streaming<DeployChunk>,
   accepted: &AcceptedDeploy,
   deploy_id: &str,
-  stall: Option<Duration>,
 ) -> std::result::Result<StagedArchive, Status> {
   tokio::fs::create_dir_all(&accepted.staging_dir)
     .await
@@ -802,7 +791,7 @@ async fn receive_archive(
   })?;
 
   let mut received: u64 = 0;
-  while let Some(chunk) = next_chunk(inbound, stall).await? {
+  while let Some(chunk) = inbound.message().await? {
     match chunk.payload {
       Some(Payload::Data(bytes)) => {
         received = received.saturating_add(bytes.len() as u64);
@@ -981,6 +970,8 @@ where
   info!("Binding ADeploy server on {}", addr);
 
   Server::builder()
+    .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
+    .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT))
     .add_service(
       DeployServiceServer::new(adeploy_service)
         .max_decoding_message_size(MAX_INBOUND_MESSAGE_SIZE)

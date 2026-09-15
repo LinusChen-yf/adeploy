@@ -26,18 +26,15 @@ const TEMPLATE: &str = r#"# adeploy configuration.
 [defaults]
 # Port to dial. Must match the server's [server].listen_port.
 port = 6060
-# The three phases are bounded separately, so each can be sized for what it
-# actually does instead of for the largest of them.
-#
 # Seconds allowed to establish the connection. 0 disables the limit.
 connect_timeout = 5
-# Seconds the upload may go without moving any data before the server gives up.
-# A bound on the link being alive, not on how long the transfer may take, so a
-# package that grows does not need this revisited. 0 disables the limit.
-transfer_timeout = 60
 # Seconds the server may spend deploying, measured from the moment the last byte
 # arrives: the hooks, verification, the backup and the swap. The upload is not
 # counted, so size this for what your hooks do. 0 disables the limit.
+#
+# The upload has no limit of its own and needs none: a broken connection is an
+# error already, and a silently dead one is caught by HTTP/2 keepalive, which
+# needs nothing tuned per package or per link.
 #
 # The server is told this value and stops at it too, rather than working on
 # after the client has given up. That cuts both ways: too low a value aborts a
