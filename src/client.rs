@@ -1,4 +1,8 @@
-use std::{convert::TryFrom, path::PathBuf, time::Duration};
+use std::{
+  convert::TryFrom,
+  path::{Path, PathBuf},
+  time::Duration,
+};
 
 use async_stream::stream;
 use base64::{engine::general_purpose, Engine as _};
@@ -12,13 +16,13 @@ use crate::{
   adeploy::{
     deploy_chunk::Payload, deploy_event::Event, deploy_log::Level as DeployLogLevel,
     deploy_service_client::DeployServiceClient, BackupListRequest, DeployChunk, DeployEvent,
-    DeployLog, DeployResult, DeployStart, PairRequest, PairState, RollbackRequest,
+    DeployLog, DeployManifest, DeployResult, DeployStart, PairRequest, PairState, RollbackRequest,
   },
   auth::{
     backup_list_signing_payload, deploy_start_signing_payload, fingerprint, pair_signing_payload,
     rollback_signing_payload, Auth,
   },
-  config::{ConfigProvider, LoadedConfig, ResolvedRemote},
+  config::{ConfigProvider, LoadedConfig, ProjectConfig, ResolvedRemote},
   deploy::{describe_archive, DeployManager},
   error::{AdeployError, Result},
   replay::now_ms,
@@ -87,6 +91,45 @@ pub async fn deploy(
 struct AuthResources {
   ssh_auth: Auth,
   public_key: String,
+}
+
+/// Everything the server needs to know about a package, read from this project.
+///
+/// The server holds no record of any package, so this travels with every
+/// request that names one - and is signed, so it cannot be rewritten in flight.
+fn manifest_for(config: &ProjectConfig, package: &str) -> Result<DeployManifest> {
+  let declared = config.packages.get(package).ok_or_else(|| {
+    Box::new(AdeployError::Config(format!(
+      "Package '{}' is not declared in this project",
+      package
+    )))
+  })?;
+
+  let deploy_path = declared.deploy_path.clone().ok_or_else(|| {
+    Box::new(AdeployError::Config(format!(
+      "Package '{}' has no deploy_path; the server needs one to know where it goes",
+      package
+    )))
+  })?;
+
+  // Absolute because there is no server-side root to resolve against any more,
+  // and a path that means something different on each machine is worse than one
+  // that is refused here.
+  if !Path::new(&deploy_path).is_absolute() {
+    return Err(Box::new(AdeployError::Config(format!(
+      "deploy_path for '{}' must be absolute, got '{}'",
+      package, deploy_path
+    ))));
+  }
+
+  Ok(DeployManifest {
+    deploy_path,
+    clean_deploy: declared.clean_deploy,
+    backup_enabled: declared.backup_enabled,
+    backup_path: declared.backup_path.clone().unwrap_or_default(),
+    before_deploy_script: declared.before_deploy_script.clone().unwrap_or_default(),
+    after_deploy_script: declared.after_deploy_script.clone().unwrap_or_default(),
+  })
 }
 
 /// Show what this project declares, without contacting anything.
@@ -195,7 +238,14 @@ pub async fn list_backups(host: &str, package: &str, provider: &dyn ConfigProvid
 
   let nonce = Uuid::new_v4().to_string();
   let timestamp_ms = now_ms();
-  let payload = backup_list_signing_payload(package, &auth.public_key, &nonce, timestamp_ms);
+  let manifest = manifest_for(&loaded.config, package)?;
+  let payload = backup_list_signing_payload(
+    package,
+    &auth.public_key,
+    &nonce,
+    timestamp_ms,
+    Some(&manifest),
+  );
   let signature = sign(&auth, &payload)?;
 
   let mut client = connect_deploy_client(host, &remote).await?;
@@ -205,6 +255,7 @@ pub async fn list_backups(host: &str, package: &str, provider: &dyn ConfigProvid
       public_key: auth.public_key.clone(),
       nonce,
       timestamp_ms,
+      manifest: Some(manifest),
       signature,
     }))
     .await
@@ -249,6 +300,7 @@ pub async fn rollback(
 
   let nonce = Uuid::new_v4().to_string();
   let timestamp_ms = now_ms();
+  let manifest = manifest_for(&loaded.config, package)?;
   let payload = rollback_signing_payload(
     package,
     &backup_name,
@@ -256,6 +308,7 @@ pub async fn rollback(
     &nonce,
     timestamp_ms,
     remote.deploy_timeout,
+    Some(&manifest),
   );
   let signature = sign(&auth, &payload)?;
 
@@ -276,6 +329,7 @@ pub async fn rollback(
     nonce,
     timestamp_ms,
     deploy_timeout_secs: remote.deploy_timeout,
+    manifest: Some(manifest),
     signature,
   });
   let response = client
@@ -420,6 +474,7 @@ fn local_hostname() -> String {
 struct SelectedPackage {
   name: String,
   sources: Vec<PathBuf>,
+  manifest: DeployManifest,
 }
 
 async fn connect_deploy_client(
@@ -478,15 +533,18 @@ fn select_packages(
     )));
   };
 
-  let packages: Vec<SelectedPackage> = names
-    .into_iter()
-    .filter_map(|name| {
-      loaded
-        .config
-        .resolved_sources(&name, &loaded.base_dir)
-        .map(|sources| SelectedPackage { name, sources })
-    })
-    .collect();
+  let mut packages = Vec::new();
+  for name in names {
+    let Some(sources) = loaded.config.resolved_sources(&name, &loaded.base_dir) else {
+      continue;
+    };
+    let manifest = manifest_for(&loaded.config, &name)?;
+    packages.push(SelectedPackage {
+      name,
+      sources,
+      manifest,
+    });
+  }
 
   if packages.is_empty() {
     return Err(Box::new(AdeployError::Config(
@@ -519,6 +577,7 @@ async fn deploy_single_package(
     &archive_data,
     file_hash,
     remote,
+    package,
   )?;
   let total_size = start.total_size;
 
@@ -571,6 +630,7 @@ fn build_start_message(
   archive_data: &[u8],
   file_hash: String,
   remote: &ResolvedRemote,
+  package: &SelectedPackage,
 ) -> Result<DeployStart> {
   let total_size = archive_data.len() as u64;
   let nonce = Uuid::new_v4().to_string();
@@ -586,6 +646,7 @@ fn build_start_message(
     &nonce,
     timestamp_ms,
     remote.deploy_timeout,
+    Some(&package.manifest),
   );
   let signature = ssh_auth
     .sign_data(&payload)
@@ -599,6 +660,7 @@ fn build_start_message(
     nonce,
     timestamp_ms,
     deploy_timeout_secs: remote.deploy_timeout,
+    manifest: Some(package.manifest.clone()),
     signature: general_purpose::STANDARD.encode(&signature),
   })
 }

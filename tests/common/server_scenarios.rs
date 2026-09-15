@@ -1,11 +1,24 @@
 //! Enumerates server-side integration test scenarios and helpers.
+//!
+//! A server holds no package configuration, so what these scenarios set up is
+//! the machine: its allow list, the directories a deployment will touch, and
+//! the hook scripts it will run. Which of those the deployment actually uses is
+//! decided by the manifest the client sends, built in `client_scenarios`.
 
 use std::{
   fs,
   path::{Path, PathBuf},
 };
 
-use crate::common::toml_escape_path;
+/// Everything a scenario laid out on the server, for the client to point at.
+pub struct ServerFixture {
+  pub config_path: PathBuf,
+  pub deploy_path: PathBuf,
+  pub backup_path: PathBuf,
+  pub pre_script: PathBuf,
+  pub post_script: PathBuf,
+  pub backup_enabled: bool,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ServerScenarioKind {
@@ -17,8 +30,6 @@ pub enum ServerScenarioKind {
   PreDeployScriptFailure,
   /// After-deploy script exits with a non-zero status.
   PostDeployScriptFailure,
-  /// Package name is not present in server configuration.
-  MissingPackage,
   /// Client public key is not on the allow list.
   UnauthorizedKey,
 }
@@ -53,11 +64,6 @@ const SERVER_SCENARIOS: &[ServerScenario] = &[
     description: "After hook fails but deployment is kept",
   },
   ServerScenario {
-    kind: ServerScenarioKind::MissingPackage,
-    name: "server_missing_package",
-    description: "Requested package is not configured on the server",
-  },
-  ServerScenario {
     kind: ServerScenarioKind::UnauthorizedKey,
     name: "server_unauthorized_key",
     description: "Client public key is not allowed",
@@ -77,14 +83,13 @@ pub fn get(kind: ServerScenarioKind) -> &'static ServerScenario {
     .expect("Missing server scenario definition")
 }
 
-/// Create a server-side `adeploy.toml` tailored to the provided scenario.
-pub fn write_server_config(
+/// Lay out the server side of a scenario.
+pub fn prepare_server(
   scenario: ServerScenarioKind,
   server_dir: &Path,
   port: u16,
   public_key: &str,
-  package_name: &str,
-) -> PathBuf {
+) -> ServerFixture {
   use ServerScenarioKind::*;
 
   let deploy_path = server_dir.join("deploy");
@@ -174,11 +179,6 @@ touch '{}'
     }
   }
 
-  let configured_package_name = match scenario {
-    MissingPackage => "other-app",
-    _ => package_name,
-  };
-
   let allowed_key_entry = if matches!(scenario, UnauthorizedKey) {
     "invalid-test-key".to_string()
   } else {
@@ -193,26 +193,20 @@ listen_port = {port}
 allowed_keys = [
   "{allowed_key}"
 ]
-
-[packages.{package}]
-deploy_path = "{deploy_path}"
-backup_enabled = {backup_enabled}
-backup_path = "{backup_path}"
-before_deploy_script = "{pre_script}"
-after_deploy_script = "{post_script}"
 "#,
     port = port,
     allowed_key = allowed_key_entry,
-    package = configured_package_name,
-    deploy_path = toml_escape_path(&deploy_path),
-    backup_enabled = backup_enabled,
-    backup_path = toml_escape_path(&backup_path),
-    pre_script = toml_escape_path(&pre_script_path),
-    post_script = toml_escape_path(&post_script_path),
   );
 
   let config_path = server_dir.join("adeploy.toml");
   fs::write(&config_path, config_content).expect("Failed to write server config file");
 
-  config_path
+  ServerFixture {
+    config_path,
+    deploy_path,
+    backup_path,
+    pre_script: pre_script_path,
+    post_script: post_script_path,
+    backup_enabled,
+  }
 }

@@ -308,8 +308,14 @@ impl DeployManager {
     info!("Creating backup at {}", backup_dir_path.display());
 
     info!("Backing up {} from {}", package_name, deploy_path.display());
-    let backup_name = format!("backup_{}", self.start_time.format("%Y%m%d_%H%M%S"));
-    let backup_full_path = backup_dir_path.join(backup_name);
+    let backup_full_path = unique_backup_path(
+      &backup_dir_path,
+      &format!(
+        "{}{}",
+        BACKUP_PREFIX,
+        self.start_time.format("%Y%m%d_%H%M%S")
+      ),
+    );
 
     self
       .copy_existing_deploy(deploy_path, &backup_full_path)
@@ -571,14 +577,19 @@ const BACKUP_PREFIX: &str = "backup_";
 
 /// Where a package's snapshots live.
 ///
-/// Under the deploy root rather than beside the binary, which is where they
-/// used to go: a package named `logs` or `deploy` would have put its snapshots
-/// straight on top of the server's own directories.
-pub fn backup_directory(config: &PackageConfig, package_name: &str, deploy_root: &Path) -> PathBuf {
-  match &config.backup_path {
-    Some(path) => PathBuf::from(path),
-    None => deploy_root.join(".backups").join(package_name),
+/// Beside the deployment unless told otherwise, which is the only place left
+/// that is certain to exist and certain to be on the same filesystem now that
+/// the server keeps no root of its own.
+pub fn backup_directory(configured: &str, deploy_path: &Path) -> PathBuf {
+  if !configured.is_empty() {
+    return PathBuf::from(configured);
   }
+
+  let name = deploy_path
+    .file_name()
+    .map(|name| name.to_string_lossy().to_string())
+    .unwrap_or_else(|| "package".to_string());
+  deploy_path.with_file_name(format!("{name}.backups"))
 }
 
 /// Snapshots available for a package, newest first.
@@ -620,9 +631,37 @@ pub fn list_backups(backup_dir: &Path) -> Result<Vec<BackupInfo>> {
   Ok(backups)
 }
 
+/// A snapshot directory that does not exist yet.
+///
+/// Names carry a timestamp to one second, so two snapshots taken inside the
+/// same second would otherwise be the same directory - and `copy_dir_recursive`
+/// merges into whatever is there rather than refusing. A rollback takes a
+/// snapshot of the current state before restoring, so the collision landed
+/// exactly where it does the most damage: the snapshot being restored from was
+/// overwritten with the state being replaced, and the rollback became a no-op
+/// that also destroyed the thing it was meant to recover.
+fn unique_backup_path(backup_dir: &Path, base_name: &str) -> PathBuf {
+  let first = backup_dir.join(base_name);
+  if !first.exists() {
+    return first;
+  }
+
+  // Suffixes sort after the bare name, so a later snapshot still reads as the
+  // newer one.
+  for attempt in 2..1_000 {
+    let candidate = backup_dir.join(format!("{base_name}-{attempt}"));
+    if !candidate.exists() {
+      return candidate;
+    }
+  }
+
+  backup_dir.join(format!("{base_name}-{}", Uuid::new_v4()))
+}
+
 /// When a snapshot was taken, from its name, falling back to its mtime.
 fn backup_created_ms(name: &str, path: &Path) -> i64 {
   let stamp = name.trim_start_matches(BACKUP_PREFIX);
+  let stamp = stamp.split_once('-').map_or(stamp, |(head, _)| head);
   if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%d_%H%M%S") {
     return parsed.and_utc().timestamp_millis();
   }
@@ -1103,23 +1142,16 @@ mod tests {
   }
 
   #[test]
-  fn the_default_backup_directory_sits_under_the_deploy_root() {
-    let config = PackageConfig::default();
-    let resolved = backup_directory(&config, "demo", Path::new("/srv/adeploy"));
-
-    // Beside the binary it could have collided with logs/ or the deploy root
-    // itself for a package named after either.
-    assert_eq!(resolved, PathBuf::from("/srv/adeploy/.backups/demo"));
+  fn snapshots_default_to_sitting_beside_the_deployment() {
+    // The only place certain to exist and to be on the same filesystem, now
+    // that the server keeps no root of its own to put them under.
+    let resolved = backup_directory("", Path::new("/opt/demo"));
+    assert_eq!(resolved, PathBuf::from("/opt/demo.backups"));
   }
 
   #[test]
   fn a_configured_backup_path_wins() {
-    let config = PackageConfig {
-      backup_path: Some("/var/backups/demo".to_string()),
-      ..PackageConfig::default()
-    };
-    let resolved = backup_directory(&config, "demo", Path::new("/srv/adeploy"));
-
+    let resolved = backup_directory("/var/backups/demo", Path::new("/opt/demo"));
     assert_eq!(resolved, PathBuf::from("/var/backups/demo"));
   }
 
@@ -1149,5 +1181,41 @@ mod tests {
     // A preview must not claim an archive is fine when it cannot be read.
     let failure = describe_archive(&[0x42u8; 512]).expect_err("not a gzip stream");
     assert!(failure.to_string().contains("archive"));
+  }
+
+  #[test]
+  fn two_snapshots_in_the_same_second_do_not_become_one() {
+    let temp = TempDir::new().expect("temp dir");
+    let backups = temp.path().join("backups");
+    fs::create_dir_all(&backups).expect("backup dir");
+
+    let first = unique_backup_path(&backups, "backup_20260915_073524");
+    fs::create_dir_all(&first).expect("first snapshot");
+    let second = unique_backup_path(&backups, "backup_20260915_073524");
+
+    assert_ne!(
+      first, second,
+      "a rollback snapshots the current state before restoring, so a collision \
+       here overwrites the snapshot being restored from"
+    );
+    assert_eq!(
+      second.file_name().unwrap().to_string_lossy(),
+      "backup_20260915_073524-2"
+    );
+  }
+
+  #[test]
+  fn a_disambiguated_snapshot_still_reads_as_the_newer_one() {
+    let temp = TempDir::new().expect("temp dir");
+    let backups = temp.path().join("backups");
+    for name in ["backup_20260915_073524", "backup_20260915_073524-2"] {
+      fs::create_dir_all(backups.join(name)).expect("snapshot");
+    }
+
+    let listed = list_backups(&backups).expect("list");
+
+    assert_eq!(listed[0].name, "backup_20260915_073524-2");
+    // The suffix is not part of the timestamp it carries.
+    assert_eq!(listed[0].created_ms, listed[1].created_ms);
   }
 }
