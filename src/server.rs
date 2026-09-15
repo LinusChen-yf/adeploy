@@ -18,6 +18,7 @@ use service_manager::{
 use tokio::{
   io::AsyncWriteExt,
   sync::{mpsc, watch, RwLock},
+  time::{sleep_until, Instant},
 };
 use tokio_stream::Stream;
 use tonic::{transport::Server, Request, Response, Status, Streaming};
@@ -136,6 +137,39 @@ impl Drop for StagedArchive {
 enum DeployStep {
   Log(DeployLogEntry),
   Finished(Result<()>),
+  Expired,
+}
+
+/// The deadline the client asked for, as an instant.
+///
+/// tonic applies `grpc-timeout` to the future that produces the response, which
+/// for a streaming method resolves as soon as the handler hands back the
+/// stream - long before the upload and the deployment that stream then runs.
+/// Holding the work to that deadline is therefore ours to do.
+fn request_deadline<T>(request: &Request<T>) -> Option<Instant> {
+  let raw = request.metadata().get("grpc-timeout")?.to_str().ok()?;
+  let (value, unit) = raw.split_at(raw.len().checked_sub(1)?);
+  let value: u64 = value.parse().ok()?;
+
+  let duration = match unit {
+    "H" => Duration::from_secs(value.checked_mul(60 * 60)?),
+    "M" => Duration::from_secs(value.checked_mul(60)?),
+    "S" => Duration::from_secs(value),
+    "m" => Duration::from_millis(value),
+    "u" => Duration::from_micros(value),
+    "n" => Duration::from_nanos(value),
+    _ => return None,
+  };
+
+  Some(Instant::now() + duration)
+}
+
+/// Resolve at `deadline`, or never when there is not one.
+async fn expire_at(deadline: Option<Instant>) {
+  match deadline {
+    Some(instant) => sleep_until(instant).await,
+    None => std::future::pending().await,
+  }
 }
 
 #[tonic::async_trait]
@@ -147,6 +181,7 @@ impl DeployService for AdeployService {
     &self,
     request: Request<Streaming<DeployChunk>>,
   ) -> std::result::Result<Response<Self::DeployStream>, Status> {
+    let deadline = request_deadline(&request);
     let mut inbound = request.into_inner();
 
     // The opening message is checked before any response stream exists, so a
@@ -161,7 +196,7 @@ impl DeployService for AdeployService {
       deploy_manager.deploy_id, accepted.start.package_name, accepted.start.total_size
     );
 
-    let stream = deployment_stream(deploy_manager, accepted, inbound);
+    let stream = deployment_stream(deploy_manager, accepted, inbound, deadline);
     Ok(Response::new(Box::pin(stream) as Self::DeployStream))
   }
 
@@ -216,6 +251,7 @@ impl DeployService for AdeployService {
     &self,
     request: Request<RollbackRequest>,
   ) -> std::result::Result<Response<Self::RollbackStream>, Status> {
+    let deadline = request_deadline(&request);
     let request = request.into_inner();
 
     let payload = rollback_signing_payload(
@@ -267,7 +303,13 @@ impl DeployService for AdeployService {
       request.package_name, chosen.name, deploy_manager.deploy_id
     );
 
-    let stream = rollback_stream(deploy_manager, request.package_name, context, chosen);
+    let stream = rollback_stream(
+      deploy_manager,
+      request.package_name,
+      context,
+      chosen,
+      deadline,
+    );
     Ok(Response::new(Box::pin(stream) as Self::RollbackStream))
   }
 
@@ -527,26 +569,50 @@ fn deployment_stream(
   deploy_manager: DeployManager,
   accepted: AcceptedDeploy,
   mut inbound: Streaming<DeployChunk>,
+  deadline: Option<Instant>,
 ) -> impl Stream<Item = std::result::Result<DeployEvent, Status>> + Send + 'static {
   try_stream! {
     let deploy_id = deploy_manager.deploy_id.clone();
     yield accepted_event(&deploy_id);
 
-    let staged = receive_archive(&mut inbound, &accepted, &deploy_id).await?;
+    let staged = match tokio::time::timeout_at(
+      deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(u32::MAX as u64)),
+      receive_archive(&mut inbound, &accepted, &deploy_id),
+    )
+    .await
+    {
+      Ok(result) => result?,
+      Err(_) => {
+        error!("Upload for {} exceeded the client's deadline", accepted.start.package_name);
+        Err(Status::deadline_exceeded("Upload exceeded the deadline"))?;
+        unreachable!()
+      }
+    };
 
     let (sender, mut receiver) = mpsc::channel(EVENT_CHANNEL_SIZE);
     let sink = LogSink::new(sender);
     let work = execute_deployment(&deploy_manager, &accepted, &staged.path, &sink);
     tokio::pin!(work);
+    let expiry = expire_at(deadline);
+    tokio::pin!(expiry);
 
     loop {
       let step = tokio::select! {
         Some(entry) = receiver.recv() => DeployStep::Log(entry),
         outcome = &mut work => DeployStep::Finished(outcome),
+        _ = &mut expiry => DeployStep::Expired,
       };
 
       match step {
         DeployStep::Log(entry) => yield log_event(entry),
+        // Dropping the generator drops the work with it, so the deployment
+        // stops here rather than carrying on with nobody waiting for it.
+        DeployStep::Expired => {
+          error!("Deployment {} exceeded the client's deadline", deploy_id);
+          yield log_event(DeployLogEntry::error("Deadline exceeded; stopping"));
+          yield result_event(false, "Deadline exceeded", &deploy_id);
+          break;
+        }
         DeployStep::Finished(outcome) => {
           // Whatever the work produced before returning still belongs to the
           // client, including the entries explaining a failure.
@@ -578,6 +644,7 @@ fn rollback_stream(
   package_name: String,
   context: PackageContext,
   chosen: crate::deploy::BackupInfo,
+  deadline: Option<Instant>,
 ) -> impl Stream<Item = std::result::Result<DeployEvent, Status>> + Send + 'static {
   try_stream! {
     let deploy_id = deploy_manager.deploy_id.clone();
@@ -587,15 +654,24 @@ fn rollback_stream(
     let sink = LogSink::new(sender);
     let work = execute_rollback(&deploy_manager, &package_name, &context, &chosen, &sink);
     tokio::pin!(work);
+    let expiry = expire_at(deadline);
+    tokio::pin!(expiry);
 
     loop {
       let step = tokio::select! {
         Some(entry) = receiver.recv() => DeployStep::Log(entry),
         outcome = &mut work => DeployStep::Finished(outcome),
+        _ = &mut expiry => DeployStep::Expired,
       };
 
       match step {
         DeployStep::Log(entry) => yield log_event(entry),
+        DeployStep::Expired => {
+          error!("Rollback {} exceeded the client's deadline", deploy_id);
+          yield log_event(DeployLogEntry::error("Deadline exceeded; stopping"));
+          yield result_event(false, "Deadline exceeded", &deploy_id);
+          break;
+        }
         DeployStep::Finished(outcome) => {
           while let Ok(entry) = receiver.try_recv() {
             yield log_event(entry);

@@ -3,6 +3,7 @@ use std::{convert::TryFrom, path::PathBuf, time::Duration};
 use async_stream::stream;
 use base64::{engine::general_purpose, Engine as _};
 use log2::*;
+use tokio::time::{timeout_at, Instant};
 use tokio_stream::Stream;
 use tonic::transport::{Channel, Endpoint};
 use uuid::Uuid;
@@ -37,6 +38,15 @@ const CHUNK_SIZE: usize = 1024 * 1024;
 
 /// Report upload progress at each multiple of this percentage.
 const PROGRESS_STEP: u64 = 20;
+
+/// How long past the deadline the client keeps listening.
+///
+/// Both ends hold the same deadline, and the client's clock starts fractionally
+/// earlier, so without this it always gives up first and reports a silent
+/// server rather than the verdict the server is in the middle of sending. This
+/// leaves the client-side limit as what it should be: a backstop for a server
+/// that has stopped answering altogether.
+const DEADLINE_GRACE: Duration = Duration::from_secs(2);
 
 /// Deploy specific packages using an explicit provider
 pub async fn deploy(
@@ -260,6 +270,7 @@ pub async fn rollback(
     timestamp_ms,
     signature,
   });
+  let deadline = deploy_deadline(remote.deploy_timeout);
   if remote.deploy_timeout > 0 {
     request.set_timeout(Duration::from_secs(remote.deploy_timeout));
   }
@@ -269,7 +280,13 @@ pub async fn rollback(
     .await
     .map_err(|status| unauthenticated_hint(status, &auth.public_key))?;
 
-  consume_events(response.into_inner(), package, Operation::Rollback).await
+  consume_events(
+    response.into_inner(),
+    package,
+    Operation::Rollback,
+    deadline,
+  )
+  .await
 }
 
 fn sign(auth: &AuthResources, payload: &[u8]) -> Result<String> {
@@ -502,6 +519,7 @@ async fn deploy_single_package(
   // running hooks after the client had already given up. The `grpc-timeout`
   // metadata this sets is honoured by tonic on both ends, so the two stop
   // together and cannot disagree about when.
+  let deadline = deploy_deadline(deploy_timeout);
   if deploy_timeout > 0 {
     request.set_timeout(Duration::from_secs(deploy_timeout));
   }
@@ -524,8 +542,15 @@ async fn deploy_single_package(
     response.into_inner(),
     package_name,
     Operation::Deploy { total_size },
+    deadline,
   )
   .await
+}
+
+/// When a deployment must be finished by, if a limit is configured.
+fn deploy_deadline(deploy_timeout: u64) -> Option<Instant> {
+  (deploy_timeout > 0)
+    .then(|| Instant::now() + Duration::from_secs(deploy_timeout) + DEADLINE_GRACE)
 }
 
 /// Describe and sign the upload that is about to start.
@@ -638,18 +663,34 @@ impl Operation {
 }
 
 /// Render the server's events as they arrive, and report the final outcome.
+///
+/// `deadline` is enforced here as well as on the server. tonic applies
+/// `grpc-timeout` to the future that produces the response, not to the stream
+/// that follows, so without this a server that stopped answering mid-deployment
+/// would leave the client waiting indefinitely.
 async fn consume_events(
   mut events: tonic::Streaming<DeployEvent>,
   package_name: &str,
   operation: Operation,
+  deadline: Option<Instant>,
 ) -> Result<()> {
   let mut outcome: Option<DeployResult> = None;
 
   loop {
-    let message = events
-      .message()
-      .await
-      .map_err(|status| Box::new(AdeployError::Grpc(status)))?;
+    let next = match deadline {
+      Some(instant) => match timeout_at(instant, events.message()).await {
+        Ok(next) => next,
+        Err(_) => {
+          return Err(Box::new(AdeployError::Deploy(format!(
+            "{} exceeded deploy_timeout with no answer from the server",
+            package_name
+          ))))
+        }
+      },
+      None => events.message().await,
+    };
+
+    let message = next.map_err(|status| Box::new(AdeployError::Grpc(status)))?;
 
     let Some(event) = message else { break };
 
