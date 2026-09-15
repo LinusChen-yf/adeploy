@@ -26,16 +26,23 @@ const TEMPLATE: &str = r#"# adeploy configuration.
 [defaults]
 # Port to dial. Must match the server's [server].listen_port.
 port = 6060
+# The three phases are bounded separately, so each can be sized for what it
+# actually does instead of for the largest of them.
+#
 # Seconds allowed to establish the connection. 0 disables the limit.
 connect_timeout = 5
-# Seconds allowed for the upload plus everything the server does afterwards:
-# unpacking, backups and both hook scripts. 0 disables the limit.
+# Seconds the upload may go without moving any data before the server gives up.
+# A bound on the link being alive, not on how long the transfer may take, so a
+# package that grows does not need this revisited. 0 disables the limit.
+transfer_timeout = 60
+# Seconds the server may spend deploying, measured from the moment the last byte
+# arrives: the hooks, verification, the backup and the swap. The upload is not
+# counted, so size this for what your hooks do. 0 disables the limit.
 #
-# Travels with the request as its gRPC deadline, so the server stops at the same
-# moment rather than working on after the client has given up. That cuts both
-# ways: too low a value aborts a deployment that was going to succeed, part way
-# through. Raise it for a package whose hooks run an installer or restart a
-# service, per host in [remotes] if only some are slow.
+# The server is told this value and stops at it too, rather than working on
+# after the client has given up. That cuts both ways: too low a value aborts a
+# deployment that was going to succeed, part way through. Raise it for a package
+# whose hooks run an installer, per host in [remotes] if only some are slow.
 deploy_timeout = 60
 
 # A package describes both halves of a deployment: what the client archives and

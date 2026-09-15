@@ -188,6 +188,7 @@ impl Auth {
 /// upload to the package it was meant for: previously `package_name` was
 /// unsigned, so a captured request could be replayed against a different
 /// package's deploy path and hooks.
+#[allow(clippy::too_many_arguments)]
 pub fn deploy_start_signing_payload(
   package_name: &str,
   total_size: u64,
@@ -195,8 +196,12 @@ pub fn deploy_start_signing_payload(
   public_key: &str,
   nonce: &str,
   timestamp_ms: i64,
+  transfer_timeout_secs: u64,
+  deploy_timeout_secs: u64,
 ) -> Vec<u8> {
-  const DOMAIN: &[u8] = b"adeploy:deploy-start:v1";
+  // Bumped with the fields: a signature made for the old shape must not verify
+  // against the new one, where the timeouts would otherwise be unauthenticated.
+  const DOMAIN: &[u8] = b"adeploy:deploy-start:v2";
 
   let mut payload = Vec::with_capacity(DOMAIN.len() + 128);
   payload.extend_from_slice(DOMAIN);
@@ -206,6 +211,8 @@ pub fn deploy_start_signing_payload(
   push_field(&mut payload, public_key.as_bytes());
   push_field(&mut payload, nonce.as_bytes());
   payload.extend_from_slice(&timestamp_ms.to_le_bytes());
+  payload.extend_from_slice(&transfer_timeout_secs.to_le_bytes());
+  payload.extend_from_slice(&deploy_timeout_secs.to_le_bytes());
   payload
 }
 
@@ -260,8 +267,9 @@ pub fn rollback_signing_payload(
   public_key: &str,
   nonce: &str,
   timestamp_ms: i64,
+  deploy_timeout_secs: u64,
 ) -> Vec<u8> {
-  const DOMAIN: &[u8] = b"adeploy:rollback:v1";
+  const DOMAIN: &[u8] = b"adeploy:rollback:v2";
 
   let mut payload = Vec::with_capacity(DOMAIN.len() + 128);
   payload.extend_from_slice(DOMAIN);
@@ -270,6 +278,7 @@ pub fn rollback_signing_payload(
   push_field(&mut payload, public_key.as_bytes());
   push_field(&mut payload, nonce.as_bytes());
   payload.extend_from_slice(&timestamp_ms.to_le_bytes());
+  payload.extend_from_slice(&deploy_timeout_secs.to_le_bytes());
   payload
 }
 

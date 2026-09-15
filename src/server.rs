@@ -58,6 +58,13 @@ const STAGING_DIR: &str = ".staging";
 /// Buffer for the server-to-client event stream.
 const EVENT_CHANNEL_SIZE: usize = 256;
 
+/// Longest a client may ask the server to wait for any one phase.
+///
+/// The timeouts arrive from the client, which is fine because they can only
+/// make the server stop sooner - except that "sooner" has to mean something, so
+/// an absurd value is capped rather than trusted.
+const MAX_CLIENT_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
+
 /// ADeploy gRPC service implementation
 #[derive(Clone)]
 pub struct AdeployService {
@@ -146,22 +153,8 @@ enum DeployStep {
 /// for a streaming method resolves as soon as the handler hands back the
 /// stream - long before the upload and the deployment that stream then runs.
 /// Holding the work to that deadline is therefore ours to do.
-fn request_deadline<T>(request: &Request<T>) -> Option<Instant> {
-  let raw = request.metadata().get("grpc-timeout")?.to_str().ok()?;
-  let (value, unit) = raw.split_at(raw.len().checked_sub(1)?);
-  let value: u64 = value.parse().ok()?;
-
-  let duration = match unit {
-    "H" => Duration::from_secs(value.checked_mul(60 * 60)?),
-    "M" => Duration::from_secs(value.checked_mul(60)?),
-    "S" => Duration::from_secs(value),
-    "m" => Duration::from_millis(value),
-    "u" => Duration::from_micros(value),
-    "n" => Duration::from_nanos(value),
-    _ => return None,
-  };
-
-  Some(Instant::now() + duration)
+fn client_timeout(seconds: u64) -> Option<Duration> {
+  (seconds > 0).then(|| Duration::from_secs(seconds).min(MAX_CLIENT_TIMEOUT))
 }
 
 /// Resolve at `deadline`, or never when there is not one.
@@ -169,6 +162,27 @@ async fn expire_at(deadline: Option<Instant>) {
   match deadline {
     Some(instant) => sleep_until(instant).await,
     None => std::future::pending().await,
+  }
+}
+
+/// Wait for one message, giving up if none arrives within `stall`.
+///
+/// A gap rather than a budget: how long a transfer legitimately takes depends
+/// on the size of the package and the speed of the link, but a link that has
+/// gone quiet for a minute has gone quiet regardless of either.
+async fn next_chunk(
+  inbound: &mut Streaming<DeployChunk>,
+  stall: Option<Duration>,
+) -> std::result::Result<Option<DeployChunk>, Status> {
+  match stall {
+    Some(limit) => match tokio::time::timeout(limit, inbound.message()).await {
+      Ok(message) => message,
+      Err(_) => Err(Status::deadline_exceeded(format!(
+        "No data received for {}s",
+        limit.as_secs()
+      ))),
+    },
+    None => inbound.message().await,
   }
 }
 
@@ -181,7 +195,6 @@ impl DeployService for AdeployService {
     &self,
     request: Request<Streaming<DeployChunk>>,
   ) -> std::result::Result<Response<Self::DeployStream>, Status> {
-    let deadline = request_deadline(&request);
     let mut inbound = request.into_inner();
 
     // The opening message is checked before any response stream exists, so a
@@ -196,7 +209,7 @@ impl DeployService for AdeployService {
       deploy_manager.deploy_id, accepted.start.package_name, accepted.start.total_size
     );
 
-    let stream = deployment_stream(deploy_manager, accepted, inbound, deadline);
+    let stream = deployment_stream(deploy_manager, accepted, inbound);
     Ok(Response::new(Box::pin(stream) as Self::DeployStream))
   }
 
@@ -251,7 +264,6 @@ impl DeployService for AdeployService {
     &self,
     request: Request<RollbackRequest>,
   ) -> std::result::Result<Response<Self::RollbackStream>, Status> {
-    let deadline = request_deadline(&request);
     let request = request.into_inner();
 
     let payload = rollback_signing_payload(
@@ -260,6 +272,7 @@ impl DeployService for AdeployService {
       &request.public_key,
       &request.nonce,
       request.timestamp_ms,
+      request.deploy_timeout_secs,
     );
     self
       .authenticate(
@@ -303,6 +316,8 @@ impl DeployService for AdeployService {
       request.package_name, chosen.name, deploy_manager.deploy_id
     );
 
+    // Nothing is uploaded, so the clock starts as soon as the work does.
+    let deadline = client_timeout(request.deploy_timeout_secs).map(|limit| Instant::now() + limit);
     let stream = rollback_stream(
       deploy_manager,
       request.package_name,
@@ -520,6 +535,8 @@ impl AdeployService {
       &start.public_key,
       &start.nonce,
       start.timestamp_ms,
+      start.transfer_timeout_secs,
+      start.deploy_timeout_secs,
     );
     self
       .authenticate(
@@ -569,25 +586,21 @@ fn deployment_stream(
   deploy_manager: DeployManager,
   accepted: AcceptedDeploy,
   mut inbound: Streaming<DeployChunk>,
-  deadline: Option<Instant>,
 ) -> impl Stream<Item = std::result::Result<DeployEvent, Status>> + Send + 'static {
+  let transfer_stall = client_timeout(accepted.start.transfer_timeout_secs);
+  let deploy_limit = client_timeout(accepted.start.deploy_timeout_secs);
+
   try_stream! {
     let deploy_id = deploy_manager.deploy_id.clone();
     yield accepted_event(&deploy_id);
 
-    let staged = match tokio::time::timeout_at(
-      deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(u32::MAX as u64)),
-      receive_archive(&mut inbound, &accepted, &deploy_id),
-    )
-    .await
-    {
-      Ok(result) => result?,
-      Err(_) => {
-        error!("Upload for {} exceeded the client's deadline", accepted.start.package_name);
-        Err(Status::deadline_exceeded("Upload exceeded the deadline"))?;
-        unreachable!()
-      }
-    };
+    let staged = receive_archive(&mut inbound, &accepted, &deploy_id, transfer_stall).await?;
+
+    // The deployment budget starts here, once the last byte is in. Measuring it
+    // from the start of the request would have made it cover the upload too,
+    // and then it would have to be sized for the larger of two unrelated
+    // things instead of for what the hooks actually do.
+    let deadline = deploy_limit.map(|limit| Instant::now() + limit);
 
     let (sender, mut receiver) = mpsc::channel(EVENT_CHANNEL_SIZE);
     let sink = LogSink::new(sender);
@@ -765,6 +778,7 @@ async fn receive_archive(
   inbound: &mut Streaming<DeployChunk>,
   accepted: &AcceptedDeploy,
   deploy_id: &str,
+  stall: Option<Duration>,
 ) -> std::result::Result<StagedArchive, Status> {
   tokio::fs::create_dir_all(&accepted.staging_dir)
     .await
@@ -788,7 +802,7 @@ async fn receive_archive(
   })?;
 
   let mut received: u64 = 0;
-  while let Some(chunk) = inbound.message().await? {
+  while let Some(chunk) = next_chunk(inbound, stall).await? {
     match chunk.payload {
       Some(Payload::Data(bytes)) => {
         received = received.saturating_add(bytes.len() as u64);

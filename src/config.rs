@@ -230,10 +230,19 @@ pub struct Defaults {
   /// Seconds allowed to establish the connection. 0 disables the limit.
   #[serde(default = "default_connect_timeout")]
   pub connect_timeout: u64,
-  /// Seconds allowed for upload plus remote deployment. 0 disables the limit.
+  /// Seconds the upload may go without moving any data. 0 disables the limit.
   ///
-  /// Sent to the server as the request's gRPC deadline, so both ends stop at
-  /// the same moment instead of the server working on after the client gave up.
+  /// A bound on liveness rather than on how long a transfer may take, so it
+  /// does not need revisiting as a package grows - which is the trap a total
+  /// transfer budget sets.
+  #[serde(default = "default_transfer_timeout")]
+  pub transfer_timeout: u64,
+  /// Seconds the server may spend deploying, measured from the moment the last
+  /// byte arrives. 0 disables the limit.
+  ///
+  /// Covers the hooks, verification, backup and the swap - not the upload, so
+  /// it can be sized for what the hooks do rather than for the larger of two
+  /// unrelated things.
   #[serde(default = "default_deploy_timeout")]
   pub deploy_timeout: u64,
 }
@@ -243,6 +252,7 @@ impl Default for Defaults {
     Self {
       port: default_port(),
       connect_timeout: default_connect_timeout(),
+      transfer_timeout: default_transfer_timeout(),
       deploy_timeout: default_deploy_timeout(),
     }
   }
@@ -290,6 +300,8 @@ pub struct RemoteOverride {
   #[serde(default)]
   pub connect_timeout: Option<u64>,
   #[serde(default)]
+  pub transfer_timeout: Option<u64>,
+  #[serde(default)]
   pub deploy_timeout: Option<u64>,
 }
 
@@ -326,6 +338,7 @@ impl Default for ServerSettings {
 pub struct ResolvedRemote {
   pub port: u16,
   pub connect_timeout: u64,
+  pub transfer_timeout: u64,
   pub deploy_timeout: u64,
 }
 
@@ -345,6 +358,9 @@ impl ProjectConfig {
       connect_timeout: over
         .and_then(|o| o.connect_timeout)
         .unwrap_or(self.defaults.connect_timeout),
+      transfer_timeout: over
+        .and_then(|o| o.transfer_timeout)
+        .unwrap_or(self.defaults.transfer_timeout),
       deploy_timeout: over
         .and_then(|o| o.deploy_timeout)
         .unwrap_or(self.defaults.deploy_timeout),
@@ -461,6 +477,10 @@ const fn default_connect_timeout() -> u64 {
   5
 }
 
+const fn default_transfer_timeout() -> u64 {
+  60
+}
+
 const fn default_deploy_timeout() -> u64 {
   60
 }
@@ -501,6 +521,7 @@ mod tests {
 
     assert_eq!(config.defaults.port, 6060);
     assert_eq!(config.defaults.connect_timeout, 5);
+    assert_eq!(config.defaults.transfer_timeout, 60);
     assert_eq!(config.defaults.deploy_timeout, 60);
     assert!(config.packages.is_empty());
     assert!(config.server.allowed_keys.is_empty());
