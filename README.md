@@ -119,8 +119,10 @@ putting files back has the same requirement: the service holding them has to
 stop first and start after. It also snapshots the current state before
 replacing it, so a rollback can itself be undone.
 
-Snapshots live under `<deploy_root>/.backups/<package>` unless `backup_path`
-says otherwise.
+Snapshots live beside the deployment, at `<deploy_path>.backups`, unless
+`backup_path` says otherwise. Their names carry a timestamp to the second and
+are disambiguated when two land inside the same one — which a rollback does by
+design, since it snapshots the current state before restoring.
 
 ## Replacing a deployment
 
@@ -178,9 +180,9 @@ connect_timeout = 5    # seconds to establish the connection
 deploy_timeout = 60    # seconds for the server's work, from the last byte
 
 [packages.demo]
-sources = ["./dist/demo"]   # client: what to archive
-deploy_path = "demo"        # server: where to unpack, under deploy_root
-clean_deploy = false        # server: replace the directory rather than merge
+sources = ["./dist/demo"]   # what to archive
+deploy_path = "/opt/demo"   # absolute directory on the server to unpack into
+clean_deploy = false        # replace the directory rather than merge into it
 backup_enabled = true
 
 # Per-host overrides; list only what differs from [defaults].
@@ -188,11 +190,22 @@ backup_enabled = true
 deploy_timeout = 1800
 ```
 
-`[defaults]` and `[remotes.*]` describe how *this client* reaches a server, and
-the server reads neither. That separation is load-bearing: a project's
-configuration travels to the server along with its packages, so nothing a client
-sends may decide what the server enforces. Server policy lives in `[server]`,
-and the parser rejects it anywhere else.
+A package describes its deployment end to end, and all of it travels to the
+server: where to unpack, whether to replace or merge, whether to snapshot, and
+the hooks to run. **A server holds no configuration for anything deployed to
+it** — only which port it listens on and whose keys it trusts. Adding a package,
+moving one, or changing a hook is a change to the project, committed with the
+code it deploys.
+
+`deploy_path` is absolute for that reason: there is no server-side root left for
+a relative path to resolve against.
+
+The manifest is covered by the request's signature, so it cannot be rewritten in
+flight. It is worth being clear about what that does and does not buy: an
+approved client already chooses the commands the server runs as itself, so
+approving one is trusting it with the machine. The server refuses only what is
+certainly a mistake — a relative path, the filesystem root, or its own
+directory.
 
 `deploy_timeout` starts when the last byte arrives, so it never has to leave
 room for the upload — size it for what your hooks do. The server is told the
@@ -219,15 +232,14 @@ It reads only the copy beside its own binary, never one found by searching
 upward — starting the server from inside a project checkout must not make it
 adopt that project's configuration. Use `--config <path>` to point it elsewhere.
 
-Server-only settings live under `[server]`:
+Server-only settings live under `[server]`, and there are two:
 
 - `listen_port` — the port to bind. Clients dial it through their own `port`;
   the two are separate fields because they are separate decisions that merely
   share a default. Changing it requires a restart.
 - `allowed_keys` — the base64 Ed25519 keys permitted to deploy, which the
-  client prints when it is rejected.
-- `deploy_root` — the base directory that relative `deploy_path` values land
-  under, defaulting to a `deploy` directory beside the binary.
+  client prints when it is rejected, and which `adeploy server approve`
+  maintains through pairing.
 
 The server reloads this file when it changes, so adding a key does not require
 a restart.

@@ -259,7 +259,10 @@ pub struct PackageConfig {
   /// Client side: files and directories to archive, relative to `adeploy.toml`.
   #[serde(default)]
   pub sources: Vec<String>,
-  /// Server side: where to unpack. Relative paths land under `deploy_root`.
+  /// Server side: absolute directory to unpack into.
+  ///
+  /// Absolute because it travels to the server with the package, and the server
+  /// keeps no root of its own for a relative path to hang from.
   #[serde(default)]
   pub deploy_path: Option<String>,
   /// Server side: run before unpacking; a non-zero exit aborts the deployment.
@@ -310,9 +313,6 @@ pub struct ServerSettings {
   /// Base64 Ed25519 public keys permitted to deploy.
   #[serde(default)]
   pub allowed_keys: Vec<String>,
-  /// Root for package `deploy_path` values that are relative.
-  #[serde(default)]
-  pub deploy_root: Option<String>,
 }
 
 impl Default for ServerSettings {
@@ -320,7 +320,6 @@ impl Default for ServerSettings {
     Self {
       listen_port: default_port(),
       allowed_keys: Vec::new(),
-      deploy_root: None,
     }
   }
 }
@@ -353,26 +352,6 @@ impl ProjectConfig {
         .and_then(|o| o.deploy_timeout)
         .unwrap_or(self.defaults.deploy_timeout),
     }
-  }
-
-  /// Absolute directory a package unpacks into on this server.
-  ///
-  /// A relative `deploy_path` lands under `[server].deploy_root`, so a client
-  /// cannot pick an arbitrary absolute location on the target machine.
-  /// `fallback_root` is used when no `deploy_root` is configured.
-  pub fn resolve_deploy_path(&self, package: &str, fallback_root: &Path) -> Option<PathBuf> {
-    let config = self.packages.get(package)?;
-    let root = self
-      .server
-      .deploy_root
-      .as_deref()
-      .map(PathBuf::from)
-      .unwrap_or_else(|| fallback_root.to_path_buf());
-
-    Some(match config.deploy_path.as_deref() {
-      Some(path) => resolve_against(&root, path),
-      None => root.join(package),
-    })
   }
 
   /// Absolute source paths for `package`, resolved against `base_dir`.
@@ -515,7 +494,7 @@ mod tests {
     let config = parse("");
 
     assert_eq!(config.server.listen_port, 6060);
-    assert!(config.server.deploy_root.is_none());
+    assert!(config.server.allowed_keys.is_empty());
   }
 
   #[test]
@@ -525,8 +504,8 @@ mod tests {
     // quietly ignoring it.
     for text in [
       "[defaults]\nlisten_port = 1\n",
-      "[defaults]\ndeploy_root = \"/opt\"\n",
       "[remotes.default]\nlisten_port = 1\n",
+      "[defaults]\nsources = []\n",
       "[defaults]\nallowed_keys = []\n",
     ] {
       assert!(
@@ -628,53 +607,6 @@ deploy_timeout = 30
     assert!(config
       .resolved_sources("absent", Path::new("/tmp"))
       .is_none());
-  }
-
-  #[test]
-  fn relative_deploy_path_lands_under_deploy_root() {
-    let config = parse(
-      r#"
-[server]
-deploy_root = "/opt"
-
-[packages.demo]
-deploy_path = "demo"
-"#,
-    );
-
-    let resolved = config
-      .resolve_deploy_path("demo", Path::new("/fallback"))
-      .expect("package should exist");
-    assert_eq!(resolved, PathBuf::from("/opt/demo"));
-  }
-
-  #[test]
-  fn absolute_deploy_path_overrides_deploy_root() {
-    let config = parse(
-      r#"
-[server]
-deploy_root = "/opt"
-
-[packages.demo]
-deploy_path = "/srv/demo"
-"#,
-    );
-
-    let resolved = config
-      .resolve_deploy_path("demo", Path::new("/fallback"))
-      .expect("package should exist");
-    assert_eq!(resolved, PathBuf::from("/srv/demo"));
-  }
-
-  #[test]
-  fn missing_deploy_path_defaults_to_the_package_name() {
-    let config = parse("[packages.demo]\nsources = []\n");
-
-    // No deploy_root either, so the fallback root is used.
-    let resolved = config
-      .resolve_deploy_path("demo", Path::new("/var/lib/adeploy"))
-      .expect("package should exist");
-    assert_eq!(resolved, PathBuf::from("/var/lib/adeploy/demo"));
   }
 
   #[test]

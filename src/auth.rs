@@ -10,7 +10,10 @@ use log2::*;
 use rand_core::OsRng;
 use sha2::{Digest, Sha256};
 
-use crate::error::{AdeployError, Result};
+use crate::{
+  adeploy::DeployManifest,
+  error::{AdeployError, Result},
+};
 
 /// Ed25519 authentication helper
 pub struct Auth {
@@ -197,10 +200,11 @@ pub fn deploy_start_signing_payload(
   nonce: &str,
   timestamp_ms: i64,
   deploy_timeout_secs: u64,
+  manifest: Option<&DeployManifest>,
 ) -> Vec<u8> {
-  // Bumped with the fields: a signature made for the old shape must not verify
-  // against the new one, where the timeouts would otherwise be unauthenticated.
-  const DOMAIN: &[u8] = b"adeploy:deploy-start:v2";
+  // Bumped with the fields: a signature made for an older shape must not verify
+  // against this one, where the new fields would otherwise be unauthenticated.
+  const DOMAIN: &[u8] = b"adeploy:deploy-start:v3";
 
   let mut payload = Vec::with_capacity(DOMAIN.len() + 128);
   payload.extend_from_slice(DOMAIN);
@@ -211,6 +215,7 @@ pub fn deploy_start_signing_payload(
   push_field(&mut payload, nonce.as_bytes());
   payload.extend_from_slice(&timestamp_ms.to_le_bytes());
   payload.extend_from_slice(&deploy_timeout_secs.to_le_bytes());
+  push_manifest(&mut payload, manifest);
   payload
 }
 
@@ -242,8 +247,9 @@ pub fn backup_list_signing_payload(
   public_key: &str,
   nonce: &str,
   timestamp_ms: i64,
+  manifest: Option<&DeployManifest>,
 ) -> Vec<u8> {
-  const DOMAIN: &[u8] = b"adeploy:backup-list:v1";
+  const DOMAIN: &[u8] = b"adeploy:backup-list:v2";
 
   let mut payload = Vec::with_capacity(DOMAIN.len() + 96);
   payload.extend_from_slice(DOMAIN);
@@ -251,6 +257,7 @@ pub fn backup_list_signing_payload(
   push_field(&mut payload, public_key.as_bytes());
   push_field(&mut payload, nonce.as_bytes());
   payload.extend_from_slice(&timestamp_ms.to_le_bytes());
+  push_manifest(&mut payload, manifest);
   payload
 }
 
@@ -259,6 +266,7 @@ pub fn backup_list_signing_payload(
 /// A separate domain from a deployment's: a signature authorising one must
 /// never be usable as the other, since rolling back replaces a live directory
 /// just as thoroughly as deploying does.
+#[allow(clippy::too_many_arguments)]
 pub fn rollback_signing_payload(
   package_name: &str,
   backup_name: &str,
@@ -266,8 +274,9 @@ pub fn rollback_signing_payload(
   nonce: &str,
   timestamp_ms: i64,
   deploy_timeout_secs: u64,
+  manifest: Option<&DeployManifest>,
 ) -> Vec<u8> {
-  const DOMAIN: &[u8] = b"adeploy:rollback:v2";
+  const DOMAIN: &[u8] = b"adeploy:rollback:v3";
 
   let mut payload = Vec::with_capacity(DOMAIN.len() + 128);
   payload.extend_from_slice(DOMAIN);
@@ -277,7 +286,29 @@ pub fn rollback_signing_payload(
   push_field(&mut payload, nonce.as_bytes());
   payload.extend_from_slice(&timestamp_ms.to_le_bytes());
   payload.extend_from_slice(&deploy_timeout_secs.to_le_bytes());
+  push_manifest(&mut payload, manifest);
   payload
+}
+
+/// Append a manifest to a signing payload.
+///
+/// Every field, in a fixed order, length-prefixed like the rest. The manifest
+/// says where an archive lands and what runs around it, so leaving any part of
+/// it unsigned would leave that part open to being rewritten in flight.
+fn push_manifest(buf: &mut Vec<u8>, manifest: Option<&DeployManifest>) {
+  let Some(manifest) = manifest else {
+    // Distinguish "no manifest" from an empty one, so the two cannot collide.
+    buf.push(0);
+    return;
+  };
+
+  buf.push(1);
+  push_field(buf, manifest.deploy_path.as_bytes());
+  buf.push(u8::from(manifest.clean_deploy));
+  buf.push(u8::from(manifest.backup_enabled));
+  push_field(buf, manifest.backup_path.as_bytes());
+  push_field(buf, manifest.before_deploy_script.as_bytes());
+  push_field(buf, manifest.after_deploy_script.as_bytes());
 }
 
 /// A short, comparable name for a public key, in the style of SSH.

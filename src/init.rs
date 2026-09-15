@@ -6,7 +6,7 @@ use std::{
 use log2::*;
 
 use crate::{
-  config::{executable_dir, ServerSettings, PROJECT_CONFIG_NAME},
+  config::{ServerSettings, PROJECT_CONFIG_NAME},
   error::{AdeployError, Result},
 };
 
@@ -21,8 +21,8 @@ const TEMPLATE: &str = r#"# adeploy configuration.
 # anywhere inside the checkout. Relative paths below resolve against the
 # directory holding this file, never against the working directory.
 
-# How this client reaches a server. The server reads none of it: the client is
-# the one dialling, so the port and both timeouts belong here.
+# How this client reaches a server. The client is the one dialling, so the port
+# and the timeouts belong here.
 [defaults]
 # Port to dial. Must match the server's [server].listen_port.
 port = 6060
@@ -42,27 +42,29 @@ connect_timeout = 5
 # whose hooks run an installer, per host in [remotes] if only some are slow.
 deploy_timeout = 60
 
-# A package describes both halves of a deployment: what the client archives and
-# what the server does with it. Rename "demo" to suit, and add more tables for
-# more packages.
+# A package describes a deployment end to end: what to archive, where it goes
+# and what runs around it. All of it travels to the server with the package, so
+# a server needs no configuration for anything you deploy to it. Rename "demo"
+# to suit, and add more tables for more packages.
 [packages.demo]
-# Client: files and directories to archive, in order. No glob expansion.
+# Files and directories to archive, in order. No glob expansion. Relative to the
+# directory holding this file.
 sources = ["./dist/demo"]
-# Server: where to unpack. A relative path lands under the server's deploy_root.
-deploy_path = "demo"
-# Server: replace the deploy directory instead of merging into it, so files
-# dropped from the package stop lingering. Leave it off if the directory also
-# holds things the package does not ship, such as uploads or a database.
+# Absolute directory on the server to unpack into. Absolute because the server
+# keeps no root of its own for a relative path to hang from.
+deploy_path = "/opt/demo"
+# Replace the directory instead of merging into it, so files dropped from the
+# package stop lingering. Leave it off if the directory also holds things the
+# package does not ship, such as uploads or a database.
 # clean_deploy = false
-# Server: snapshot the existing directory before unpacking.
+# Snapshot the directory before unpacking, and what `adeploy rollback` restores.
 backup_enabled = true
-# Server: where snapshots go, and what `adeploy rollback` restores from.
-# Defaults to <deploy_root>/.backups/<package>.
+# Where snapshots go. Defaults to <deploy_path>.backups.
 # backup_path = "/var/backups/demo"
-# Server: runs before unpacking. A non-zero exit aborts the deployment, so this
-# is the place to stop a service that holds the files open.
+# Runs on the server before unpacking. A non-zero exit aborts the deployment, so
+# this is the place to stop a service that holds the files open.
 # before_deploy_script = "systemctl stop demo"
-# Server: runs after unpacking. Failure is logged as a warning but the
+# Runs on the server after unpacking. Failure is logged as a warning but the
 # deployment still counts as successful.
 # after_deploy_script = "systemctl start demo"
 
@@ -72,13 +74,6 @@ backup_enabled = true
 # [remotes."192.0.2.10"]
 # port = 6070
 # deploy_timeout = 1800   # this one runs an installer
-
-# Server-local settings. A project checkout leaves this out entirely; it belongs
-# to the copy of this file beside the server binary, which generates its own.
-# [server]
-# listen_port = 6060
-# allowed_keys = []
-# deploy_root = "/opt"
 "#;
 
 /// Configuration generated on the server's first run.
@@ -92,27 +87,19 @@ const SERVER_TEMPLATE: &str = r#"# adeploy server configuration, generated on fi
 # This file belongs to this machine, not to any project. It is reloaded
 # automatically when it changes, so edits take effect without a restart.
 #
-# Only [server] is read here. A deploying client brings its own port and
-# timeouts, and nothing a client sends may decide what this server enforces.
+# There is nothing here about any package. A deploying client brings its own
+# description of what to install and where, so a server needs to know only who
+# it will listen to.
 
 [server]
 # Port to bind. Clients must dial this same port. Changing it needs a restart.
 listen_port = {port}
 # Base64 Ed25519 public keys allowed to deploy here. A client that is not
 # listed is rejected and prints its own key, ready to be pasted in below.
+#
+# `adeploy server pending` and `adeploy server approve` maintain the same list
+# through pairing, which is usually easier than copying a key by hand.
 allowed_keys = []
-# Base directory that relative deploy_path values land under. A package cannot
-# escape it unless its deploy_path is written as an absolute path.
-deploy_root = {deploy_root}
-
-# One table per package this server accepts. The name must match what the
-# client deploys. Remove the comment markers and adjust to taste.
-# [packages.demo]
-# deploy_path = "demo"
-# clean_deploy = false
-# backup_enabled = true
-# before_deploy_script = "systemctl stop demo"
-# after_deploy_script = "systemctl start demo"
 "#;
 
 /// Create the server configuration if it is not there yet.
@@ -135,9 +122,7 @@ pub fn ensure_server_config(path: &Path) -> Result<bool> {
   }
 
   let settings = ServerSettings::default();
-  let content = SERVER_TEMPLATE
-    .replace("{port}", &settings.listen_port.to_string())
-    .replace("{deploy_root}", &toml_string(&default_deploy_root()?));
+  let content = SERVER_TEMPLATE.replace("{port}", &settings.listen_port.to_string());
 
   fs::write(path, content).map_err(|e| {
     Box::new(AdeployError::FileSystem(format!(
@@ -149,20 +134,6 @@ pub fn ensure_server_config(path: &Path) -> Result<bool> {
 
   info!("Generated {}", path.display());
   Ok(true)
-}
-
-/// Where deployments land unless `deploy_root` says otherwise.
-///
-/// A `deploy` directory beside the binary, matching where the server already
-/// keeps `logs/` and `.key/`. It needs no elevated privileges and behaves the
-/// same on every platform.
-pub fn default_deploy_root() -> Result<PathBuf> {
-  Ok(executable_dir()?.join("deploy"))
-}
-
-/// Render a path as a TOML string literal, escaping Windows separators.
-fn toml_string(path: &Path) -> String {
-  toml::Value::String(path.to_string_lossy().into_owned()).to_string()
 }
 
 /// Write a starter `adeploy.toml` into the working directory.
@@ -226,11 +197,10 @@ mod tests {
     );
     // Empty on purpose: the key does not exist until a client first runs.
     assert!(config.server.allowed_keys.is_empty());
-    // A concrete root is written so deployments do not depend on the implicit
-    // fallback, and so an operator can see where files will land.
+    // Nothing about any package: a deploying client brings its own.
     assert!(
-      config.server.deploy_root.is_some(),
-      "generated config must pin deploy_root"
+      config.packages.is_empty(),
+      "the server template must declare no packages"
     );
   }
 
@@ -276,7 +246,7 @@ mod tests {
       .get("demo")
       .expect("template must define the demo package");
     assert_eq!(demo.sources, vec!["./dist/demo".to_string()]);
-    assert_eq!(demo.deploy_path.as_deref(), Some("demo"));
+    assert_eq!(demo.deploy_path.as_deref(), Some("/opt/demo"));
     assert!(demo.backup_enabled);
   }
 

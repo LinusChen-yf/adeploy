@@ -13,7 +13,7 @@ use std::{
 use adeploy::{
   adeploy::{
     deploy_chunk::Payload, deploy_event::Event, deploy_service_client::DeployServiceClient,
-    DeployChunk, DeployStart, PairRequest, PairState,
+    DeployChunk, DeployManifest, DeployStart, PairRequest, PairState,
   },
   auth::{deploy_start_signing_payload, fingerprint, pair_signing_payload, Auth},
   config::{ConfigProvider, ConfigProviderImpl, KeyPairPaths, ProjectConfig},
@@ -64,6 +64,8 @@ struct Harness {
   file_hash: String,
   /// Carried in every start message; 0 leaves the phase unbounded.
   deploy_timeout_secs: u64,
+  /// The server holds no package configuration, so every request brings this.
+  manifest: DeployManifest,
 }
 
 impl Harness {
@@ -124,7 +126,7 @@ impl Harness {
 
     // A hook that outlasts the deadline is the clearest way to ask whether the
     // server actually stops, rather than finishing with nobody listening.
-    let hook = if slow_hook {
+    let before_deploy_script = if slow_hook {
       let (name, body) = if cfg!(target_os = "windows") {
         // `timeout` needs a console and exits 1 when stdin is redirected, which
         // a hook's always is, so the script would fail instead of sleeping.
@@ -141,10 +143,7 @@ impl Harness {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&script, permissions).expect("hook permissions");
       }
-      format!(
-        "before_deploy_script = \"{}\"\n",
-        script.to_string_lossy().replace('\\', "\\\\")
-      )
+      script.to_string_lossy().to_string()
     } else {
       String::new()
     };
@@ -154,15 +153,19 @@ impl Harness {
         r#"[server]
 listen_port = {port}
 allowed_keys = {allowlist}
-deploy_root = "{deploy_root}"
-
-[packages.{PACKAGE}]
-deploy_path = "{PACKAGE}"
-{hook}"#,
-        deploy_root = deploy_root.to_string_lossy().replace('\\', "\\\\"),
+"#
       ),
     )
     .expect("write server config");
+
+    let manifest = DeployManifest {
+      deploy_path: deploy_root.join(PACKAGE).to_string_lossy().to_string(),
+      clean_deploy: false,
+      backup_enabled: false,
+      backup_path: String::new(),
+      before_deploy_script,
+      after_deploy_script: String::new(),
+    };
 
     let provider: Arc<dyn ConfigProvider> = Arc::new(FixedProvider {
       config_path,
@@ -185,6 +188,7 @@ deploy_path = "{PACKAGE}"
       // Long enough that nothing in these tests trips it by accident; the
       // deadline test sets its own.
       deploy_timeout_secs: 0,
+      manifest,
     }
   }
 
@@ -264,6 +268,7 @@ deploy_path = "{PACKAGE}"
       &nonce,
       timestamp_ms,
       self.deploy_timeout_secs,
+      Some(&self.manifest),
     );
 
     DeployStart {
@@ -274,6 +279,7 @@ deploy_path = "{PACKAGE}"
       nonce,
       timestamp_ms,
       deploy_timeout_secs: self.deploy_timeout_secs,
+      manifest: Some(self.manifest.clone()),
       signature: general_purpose::STANDARD.encode(self.signing_key.sign(&payload).to_bytes()),
     }
   }
@@ -300,6 +306,7 @@ deploy_path = "{PACKAGE}"
       &nonce,
       timestamp_ms,
       self.deploy_timeout_secs,
+      Some(&self.manifest),
     );
     let signature = self.signing_key.sign(&payload);
 
@@ -311,6 +318,7 @@ deploy_path = "{PACKAGE}"
       nonce,
       timestamp_ms,
       deploy_timeout_secs: self.deploy_timeout_secs,
+      manifest: Some(self.manifest.clone()),
       signature: general_purpose::STANDARD.encode(signature.to_bytes()),
     }
   }
@@ -513,6 +521,7 @@ async fn an_unknown_key_never_gets_to_send_an_archive() {
     &nonce,
     timestamp_ms,
     0,
+    Some(&harness.manifest),
   );
 
   let start = DeployStart {
@@ -523,6 +532,7 @@ async fn an_unknown_key_never_gets_to_send_an_archive() {
     nonce,
     timestamp_ms,
     deploy_timeout_secs: 0,
+    manifest: Some(harness.manifest.clone()),
     signature: general_purpose::STANDARD.encode(stranger_key.sign(&payload).to_bytes()),
   };
 

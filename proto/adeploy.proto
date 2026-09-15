@@ -62,12 +62,35 @@ message DeployStart {
     // transport error, and a silently dead one is caught by HTTP/2 keepalive,
     // which needs no value tuned per package or per link.
     uint64 deploy_timeout_secs = 9;
-    // Base64 Ed25519 signature over fields 1-6 and 9.
+    // How this package is to be installed. Sent by the client rather than
+    // configured on the server, so a project carries everything about its own
+    // deployment and a server needs to know nothing about the packages it
+    // accepts.
+    DeployManifest manifest = 10;
+    // Base64 Ed25519 signature over fields 1-6, 9 and every field of 10.
     //
     // Covering the description rather than only the bytes binds the archive to
     // the package it was meant for, so a captured request cannot be replayed
-    // against a different package's path and hooks.
+    // against a different package's path and hooks - and now also fixes where
+    // it lands and what runs around it.
     string signature = 7;
+}
+
+// What the server should do with an archive once it has it.
+message DeployManifest {
+    // Absolute directory to unpack into. Absolute because the server no longer
+    // holds a root for a relative path to hang from.
+    string deploy_path = 1;
+    // Replace the directory rather than merging into it.
+    bool clean_deploy = 2;
+    // Snapshot the directory before replacing it.
+    bool backup_enabled = 3;
+    // Where snapshots go. Empty means beside deploy_path.
+    string backup_path = 4;
+    // Run before unpacking; a non-zero exit aborts the deployment.
+    string before_deploy_script = 5;
+    // Run after unpacking; failure is logged but not fatal.
+    string after_deploy_script = 6;
 }
 
 // Server-to-client event stream.
@@ -143,7 +166,10 @@ message BackupListRequest {
     string public_key = 2;
     string nonce = 3;
     int64 timestamp_ms = 4;
-    // Base64 Ed25519 signature over fields 1-4.
+    // Needed for the same reason a deployment needs it: the server holds no
+    // record of where this package lives or where its snapshots go.
+    DeployManifest manifest = 6;
+    // Base64 Ed25519 signature over fields 1-4 and every field of 6.
     string signature = 5;
 }
 
@@ -169,6 +195,9 @@ message RollbackRequest {
     // Seconds the server may spend restoring. There is nothing to upload, so
     // this starts as soon as the request is accepted.
     uint64 deploy_timeout_secs = 7;
-    // Base64 Ed25519 signature over fields 1-5 and 7.
+    // Restoring runs the same hooks a deployment does, so it needs the same
+    // description of the package.
+    DeployManifest manifest = 8;
+    // Base64 Ed25519 signature over fields 1-5, 7 and every field of 8.
     string signature = 6;
 }
