@@ -303,12 +303,6 @@ pub struct ServerSettings {
   /// Port to bind. Changing it requires a restart.
   #[serde(default = "default_port")]
   pub listen_port: u16,
-  /// Largest archive this server accepts, in bytes.
-  ///
-  /// A request is decoded before the handler that checks `allowed_keys` runs,
-  /// so this bounds what an unauthenticated caller can make the server buffer.
-  #[serde(default = "default_max_file_size")]
-  pub max_file_size: u64,
   /// Base64 Ed25519 public keys permitted to deploy.
   #[serde(default)]
   pub allowed_keys: Vec<String>,
@@ -321,7 +315,6 @@ impl Default for ServerSettings {
   fn default() -> Self {
     Self {
       listen_port: default_port(),
-      max_file_size: default_max_file_size(),
       allowed_keys: Vec::new(),
       deploy_root: None,
     }
@@ -469,11 +462,7 @@ const fn default_connect_timeout() -> u64 {
 }
 
 const fn default_deploy_timeout() -> u64 {
-  600
-}
-
-const fn default_max_file_size() -> u64 {
-  100 * 1024 * 1024
+  60
 }
 
 /// Directory containing the running executable.
@@ -512,7 +501,7 @@ mod tests {
 
     assert_eq!(config.defaults.port, 6060);
     assert_eq!(config.defaults.connect_timeout, 5);
-    assert_eq!(config.defaults.deploy_timeout, 600);
+    assert_eq!(config.defaults.deploy_timeout, 60);
     assert!(config.packages.is_empty());
     assert!(config.server.allowed_keys.is_empty());
   }
@@ -522,7 +511,6 @@ mod tests {
     let config = parse("");
 
     assert_eq!(config.server.listen_port, 6060);
-    assert_eq!(config.server.max_file_size, 100 * 1024 * 1024);
     assert!(config.server.deploy_root.is_none());
   }
 
@@ -532,9 +520,9 @@ mod tests {
     // parser must refuse server policy written into a client table rather than
     // quietly ignoring it.
     for text in [
-      "[defaults]\nmax_file_size = 1\n",
       "[defaults]\nlisten_port = 1\n",
-      "[remotes.default]\nmax_file_size = 1\n",
+      "[defaults]\ndeploy_root = \"/opt\"\n",
+      "[remotes.default]\nlisten_port = 1\n",
       "[defaults]\nallowed_keys = []\n",
     ] {
       assert!(

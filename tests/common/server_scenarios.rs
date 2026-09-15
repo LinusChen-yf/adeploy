@@ -190,7 +190,6 @@ touch '{}'
   let config_content = format!(
     r#"[server]
 listen_port = {port}
-max_file_size = 1048576
 allowed_keys = [
   "{allowed_key}"
 ]

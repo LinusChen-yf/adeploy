@@ -29,12 +29,14 @@ port = 6060
 # Seconds allowed to establish the connection. 0 disables the limit.
 connect_timeout = 5
 # Seconds allowed for the upload plus everything the server does afterwards:
-# unpacking, backups and both hook scripts. Installers and service restarts are
-# slow, so keep this far larger than connect_timeout. 0 disables the limit.
+# unpacking, backups and both hook scripts. 0 disables the limit.
 #
 # Travels with the request as its gRPC deadline, so the server stops at the same
-# moment rather than working on after the client has given up.
-deploy_timeout = 600
+# moment rather than working on after the client has given up. That cuts both
+# ways: too low a value aborts a deployment that was going to succeed, part way
+# through. Raise it for a package whose hooks run an installer or restart a
+# service, per host in [remotes] if only some are slow.
+deploy_timeout = 60
 
 # A package describes both halves of a deployment: what the client archives and
 # what the server does with it. Rename "demo" to suit, and add more tables for
@@ -65,13 +67,12 @@ backup_enabled = true
 # applies to any host without its own table.
 # [remotes."192.0.2.10"]
 # port = 6070
-# deploy_timeout = 1800
+# deploy_timeout = 1800   # this one runs an installer
 
 # Server-local settings. A project checkout leaves this out entirely; it belongs
 # to the copy of this file beside the server binary, which generates its own.
 # [server]
 # listen_port = 6060
-# max_file_size = 104857600
 # allowed_keys = []
 # deploy_root = "/opt"
 "#;
@@ -93,11 +94,6 @@ const SERVER_TEMPLATE: &str = r#"# adeploy server configuration, generated on fi
 [server]
 # Port to bind. Clients must dial this same port. Changing it needs a restart.
 listen_port = {port}
-# Largest archive accepted, in bytes. Default 100 MiB.
-#
-# A request is decoded before the handler that checks allowed_keys runs, so this
-# also bounds what an unauthenticated caller can make this server buffer.
-max_file_size = {max_file_size}
 # Base64 Ed25519 public keys allowed to deploy here. A client that is not
 # listed is rejected and prints its own key, ready to be pasted in below.
 allowed_keys = []
@@ -137,7 +133,6 @@ pub fn ensure_server_config(path: &Path) -> Result<bool> {
   let settings = ServerSettings::default();
   let content = SERVER_TEMPLATE
     .replace("{port}", &settings.listen_port.to_string())
-    .replace("{max_file_size}", &settings.max_file_size.to_string())
     .replace("{deploy_root}", &toml_string(&default_deploy_root()?));
 
   fs::write(path, content).map_err(|e| {
@@ -220,7 +215,6 @@ mod tests {
     let config: ProjectConfig = toml::from_str(&text).expect("generated config must parse");
 
     assert_eq!(config.server.listen_port, 6060);
-    assert_eq!(config.server.max_file_size, 100 * 1024 * 1024);
     // The server template carries no client settings at all.
     assert!(
       !text.contains("[defaults]"),
@@ -271,7 +265,7 @@ mod tests {
 
     assert_eq!(config.defaults.port, 6060);
     assert_eq!(config.defaults.connect_timeout, 5);
-    assert_eq!(config.defaults.deploy_timeout, 600);
+    assert_eq!(config.defaults.deploy_timeout, 60);
 
     let demo = config
       .packages

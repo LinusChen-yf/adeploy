@@ -175,7 +175,7 @@ committed configuration behave identically on every machine.
 [defaults]
 port = 6060            # port to dial; must match the server's listen_port
 connect_timeout = 5    # seconds to establish the connection
-deploy_timeout = 600   # seconds for upload plus everything the server does
+deploy_timeout = 60    # seconds for upload plus everything the server does
 
 [packages.demo]
 sources = ["./dist/demo"]   # client: what to archive
@@ -201,7 +201,9 @@ installer and a service restart may legitimately take minutes.
 `deploy_timeout` travels with the request as its gRPC deadline, so the server
 stops at the same moment the client does. Without it the server carried on
 unpacking and running hooks after the client had already reported a timeout,
-writing files that nobody was waiting for.
+writing files that nobody was waiting for. It cuts both ways: too low a value
+aborts a deployment that was going to succeed, part way through, so raise it
+for a package whose hooks run an installer or restart a service.
 
 ### On the server
 
@@ -219,11 +221,6 @@ Server-only settings live under `[server]`:
 - `listen_port` — the port to bind. Clients dial it through their own `port`;
   the two are separate fields because they are separate decisions that merely
   share a default. Changing it requires a restart.
-- `max_file_size` — the largest archive this server accepts. It is the only
-  limit: the client does not pre-check, so the server's answer is the only one.
-  It also bounds what an unauthenticated caller can make the server buffer,
-  because a request is decoded before the handler that checks `allowed_keys`
-  runs.
 - `allowed_keys` — the base64 Ed25519 keys permitted to deploy, which the
   client prints when it is rejected.
 - `deploy_root` — the base directory that relative `deploy_path` values land
