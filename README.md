@@ -1,21 +1,29 @@
 # ADeploy
 
-ADeploy is a lightweight Rust tool for deploying applications across platforms through a gRPC-driven client/server workflow. Use it to push versioned artifacts and run pre/post hooks with predictable TOML configuration.
+ADeploy pushes a build to a machine and installs it there, over gRPC. A project
+describes its own deployment in one committed file; a server needs nothing but
+the binary and a key to trust.
 
 ## Highlights
-- Cross-platform deployment (Linux, macOS, Windows)
-- Language-agnostic packaging with tar/flate2
-- Ed25519 signing with a server-side key allowlist, checked before any upload
-- Chunked uploads with live progress and server logs streamed back as they happen
+- Cross-platform (Linux, macOS, Windows), language-agnostic packaging
 - One `adeploy.toml` per project, committed alongside the code it deploys
-- Optional pre/post deployment scripts, snapshots, and rollback to any of them
+- **A server holds no configuration for anything deployed to it** — the
+  description travels with the package, signed
+- Ed25519 signing checked *before* any upload, with pairing instead of copying
+  keys by hand
+- Chunked uploads with live progress, and the server's own output streamed back
+  as it happens
+- Hooks that run scripts the package ships, so nothing has to be put on the
+  server first
+- Snapshots and rollback, and a swap that leaves the live deployment untouched
+  if anything fails
 
 ## Quick Start
 
 On the target machine, the binary is the only thing you have to put there:
 
 ```bash
-adeploy server install      # generates adeploy.toml and the deploy root
+adeploy server install      # registers the service and writes its adeploy.toml
 adeploy server start
 ```
 
@@ -31,50 +39,46 @@ adeploy rollback <host> <pkg>      # put the previous deployment back
 adeploy --help                     # list available subcommands and flags
 ```
 
-`adeploy list` reads the configuration and nothing else — the package and remote
-names every other command wants, and a mark against any source that is not
-there. `--dry-run` really builds the archive and shows what it holds, so it also
-answers whether packaging works at all:
-
-```
-Would deploy demo to 192.0.2.10:6070
-      app.bin                       878.9 KiB
-      app.conf                      7 B
-  2 file(s), 878.9 KiB packed into 879.3 KiB, sha256 24a33d5e...
-Nothing was sent; drop --dry-run to deploy
-```
-
-Pairing queues a request; an operator on the server approves it:
-
-```bash
-adeploy server pending             # who is waiting, and from where
-adeploy server approve 1           # by position, or by fingerprint
-```
-
-Both ends print the same key fingerprint. Compare them before approving — that
-comparison is what makes the approval mean anything, rather than trusting
-whoever reached the queue first. `adeploy server keys` lists who is trusted and
-`adeploy server revoke` withdraws it. The running server picks all of this up
-without a restart.
-
-A deployment reports itself as it goes, rather than after it finishes:
-
-```
-Server accepted demo (6001142 bytes), deploy ID a708af0a-...
-Uploaded 34% (2097152/6001142 bytes)
-...
-Uploaded 100% (6001142/6001142 bytes)
-Running Before-deploy script /opt/adeploy/stop.sh
-stopping service                     <- the hook's own output, line by line
-installing dependencies
-Before-deploy script succeeded
-Extracting files into /opt/adeploy/deploy/demo
-Deployment succeeded for demo
-```
-
 Build with `cargo build` first if you do not already have the binary.
 `adeploy client <host> <pkg>` is the explicit spelling of the deploy line; both
 forms are equivalent.
+
+### Before sending anything
+
+`adeploy list` reads the configuration and contacts nothing — the package and
+remote names every other command wants, and a mark against any source that is
+not there. `--dry-run` really builds the archive and shows what it holds, so it
+also answers whether packaging works at all:
+
+```
+Would deploy demo to 192.0.2.10:6060
+      scripts/stop.sh                 34 B
+      scripts/start.sh                33 B
+      app.bin                         2.9 MiB
+      app.conf                        3 B
+  4 file(s), 2.9 MiB packed into 2.9 MiB, sha256 ce833fd0...
+Nothing was sent; drop --dry-run to deploy
+```
+
+### A deployment as it happens
+
+```
+Uploaded 34% (1048576/3000938 bytes)
+Server accepted demo (3000938 bytes), deploy ID cdabe0fa-...
+Uploaded 69% ... 100%
+Verifying archive hash
+Unpacking the new deployment
+Running Before-deploy [1/2]: echo preparing
+preparing
+Running Before-deploy [2/2]: scripts/stop.sh
+stopping service                        <- the script's own output, line by line
+Before-deploy succeeded
+Creating backup snapshot
+Swapping in /opt/demo
+Running After-deploy: scripts/start.sh
+service started
+Deployment succeeded for demo
+```
 
 ### Running as a Service
 ```bash
@@ -87,89 +91,17 @@ adeploy server uninstall               # remove the service definition
 ```
 Pass `--label <name>` to customise the service identifier (defaults to `adeploy`). Add `--no-autostart` to skip starting on boot or `--disable-restart-on-failure` to prevent automatic restarts when the service exits with an error.
 
-## Pairing
-
-`Pair` is the one method that cannot require a key, since establishing one is
-the point. A request is self-signed, which proves the sender holds the key it is
-presenting — enough to stop anyone queueing keys they do not control — and then
-waits for a human. Nothing is trusted until someone approves it.
-
-Approvals live in `paired.toml` beside the server binary, written by the tool.
-They are kept out of `adeploy.toml` so the server never rewrites a file an
-operator hand-edited, losing their comments and layout. `allowed_keys` still
-works and is simply unioned with what has been approved.
-
-The queue is bounded and deduplicated by key, so a client polling while it waits
-cannot fill it, and filling it at all needs that many distinct keys — which an
-operator looking at a full queue can see.
-
-## Rolling back
-
-A deployment with `backup_enabled` snapshots the directory before replacing it.
-Those snapshots are what rollback restores:
-
-```bash
-adeploy rollback <host> <pkg> --list          # what is available
-adeploy rollback <host> <pkg>                 # the most recent snapshot
-adeploy rollback <host> <pkg> --to backup_20260914_100512
-```
-
-Rolling back runs the same before and after hooks a deployment does, because
-putting files back has the same requirement: the service holding them has to
-stop first and start after. It also snapshots the current state before
-replacing it, so a rollback can itself be undone.
-
-Snapshots live under `<deploy_root>/.backups/<package>` unless `backup_path`
-says otherwise.
-
-## Replacing a deployment
-
-The new tree is assembled under a sibling directory and moved into place with a
-rename. Unpacking straight over the deploy path meant a failure part way through
-left a directory that was neither the old deployment nor the new one, and a
-running service could read half-replaced files for as long as extraction took.
-A failed deployment now leaves the live one exactly as it was.
-
-`clean_deploy` decides what the new tree starts from. Off by default, the
-existing directory is copied in first, so files the package does not ship —
-uploads, logs, a database — survive; the archive then overwrites what it does
-ship. Turned on, the new tree contains only what the archive holds, so files
-dropped from a package stop lingering on the server. That is usually what you
-want for a directory that is entirely build output.
-
-## How a deployment travels
-
-The client opens with a small signed message describing what it is about to
-send — package name, size, SHA256, its public key, a nonce and a timestamp —
-and only streams the archive once the server has accepted it. The signature
-covers that whole description, not just the archive bytes, so an intercepted
-request cannot be pointed at a different package, and the nonce and timestamp
-stop it being replayed at all.
-
-Two things follow from checking the key before the payload. An unauthorized
-caller never gets to send an archive, and the server writes what it does
-receive straight to a staging file rather than holding it in memory, so its
-memory does not grow with the size of the package. The staged file is removed
-once the deployment ends, however it ends.
-
-The server also counts the bytes it actually receives: the declared size is a
-claim from the client, so a stream that runs past it is cut off and one that
-stops short is refused.
-
 ## Configuration
 
-Both halves of a deployment live in a single `adeploy.toml`. Run `adeploy init`
-to write a fully commented starting point, then edit the `[packages.*]` table.
+Run `adeploy init` to write a fully commented starting point, then edit the
+`[packages.*]` table.
 
-The client looks for `adeploy.toml` by walking up from the working directory,
-the way `cargo` finds `Cargo.toml`. Commit the file with your project and
-`adeploy <host> <package>` works from anywhere inside the checkout. The server
-reads the copy sitting beside its own binary. Either can be pointed elsewhere
-with `--config <path>`.
-
-**Relative paths in `sources` resolve against the directory holding
-`adeploy.toml`, never against the working directory.** That is what makes a
-committed configuration behave identically on every machine.
+The client finds `adeploy.toml` by walking up from the working directory, the
+way `cargo` finds `Cargo.toml`, so committing it with your project makes
+`adeploy <host> <package>` work from anywhere inside the checkout. **Relative
+paths in `sources` resolve against the directory holding the file**, never
+against the working directory — that is what makes one committed configuration
+behave identically on every machine. `--config <path>` overrides the search.
 
 ```toml
 [defaults]
@@ -178,56 +110,181 @@ connect_timeout = 5    # seconds to establish the connection
 deploy_timeout = 60    # seconds for the server's work, from the last byte
 
 [packages.demo]
-sources = ["./dist/demo"]   # client: what to archive
-deploy_path = "demo"        # server: where to unpack, under deploy_root
-clean_deploy = false        # server: replace the directory rather than merge
+sources = ["./dist/demo"]        # includes dist/demo/scripts/
+deploy_path = "/opt/demo"        # absolute directory on the server
 backup_enabled = true
+before_deploy = ["sc stop demo", "scripts/prepare.cmd"]
+after_deploy = "scripts/start.cmd"
 
 # Per-host overrides; list only what differs from [defaults].
 [remotes."192.0.2.10"]
 deploy_timeout = 1800
 ```
 
-`[defaults]` and `[remotes.*]` describe how *this client* reaches a server, and
-the server reads neither. That separation is load-bearing: a project's
-configuration travels to the server along with its packages, so nothing a client
-sends may decide what the server enforces. Server policy lives in `[server]`,
-and the parser rejects it anywhere else.
+A package describes its deployment end to end, and all of it travels with the
+package. Adding one, moving one, or changing a command is a change to the
+project, committed with the code it deploys — there is nothing to keep agreed on
+the other machine.
+
+### Sources
+
+A directory source contributes its *contents*, so `sources = ["./dist/demo"]`
+puts whatever is inside `dist/demo` at the top of the deployment, and
+`dist/demo/scripts/stop.sh` arrives as `scripts/stop.sh`. Files land at the top
+by name. Executable bits survive the round trip. There is no glob expansion.
+
+### Hooks
+
+`before_deploy` and `after_deploy` take one command or a list, run in order,
+with the first failure stopping the rest. Before-deploy aborts the deployment if
+it fails; after-deploy only warns, since the files are already in place by then.
+
+Before-deploy runs with the **unpacked package** as its working directory, and
+after-deploy from the live deployment. That is what makes a script the package
+ships usable: `scripts/prepare.cmd` is simply there, rather than something that
+had to be placed on the server and kept in step with the code by hand.
+
+### Timeouts
 
 `deploy_timeout` starts when the last byte arrives, so it never has to leave
 room for the upload — size it for what your hooks do. The server is told the
-value and stops at it too, rather than working on after the client has given
-up. It cuts both ways: too low a value aborts a deployment that was going to
+value and stops at it too, rather than working on after the client has given up.
+It cuts both ways: too low a value aborts a deployment that was going to
 succeed, part way through, so raise it for a package whose hooks run an
-installer or restart a service.
+installer.
 
-The upload itself has no timeout, and does not need one. How long a transfer
+The upload itself has no timeout and needs none. How long a transfer
 legitimately takes depends on the package and the link, so any limit would have
 to be revisited whenever either changed. A connection that breaks reports an
-error on its own; a connection that is silently gone — a suspended machine, a
-pulled cable, an expired NAT entry — is what HTTP/2 keepalive is for, and both
-ends enable it.
+error on its own; one that is silently gone — a suspended machine, a pulled
+cable, an expired NAT entry — is what HTTP/2 keepalive is for, and both ends
+enable it.
 
 ### On the server
 
-The server generates its own `adeploy.toml` on first run (and during
-`adeploy server install`), creates its deploy root, and reports both at startup
-along with whether any client key is authorized yet. It never overwrites a file
-that already exists.
+The server generates its own `adeploy.toml` on first run, and during
+`adeploy server install`, then reports at startup where it is and whether any
+client key is authorized yet. It never overwrites a file that already exists.
 
 It reads only the copy beside its own binary, never one found by searching
 upward — starting the server from inside a project checkout must not make it
-adopt that project's configuration. Use `--config <path>` to point it elsewhere.
+adopt that project's configuration. `--config <path>` points it elsewhere.
 
-Server-only settings live under `[server]`:
+There are two settings, and neither mentions a package:
+
+```toml
+[server]
+listen_port = 6060
+allowed_keys = []
+```
 
 - `listen_port` — the port to bind. Clients dial it through their own `port`;
   the two are separate fields because they are separate decisions that merely
   share a default. Changing it requires a restart.
-- `allowed_keys` — the base64 Ed25519 keys permitted to deploy, which the
-  client prints when it is rejected.
-- `deploy_root` — the base directory that relative `deploy_path` values land
-  under, defaulting to a `deploy` directory beside the binary.
+- `allowed_keys` — the base64 Ed25519 keys permitted to deploy, which the client
+  prints when it is rejected, and which `adeploy server approve` maintains
+  through pairing.
 
-The server reloads this file when it changes, so adding a key does not require
-a restart.
+The server reloads this file when it changes, so adding a key does not require a
+restart.
+
+## Pairing
+
+```bash
+adeploy pair 192.0.2.10            # on the client; prints its key fingerprint
+adeploy server pending             # on the server: who is waiting, and from where
+adeploy server approve 1           # by position, or by fingerprint
+```
+
+Both ends print the same fingerprint. **Comparing them is what makes the
+approval mean anything**, rather than trusting whoever reached the queue first.
+`adeploy server keys` lists who is trusted and `adeploy server revoke` withdraws
+it; the running server picks all of this up without a restart.
+
+`Pair` is the one method that cannot require a key, since establishing one is
+the point. A request is self-signed, which proves the sender holds the key it is
+presenting — enough to stop anyone queueing keys they do not control — and then
+waits for a human. The queue is bounded and deduplicated by key, so a client
+polling while it waits cannot fill it.
+
+Approvals live in `paired.toml` beside the server binary, written by the tool
+and kept out of `adeploy.toml` so the server never rewrites a file an operator
+hand-edited. `allowed_keys` still works and is simply unioned with what has been
+approved.
+
+## What travels to the server
+
+The client opens with a small signed message: the package name, the archive's
+size and SHA256, its public key, a nonce, a timestamp, the deploy timeout, and
+the manifest — where to unpack, whether to snapshot, and the commands to run.
+The archive itself only follows once the server has accepted that.
+
+**The signature covers all of it.** Covering the description rather than only
+the bytes is what binds an archive to the package it was meant for, fixes where
+it lands and what runs around it, and — with the nonce and timestamp — stops a
+captured request being replayed at all.
+
+Two things follow from checking the key before the payload. An unauthorized
+caller never gets to send an archive, and the server writes what it does receive
+straight to a staging file rather than holding it in memory, so its memory does
+not grow with the size of the package. The staged file is removed once the
+deployment ends, however it ends.
+
+The declared size is a claim, not a fact: the server counts the bytes it
+actually receives, cuts off a stream that runs past it, and refuses one that
+stops short.
+
+Worth being plain about what this does and does not buy. An approved client
+chooses the commands the server runs as itself, so approving one is trusting it
+with the machine. The server refuses only what is certainly a mistake — a
+relative `deploy_path`, the filesystem root, or its own directory.
+
+## How a deployment is applied
+
+```
+receive → verify hash → unpack beside the live deployment
+        → before_deploy   (working directory: the unpacked package)
+        → carry over what the package does not ship
+        → snapshot
+        → swap into place
+        → after_deploy    (working directory: the live deployment)
+```
+
+The new tree is assembled under a sibling directory and moved in with a rename.
+Unpacking straight over the deploy path meant a failure part way through left a
+directory that was neither the old deployment nor the new one, and a running
+service could read half-replaced files for as long as extraction took. **A
+failed deployment now leaves the live one exactly as it was**, and nothing is
+left beside it.
+
+Unpacking happens before the hook, so the slowest step is outside the downtime
+window and before-deploy has the package's scripts to hand. Carrying over the
+old content happens after it, once the hook has stopped whatever was writing —
+copying a live directory can otherwise capture a file mid-write.
+
+Files the package does not ship survive: uploads, logs, a database. A deployment
+overwrites what it ships and leaves everything else.
+
+## Rolling back
+
+```bash
+adeploy rollback <host> <pkg> --list          # what is available
+adeploy rollback <host> <pkg>                 # the most recent snapshot
+adeploy rollback <host> <pkg> --to backup_20260914_100512
+```
+
+A deployment with `backup_enabled` snapshots the directory before replacing it,
+and those snapshots are what rollback restores — through the same phases and the
+same hooks, because putting files back has the same requirement: the service
+holding them has to stop first and start after. Restoring always replaces rather
+than merges, since a snapshot is a complete picture of what the directory held.
+
+It also snapshots the current state before restoring, so a rollback can itself
+be undone.
+
+Snapshots live beside the server binary, under the package's name:
+`<server dir>/demo/backup_<timestamp>/`. Where they go is the server's own
+business rather than something a client asks for — a client that could place them
+could also point them at a directory it wanted emptied by the next rollback.
+Names carry a timestamp to the second and are disambiguated when two land inside
+the same one, which a rollback does by design.

@@ -145,12 +145,7 @@ fn resolve_expected_outcome(
     (HappyPath, PostDeployScriptFailure) => Some(CombinedOutcome::Success(
       SuccessExpectation::new(true, false, true),
     )),
-    (HappyPath, PreDeployScriptFailure) => Some(CombinedOutcome::ServerError(
-      "execution failed with exit code: 1",
-    )),
-    (HappyPath, MissingPackage) => Some(CombinedOutcome::ServerError(
-      "Package 'test-app' not configured",
-    )),
+    (HappyPath, PreDeployScriptFailure) => Some(CombinedOutcome::ServerError("exited with code 1")),
     (HappyPath, UnauthorizedKey) => Some(CombinedOutcome::ServerError(
       "Client public key not allowed",
     )),
@@ -177,7 +172,7 @@ async fn run_case(case: &ScenarioCase) -> Result<(), String> {
   let package_name = client_scenario.package_name();
   let port = test_setup.port;
   let deploy_path = test_setup.server_dir.join("deploy");
-  let backup_path = test_setup.server_dir.join("backup");
+  let backup_path = server_scenarios::snapshot_directory();
 
   generate_test_keys(&test_setup.public_key_path, &test_setup.private_key_path);
 
@@ -186,20 +181,19 @@ async fn run_case(case: &ScenarioCase) -> Result<(), String> {
     .trim()
     .to_string();
 
-  let server_config_path = server_scenarios::write_server_config(
+  let fixture = server_scenarios::prepare_server(
     server_scenario.kind,
     &test_setup.server_dir,
     port,
     &public_key,
-    package_name,
   );
 
   let client_config_path =
-    client_scenarios::write_client_config(case.client_kind, &test_setup.client_dir, port);
+    client_scenarios::write_client_config(case.client_kind, &test_setup.client_dir, port, &fixture);
 
   let client_provider = build_config_provider(case.client_kind, &test_setup, client_config_path);
   let server_provider: Arc<dyn ConfigProvider> = Arc::new(ConfigProviderMock::new(
-    server_config_path,
+    fixture.config_path.clone(),
     KeyPairPaths::new(
       test_setup.private_key_path.clone(),
       test_setup.public_key_path.clone(),

@@ -29,14 +29,15 @@ use crate::{
     deploy_event::Event,
     deploy_service_server::{DeployService, DeployServiceServer},
     BackupEntry, BackupListRequest, BackupListResponse, DeployAccepted, DeployChunk, DeployEvent,
-    DeployLog, DeployResult, DeployStart, PairRequest, PairResponse, PairState, RollbackRequest,
+    DeployLog, DeployManifest, DeployResult, DeployStart, PairRequest, PairResponse, PairState,
+    RollbackRequest,
   },
   auth::{
     backup_list_signing_payload, deploy_start_signing_payload, fingerprint, pair_signing_payload,
     rollback_signing_payload, Auth,
   },
-  config::{ConfigProvider, PackageConfig, ProjectConfig},
-  deploy::{backup_directory, list_backups, DeployManager, DeployTarget},
+  config::{executable_dir, ConfigProvider, PackageConfig, ProjectConfig},
+  deploy::{backup_directory, list_backups, DeployManager},
   deploy_log::{DeployLogEntry, LogLevel, LogSink},
   error::{AdeployError, Result},
   init,
@@ -131,7 +132,44 @@ struct PackageContext {
   config: PackageConfig,
   deploy_path: PathBuf,
   backup_dir: PathBuf,
-  deploy_root: PathBuf,
+}
+
+/// Refuse a destination that cannot be meant seriously.
+///
+/// `deploy_root` used to make a typo harmless by keeping every package inside
+/// it. With the path coming from the client there is no such enclosure, and a
+/// mistyped one would unpack over whatever it named - so the cases that are
+/// certainly wrong are named here.
+fn reject_unusable_deploy_path(
+  deploy_path: &Path,
+  package_name: &str,
+) -> std::result::Result<(), Status> {
+  if !deploy_path.is_absolute() {
+    return Err(Status::invalid_argument(format!(
+      "deploy_path for '{}' must be absolute, got '{}'",
+      package_name,
+      deploy_path.display()
+    )));
+  }
+
+  if deploy_path.parent().is_none() {
+    return Err(Status::invalid_argument(
+      "deploy_path may not be the filesystem root",
+    ));
+  }
+
+  // Deploying over the server's own directory would replace the binary, its
+  // configuration and its keys mid-deployment.
+  if let Ok(exe_dir) = executable_dir() {
+    if deploy_path == exe_dir || exe_dir.starts_with(deploy_path) {
+      return Err(Status::invalid_argument(format!(
+        "deploy_path '{}' would replace the server's own directory",
+        deploy_path.display()
+      )));
+    }
+  }
+
+  Ok(())
 }
 
 /// An upload written to disk, removed when it goes out of scope.
@@ -216,6 +254,7 @@ impl DeployService for AdeployService {
       &request.public_key,
       &request.nonce,
       request.timestamp_ms,
+      request.manifest.as_ref(),
     );
     self
       .authenticate(
@@ -227,7 +266,7 @@ impl DeployService for AdeployService {
       )
       .await?;
 
-    let context = self.package_context(&request.package_name).await?;
+    let context = self.package_context(&request.package_name, request.manifest.as_ref())?;
     let backups = list_backups(&context.backup_dir)
       .map_err(|e| Status::internal(format!("Failed to read snapshots: {}", e)))?;
 
@@ -265,6 +304,7 @@ impl DeployService for AdeployService {
       &request.nonce,
       request.timestamp_ms,
       request.deploy_timeout_secs,
+      request.manifest.as_ref(),
     );
     self
       .authenticate(
@@ -276,7 +316,7 @@ impl DeployService for AdeployService {
       )
       .await?;
 
-    let context = self.package_context(&request.package_name).await?;
+    let context = self.package_context(&request.package_name, request.manifest.as_ref())?;
     let backups = list_backups(&context.backup_dir)
       .map_err(|e| Status::internal(format!("Failed to read snapshots: {}", e)))?;
 
@@ -483,37 +523,36 @@ impl AdeployService {
       .map_err(|rejection| Status::unauthenticated(rejection.message()))
   }
 
-  /// Resolve a package name against this server's configuration.
-  async fn package_context(
+  /// Turn a client's manifest into somewhere to deploy.
+  ///
+  /// Nothing here comes from this server's configuration: a project carries its
+  /// own deployment, so the server's only say is refusing a destination that is
+  /// obviously a mistake.
+  fn package_context(
     &self,
     package_name: &str,
+    manifest: Option<&DeployManifest>,
   ) -> std::result::Result<PackageContext, Status> {
-    let fallback_root = init::default_deploy_root().map_err(|e| {
-      error!("Cannot determine the deploy root: {}", e);
-      Status::internal(format!("Cannot determine deploy root: {}", e))
+    let manifest = manifest.ok_or_else(|| {
+      error!("Request for {} carried no manifest", package_name);
+      Status::invalid_argument("Request carried no manifest")
     })?;
 
-    let config = self.config.read().await;
-    let deploy_root = resolve_deploy_root(&config).unwrap_or_else(|_| fallback_root.clone());
+    let deploy_path = PathBuf::from(&manifest.deploy_path);
+    reject_unusable_deploy_path(&deploy_path, package_name)?;
 
-    let package_config = config.packages.get(package_name).cloned();
-    let deploy_path = config.resolve_deploy_path(package_name, &fallback_root);
-
-    match (package_config, deploy_path) {
-      (Some(package_config), Some(deploy_path)) => Ok(PackageContext {
-        backup_dir: backup_directory(&package_config, package_name, &deploy_root),
-        config: package_config,
-        deploy_path,
-        deploy_root,
-      }),
-      _ => {
-        error!("Package {} is not configured", package_name);
-        Err(Status::not_found(format!(
-          "Package '{}' not configured",
-          package_name
-        )))
-      }
-    }
+    Ok(PackageContext {
+      backup_dir: backup_directory(package_name)
+        .map_err(|e| Status::internal(format!("Cannot determine the snapshot directory: {e}")))?,
+      config: PackageConfig {
+        sources: Vec::new(),
+        deploy_path: Some(manifest.deploy_path.clone()),
+        backup_enabled: manifest.backup_enabled,
+        before_deploy: manifest.before_deploy.clone(),
+        after_deploy: manifest.after_deploy.clone(),
+      },
+      deploy_path,
+    })
   }
 
   /// Check who is calling and what they are asking for, before accepting bytes.
@@ -528,6 +567,7 @@ impl AdeployService {
       &start.nonce,
       start.timestamp_ms,
       start.deploy_timeout_secs,
+      start.manifest.as_ref(),
     );
     self
       .authenticate(
@@ -539,14 +579,14 @@ impl AdeployService {
       )
       .await?;
 
-    let context = self.package_context(&start.package_name).await?;
+    let context = self.package_context(&start.package_name, start.manifest.as_ref())?;
 
     Ok(AcceptedDeploy {
       start,
       package_config: context.config,
+      staging_dir: context.deploy_path.with_file_name(STAGING_DIR),
       deploy_path: context.deploy_path,
       backup_dir: context.backup_dir,
-      staging_dir: context.deploy_root.join(STAGING_DIR),
     })
   }
 }
@@ -704,8 +744,9 @@ fn rollback_stream(
 
 /// Run the hooks around restoring a snapshot.
 ///
-/// The same hooks a deployment runs, because putting files back has the same
-/// requirements: the service holding them has to stop first and start after.
+/// The same hooks a deployment runs, in the same order and for the same reason:
+/// putting files back needs the service holding them stopped first, and the
+/// hook may well be a script that shipped inside the snapshot being restored.
 async fn execute_rollback(
   deploy_manager: &DeployManager,
   package_name: &str,
@@ -720,8 +761,17 @@ async fn execute_rollback(
     ))
     .await;
 
+  let tree = deploy_manager
+    .begin_restore(&chosen.path, &context.deploy_path, sink)
+    .await?;
+
   deploy_manager
-    .execute_before_deploy_script(&context.config, sink)
+    .run_hook(
+      &context.config.before_deploy,
+      "Before-deploy",
+      tree.path(),
+      sink,
+    )
     .await?;
 
   // Snapshot what is there now, so a rollback can itself be undone.
@@ -732,26 +782,22 @@ async fn execute_rollback(
       .await?;
   }
 
-  sink
-    .info(format!(
-      "Restoring {} into {}",
-      chosen.name,
-      context.deploy_path.display()
-    ))
-    .await;
   deploy_manager
-    .restore_backup(&chosen.path, &context.deploy_path)
+    .commit_deployment(tree, &context.deploy_path, sink)
     .await?;
   sink.info("Restore complete").await;
 
   if let Err(e) = deploy_manager
-    .execute_after_deploy_script(&context.config, sink)
+    .run_hook(
+      &context.config.after_deploy,
+      "After-deploy",
+      &context.deploy_path,
+      sink,
+    )
     .await
   {
-    warn!("After-deploy script failed: {}", e);
-    sink
-      .warn(format!("After-deploy script failed: {}", e))
-      .await;
+    warn!("After-deploy hook failed: {}", e);
+    sink.warn(format!("After-deploy hook failed: {}", e)).await;
   }
 
   sink
@@ -835,6 +881,12 @@ async fn receive_archive(
 }
 
 /// Run the hooks and the extraction, reporting each stage through `sink`.
+///
+/// The order matters. The package is unpacked first, so the before-deploy hook
+/// can run scripts the package itself ships; the live deployment is untouched
+/// at that point, and the slowest step happens while the service is still up.
+/// Only after the hook has stopped whatever holds the files is the old content
+/// carried across and the swap made.
 async fn execute_deployment(
   deploy_manager: &DeployManager,
   accepted: &AcceptedDeploy,
@@ -848,34 +900,56 @@ async fn execute_deployment(
     ))
     .await;
 
-  deploy_manager
-    .execute_before_deploy_script(&accepted.package_config, sink)
+  let tree = deploy_manager
+    .begin_deployment(
+      archive_path,
+      &accepted.start.file_hash,
+      &accepted.deploy_path,
+      sink,
+    )
     .await?;
 
   deploy_manager
-    .extract_files(
-      archive_path,
-      &accepted.start.file_hash,
-      &accepted.package_config,
-      DeployTarget {
-        package_name: &accepted.start.package_name,
-        deploy_path: &accepted.deploy_path,
-        backup_dir: &accepted.backup_dir,
-      },
+    .run_hook(
+      &accepted.package_config.before_deploy,
+      "Before-deploy",
+      tree.path(),
       sink,
     )
+    .await?;
+
+  deploy_manager
+    .carry_over_existing(&tree, &accepted.deploy_path, sink)
+    .await?;
+
+  if accepted.package_config.backup_enabled {
+    sink.info("Creating backup snapshot").await;
+    deploy_manager
+      .create_backup(
+        &accepted.start.package_name,
+        &accepted.deploy_path,
+        &accepted.backup_dir,
+      )
+      .await?;
+  }
+
+  deploy_manager
+    .commit_deployment(tree, &accepted.deploy_path, sink)
     .await?;
 
   // A failed after-deploy hook has never failed the deployment: the files are
   // already in place, and reverting them is not this stage's job.
   if let Err(e) = deploy_manager
-    .execute_after_deploy_script(&accepted.package_config, sink)
+    .run_hook(
+      &accepted.package_config.after_deploy,
+      "After-deploy",
+      &accepted.deploy_path,
+      sink,
+    )
     .await
   {
-    warn!("After-deploy script failed: {}", e);
-    sink
-      .warn(format!("After-deploy script failed: {}", e))
-      .await;
+    warn!("After-deploy hook failed: {}", e);
+    sink.warn(format!("After-deploy hook failed: {}", e)).await;
   }
 
   sink
@@ -938,9 +1012,7 @@ where
   let config = provider.load_project_config(config_path.as_path())?;
 
   let port = config.server.listen_port;
-  let deploy_root = resolve_deploy_root(&config)?;
-  prepare_deploy_root(&deploy_root)?;
-  log_startup_state(&config_path, &config, &deploy_root, generated);
+  log_startup_state(&config_path, &config, generated);
 
   let addr = format!("0.0.0.0:{}", port)
     .parse()
@@ -984,42 +1056,15 @@ where
   Ok(())
 }
 
-/// Directory that relative `deploy_path` values land under.
-fn resolve_deploy_root(config: &ProjectConfig) -> Result<PathBuf> {
-  match &config.server.deploy_root {
-    Some(root) => Ok(PathBuf::from(root)),
-    None => init::default_deploy_root(),
-  }
-}
-
-/// Create the deploy root up front so the first deployment does not fail on a
-/// missing directory, and so an operator can see where files will land.
-fn prepare_deploy_root(deploy_root: &Path) -> Result<()> {
-  std::fs::create_dir_all(deploy_root).map_err(|e| {
-    Box::new(AdeployError::FileSystem(format!(
-      "Failed to create deploy root {}: {}",
-      deploy_root.display(),
-      e
-    )))
-  })?;
-  Ok(())
-}
-
 /// Report what the server is about to do, and what it still needs.
 ///
 /// Everything here was previously only discoverable by reading the config file,
 /// which a freshly installed server does not have until this run creates it.
-fn log_startup_state(
-  config_path: &Path,
-  config: &ProjectConfig,
-  deploy_root: &Path,
-  generated: bool,
-) {
+fn log_startup_state(config_path: &Path, config: &ProjectConfig, generated: bool) {
   if generated {
     info!("First run: generated {}", config_path.display());
   }
   info!("Configuration: {}", config_path.display());
-  info!("Deploy root: {}", deploy_root.display());
 
   if config.server.allowed_keys.is_empty() {
     warn!(
@@ -1030,13 +1075,6 @@ fn log_startup_state(
     info!(
       "{} client key(s) authorized",
       config.server.allowed_keys.len()
-    );
-  }
-
-  if config.packages.is_empty() {
-    warn!(
-      "No packages configured. Add a [packages.<name>] table to {}",
-      config_path.display()
     );
   }
 }

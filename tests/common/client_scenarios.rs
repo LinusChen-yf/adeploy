@@ -5,7 +5,7 @@ use std::{
   path::{Path, PathBuf},
 };
 
-use crate::common::toml_escape_path;
+use crate::{common::toml_escape_path, server_scenarios::ServerFixture};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ClientScenarioKind {
@@ -80,8 +80,17 @@ pub fn get(kind: ClientScenarioKind) -> &'static ClientScenario {
     .expect("Missing client scenario definition")
 }
 
-/// Create a client-side `adeploy.toml` tailored to the provided scenario.
-pub fn write_client_config(scenario: ClientScenarioKind, client_dir: &Path, port: u16) -> PathBuf {
+/// Create the project's `adeploy.toml` for a scenario.
+///
+/// It describes the deployment end to end now - what to archive and what the
+/// server should do with it - because the server holds nothing of its own. The
+/// paths and scripts come from what the server scenario laid out.
+pub fn write_client_config(
+  scenario: ClientScenarioKind,
+  client_dir: &Path,
+  port: u16,
+  fixture: &ServerFixture,
+) -> PathBuf {
   let test1_path = client_dir.join("test1.txt");
   let test2_path = client_dir.join("test2.txt");
 
@@ -111,10 +120,18 @@ sources = [
   "{test1}",
   "{test2}",
 ]
+deploy_path = "{deploy_path}"
+backup_enabled = {backup_enabled}
+before_deploy = ["{pre_script}"]
+after_deploy = ["{post_script}"]
 {remote_block}"#,
     port = port,
     test1 = toml_escape_path(&test1_path),
     test2 = toml_escape_path(&test2_path),
+    deploy_path = toml_escape_path(&fixture.deploy_path),
+    backup_enabled = fixture.backup_enabled,
+    pre_script = toml_escape_path(&fixture.pre_script),
+    post_script = toml_escape_path(&fixture.post_script),
     remote_block = remote_block,
   );
 
