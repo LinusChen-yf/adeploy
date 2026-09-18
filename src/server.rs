@@ -143,8 +143,8 @@ fn optional(value: &str) -> Option<String> {
 ///
 /// `deploy_root` used to make a typo harmless by keeping every package inside
 /// it. With the path coming from the client there is no such enclosure, and a
-/// mistyped one combined with clean_deploy would replace whatever it named - so
-/// the cases that are certainly wrong are named here.
+/// mistyped one would unpack over whatever it named - so the cases that are
+/// certainly wrong are named here.
 fn reject_unusable_deploy_path(
   deploy_path: &Path,
   package_name: &str,
@@ -551,7 +551,6 @@ impl AdeployService {
       config: PackageConfig {
         sources: Vec::new(),
         deploy_path: Some(manifest.deploy_path.clone()),
-        clean_deploy: manifest.clean_deploy,
         backup_enabled: manifest.backup_enabled,
         backup_path: optional(&manifest.backup_path),
         before_deploy_script: optional(&manifest.before_deploy_script),

@@ -78,11 +78,12 @@ message DeployStart {
 
 // What the server should do with an archive once it has it.
 message DeployManifest {
+    // Held by a field that used to say whether to wipe the directory first.
+    reserved 2;
+
     // Absolute directory to unpack into. Absolute because the server no longer
     // holds a root for a relative path to hang from.
     string deploy_path = 1;
-    // Replace the directory rather than merging into it.
-    bool clean_deploy = 2;
     // Snapshot the directory before replacing it.
     bool backup_enabled = 3;
     // Where snapshots go. Empty means beside deploy_path.

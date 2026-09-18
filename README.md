@@ -132,12 +132,11 @@ left a directory that was neither the old deployment nor the new one, and a
 running service could read half-replaced files for as long as extraction took.
 A failed deployment now leaves the live one exactly as it was.
 
-`clean_deploy` decides what the new tree starts from. Off by default, the
-existing directory is copied in first, so files the package does not ship —
-uploads, logs, a database — survive; the archive then overwrites what it does
-ship. Turned on, the new tree contains only what the archive holds, so files
-dropped from a package stop lingering on the server. That is usually what you
-want for a directory that is entirely build output.
+The new tree starts as a copy of what is already deployed, then the archive
+overwrites what it ships. Files the deployment does not ship — uploads, logs, a
+database — survive, which is what unpacking over the top always did. Assembling
+it beside the live directory is what makes a failure part way through harmless,
+not a change to what ends up there.
 
 ## How a deployment travels
 
@@ -182,7 +181,6 @@ deploy_timeout = 60    # seconds for the server's work, from the last byte
 [packages.demo]
 sources = ["./dist/demo"]   # what to archive
 deploy_path = "/opt/demo"   # absolute directory on the server to unpack into
-clean_deploy = false        # replace the directory rather than merge into it
 backup_enabled = true
 
 # Per-host overrides; list only what differs from [defaults].

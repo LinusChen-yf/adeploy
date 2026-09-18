@@ -271,15 +271,6 @@ pub struct PackageConfig {
   /// Server side: run after unpacking; failure is logged but not fatal.
   #[serde(default)]
   pub after_deploy_script: Option<String>,
-  /// Server side: replace the deploy directory rather than merging into it.
-  ///
-  /// Off by default because the directory may hold things the package does not
-  /// ship - uploads, logs, a database - and wiping those on the next deploy
-  /// would be a surprising way to find out. Turn it on for a package whose
-  /// directory is entirely build output, so files dropped from the package
-  /// stop lingering on the server.
-  #[serde(default)]
-  pub clean_deploy: bool,
   /// Server side: snapshot the existing directory before unpacking.
   #[serde(default)]
   pub backup_enabled: bool,

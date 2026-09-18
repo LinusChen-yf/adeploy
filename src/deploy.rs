@@ -159,7 +159,7 @@ impl DeployManager {
       ))
       .await;
     self
-      .swap_into_place(archive_path, target.deploy_path, config.clean_deploy)
+      .swap_into_place(archive_path, target.deploy_path)
       .await?;
 
     info!("Extraction complete: {}", target.deploy_path.display());
@@ -455,18 +455,13 @@ impl DeployManager {
   /// extraction took. The new tree is assembled under a sibling name and moved
   /// into place with a rename, so the only moment anything is inconsistent is
   /// the gap between two renames.
-  async fn swap_into_place(
-    &self,
-    archive_path: &Path,
-    deploy_path: &Path,
-    clean: bool,
-  ) -> Result<()> {
+  async fn swap_into_place(&self, archive_path: &Path, deploy_path: &Path) -> Result<()> {
     let archive_path = archive_path.to_path_buf();
     let deploy_path = deploy_path.to_path_buf();
     // Enough to tell concurrent deployments apart without unwieldy names.
     let suffix: String = self.deploy_id.chars().take(8).collect();
 
-    spawn_blocking(move || deploy_archive_blocking(&archive_path, &deploy_path, clean, &suffix))
+    spawn_blocking(move || deploy_archive_blocking(&archive_path, &deploy_path, &suffix))
       .await
       .map_err(|e| {
         Box::new(AdeployError::Deploy(format!(
@@ -709,16 +704,14 @@ fn restore_backup_blocking(backup_path: &Path, deploy_path: &Path, suffix: &str)
 }
 
 /// Unpack an archive into a new tree, then move it over the old one.
-fn deploy_archive_blocking(
-  archive_path: &Path,
-  deploy_path: &Path,
-  clean: bool,
-  suffix: &str,
-) -> Result<()> {
+///
+/// The new tree starts as a copy of what is already deployed, so files the
+/// package does not ship survive and the archive overwrites only what it does.
+/// That is what unpacking over the top always did; assembling it beside the
+/// live directory is what makes a failure part way through harmless.
+fn deploy_archive_blocking(archive_path: &Path, deploy_path: &Path, suffix: &str) -> Result<()> {
   swap_into_place_blocking(deploy_path, suffix, &|incoming| {
-    if !clean && deploy_path.exists() {
-      // Merge semantics: start from what is there so files the package does
-      // not ship survive, then let the archive overwrite what it does.
+    if deploy_path.exists() {
       copy_dir_recursive(deploy_path, incoming).map_err(|e| {
         Box::new(AdeployError::FileSystem(format!(
           "Failed to seed the new deployment from {}: {}",
@@ -938,7 +931,7 @@ mod tests {
     let archive = archive_with(temp.path(), "app.txt", "v1");
     let deploy_path = temp.path().join("live");
 
-    deploy_archive_blocking(&archive, &deploy_path, false, "abcd1234").expect("deploy");
+    deploy_archive_blocking(&archive, &deploy_path, "abcd1234").expect("deploy");
 
     assert_eq!(
       fs::read_to_string(deploy_path.join("app.txt")).expect("read"),
@@ -953,10 +946,10 @@ mod tests {
     let deploy_path = temp.path().join("live");
 
     let first = archive_with(&temp.path().join("one"), "app.txt", "v1");
-    deploy_archive_blocking(&first, &deploy_path, false, "1111").expect("first deploy");
+    deploy_archive_blocking(&first, &deploy_path, "1111").expect("first deploy");
 
     let second = archive_with(&temp.path().join("two"), "app.txt", "v2");
-    deploy_archive_blocking(&second, &deploy_path, false, "2222").expect("second deploy");
+    deploy_archive_blocking(&second, &deploy_path, "2222").expect("second deploy");
 
     assert_eq!(
       fs::read_to_string(deploy_path.join("app.txt")).expect("read"),
@@ -966,7 +959,7 @@ mod tests {
   }
 
   #[test]
-  fn merging_keeps_files_the_package_does_not_ship() {
+  fn a_deployment_keeps_files_the_package_does_not_ship() {
     let temp = TempDir::new().expect("temp dir");
     let deploy_path = temp.path().join("live");
     fs::create_dir_all(&deploy_path).expect("deploy dir");
@@ -974,29 +967,13 @@ mod tests {
     fs::write(deploy_path.join("runtime.db"), "keep me").expect("runtime file");
 
     let archive = archive_with(temp.path(), "app.txt", "v1");
-    deploy_archive_blocking(&archive, &deploy_path, false, "abcd").expect("deploy");
+    deploy_archive_blocking(&archive, &deploy_path, "abcd").expect("deploy");
 
     assert_eq!(
       fs::read_to_string(deploy_path.join("runtime.db")).expect("read"),
       "keep me",
-      "the default must not wipe files the package does not ship"
-    );
-    assert!(deploy_path.join("app.txt").exists());
-  }
-
-  #[test]
-  fn cleaning_removes_files_the_package_no_longer_ships() {
-    let temp = TempDir::new().expect("temp dir");
-    let deploy_path = temp.path().join("live");
-    fs::create_dir_all(&deploy_path).expect("deploy dir");
-    fs::write(deploy_path.join("stale.dll"), "old version").expect("stale file");
-
-    let archive = archive_with(temp.path(), "app.txt", "v1");
-    deploy_archive_blocking(&archive, &deploy_path, true, "abcd").expect("deploy");
-
-    assert!(
-      !deploy_path.join("stale.dll").exists(),
-      "clean_deploy must leave only what the package ships"
+      "a deployment must not wipe files it does not ship: the directory may \
+       hold uploads, logs or a database that no package is responsible for"
     );
     assert!(deploy_path.join("app.txt").exists());
   }
@@ -1007,14 +984,14 @@ mod tests {
     let deploy_path = temp.path().join("live");
 
     let good = archive_with(&temp.path().join("one"), "app.txt", "v1");
-    deploy_archive_blocking(&good, &deploy_path, false, "1111").expect("first deploy");
+    deploy_archive_blocking(&good, &deploy_path, "1111").expect("first deploy");
 
     // Not a gzip stream. Its hash is whatever it is, so this stands in for an
     // archive that passed verification and still cannot be read.
     let corrupt = temp.path().join("corrupt.tar.gz");
     fs::write(&corrupt, vec![0x42u8; 4096]).expect("write corrupt archive");
 
-    let failure = deploy_archive_blocking(&corrupt, &deploy_path, false, "2222")
+    let failure = deploy_archive_blocking(&corrupt, &deploy_path, "2222")
       .expect_err("a corrupt archive must fail");
     assert!(
       failure.to_string().contains("extract"),
@@ -1043,7 +1020,7 @@ mod tests {
     fs::write(stranded.join("garbage.txt"), "from a crash").expect("stranded file");
 
     let archive = archive_with(temp.path(), "app.txt", "v1");
-    deploy_archive_blocking(&archive, &deploy_path, false, "abcd").expect("deploy");
+    deploy_archive_blocking(&archive, &deploy_path, "abcd").expect("deploy");
 
     assert!(
       !deploy_path.join("garbage.txt").exists(),

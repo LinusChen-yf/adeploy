@@ -53,10 +53,6 @@ sources = ["./dist/demo"]
 # Absolute directory on the server to unpack into. Absolute because the server
 # keeps no root of its own for a relative path to hang from.
 deploy_path = "/opt/demo"
-# Replace the directory instead of merging into it, so files dropped from the
-# package stop lingering. Leave it off if the directory also holds things the
-# package does not ship, such as uploads or a database.
-# clean_deploy = false
 # Snapshot the directory before unpacking, and what `adeploy rollback` restores.
 backup_enabled = true
 # Where snapshots go. Defaults to <deploy_path>.backups.

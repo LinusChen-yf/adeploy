@@ -124,7 +124,6 @@ fn manifest_for(config: &ProjectConfig, package: &str) -> Result<DeployManifest>
 
   Ok(DeployManifest {
     deploy_path,
-    clean_deploy: declared.clean_deploy,
     backup_enabled: declared.backup_enabled,
     backup_path: declared.backup_path.clone().unwrap_or_default(),
     before_deploy_script: declared.before_deploy_script.clone().unwrap_or_default(),

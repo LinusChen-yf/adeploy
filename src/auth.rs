@@ -204,7 +204,7 @@ pub fn deploy_start_signing_payload(
 ) -> Vec<u8> {
   // Bumped with the fields: a signature made for an older shape must not verify
   // against this one, where the new fields would otherwise be unauthenticated.
-  const DOMAIN: &[u8] = b"adeploy:deploy-start:v3";
+  const DOMAIN: &[u8] = b"adeploy:deploy-start:v4";
 
   let mut payload = Vec::with_capacity(DOMAIN.len() + 128);
   payload.extend_from_slice(DOMAIN);
@@ -249,7 +249,7 @@ pub fn backup_list_signing_payload(
   timestamp_ms: i64,
   manifest: Option<&DeployManifest>,
 ) -> Vec<u8> {
-  const DOMAIN: &[u8] = b"adeploy:backup-list:v2";
+  const DOMAIN: &[u8] = b"adeploy:backup-list:v3";
 
   let mut payload = Vec::with_capacity(DOMAIN.len() + 96);
   payload.extend_from_slice(DOMAIN);
@@ -276,7 +276,7 @@ pub fn rollback_signing_payload(
   deploy_timeout_secs: u64,
   manifest: Option<&DeployManifest>,
 ) -> Vec<u8> {
-  const DOMAIN: &[u8] = b"adeploy:rollback:v3";
+  const DOMAIN: &[u8] = b"adeploy:rollback:v4";
 
   let mut payload = Vec::with_capacity(DOMAIN.len() + 128);
   payload.extend_from_slice(DOMAIN);
@@ -304,7 +304,6 @@ fn push_manifest(buf: &mut Vec<u8>, manifest: Option<&DeployManifest>) {
 
   buf.push(1);
   push_field(buf, manifest.deploy_path.as_bytes());
-  buf.push(u8::from(manifest.clean_deploy));
   buf.push(u8::from(manifest.backup_enabled));
   push_field(buf, manifest.backup_path.as_bytes());
   push_field(buf, manifest.before_deploy_script.as_bytes());
