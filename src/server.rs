@@ -547,12 +547,12 @@ impl AdeployService {
     reject_unusable_deploy_path(&deploy_path, package_name)?;
 
     Ok(PackageContext {
-      backup_dir: backup_directory(manifest.backup_path.as_str(), &deploy_path),
+      backup_dir: backup_directory(package_name)
+        .map_err(|e| Status::internal(format!("Cannot determine the snapshot directory: {e}")))?,
       config: PackageConfig {
         sources: Vec::new(),
         deploy_path: Some(manifest.deploy_path.clone()),
         backup_enabled: manifest.backup_enabled,
-        backup_path: optional(&manifest.backup_path),
         before_deploy_script: optional(&manifest.before_deploy_script),
         after_deploy_script: optional(&manifest.after_deploy_script),
       },

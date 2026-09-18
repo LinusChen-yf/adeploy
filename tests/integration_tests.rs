@@ -174,7 +174,7 @@ async fn run_case(case: &ScenarioCase) -> Result<(), String> {
   let package_name = client_scenario.package_name();
   let port = test_setup.port;
   let deploy_path = test_setup.server_dir.join("deploy");
-  let backup_path = test_setup.server_dir.join("backup");
+  let backup_path = server_scenarios::snapshot_directory();
 
   generate_test_keys(&test_setup.public_key_path, &test_setup.private_key_path);
 

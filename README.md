@@ -119,10 +119,15 @@ putting files back has the same requirement: the service holding them has to
 stop first and start after. It also snapshots the current state before
 replacing it, so a rollback can itself be undone.
 
-Snapshots live beside the deployment, at `<deploy_path>.backups`, unless
-`backup_path` says otherwise. Their names carry a timestamp to the second and
-are disambiguated when two land inside the same one — which a rollback does by
-design, since it snapshots the current state before restoring.
+Snapshots live beside the server binary, in a directory named after the
+package: `<server dir>/demo/backup_<timestamp>/`. Where they go is the server's
+own business rather than something a client asks for — a client that could place
+them could also point them at a directory it wanted emptied by the next
+rollback.
+
+Their names carry a timestamp to the second and are disambiguated when two land
+inside the same one, which a rollback does by design since it snapshots the
+current state before restoring.
 
 ## Replacing a deployment
 

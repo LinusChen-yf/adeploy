@@ -54,9 +54,9 @@ sources = ["./dist/demo"]
 # keeps no root of its own for a relative path to hang from.
 deploy_path = "/opt/demo"
 # Snapshot the directory before unpacking, and what `adeploy rollback` restores.
+# Snapshots are kept beside the server binary, in a directory named after the
+# package: <server dir>/demo/backup_<timestamp>/
 backup_enabled = true
-# Where snapshots go. Defaults to <deploy_path>.backups.
-# backup_path = "/var/backups/demo"
 # Runs on the server before unpacking. A non-zero exit aborts the deployment, so
 # this is the place to stop a service that holds the files open.
 # before_deploy_script = "systemctl stop demo"

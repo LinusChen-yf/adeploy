@@ -122,7 +122,6 @@ sources = [
 ]
 deploy_path = "{deploy_path}"
 backup_enabled = {backup_enabled}
-backup_path = "{backup_path}"
 before_deploy_script = "{pre_script}"
 after_deploy_script = "{post_script}"
 {remote_block}"#,
@@ -131,7 +130,6 @@ after_deploy_script = "{post_script}"
     test2 = toml_escape_path(&test2_path),
     deploy_path = toml_escape_path(&fixture.deploy_path),
     backup_enabled = fixture.backup_enabled,
-    backup_path = toml_escape_path(&fixture.backup_path),
     pre_script = toml_escape_path(&fixture.pre_script),
     post_script = toml_escape_path(&fixture.post_script),
     remote_block = remote_block,

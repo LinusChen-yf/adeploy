@@ -161,7 +161,6 @@ allowed_keys = {allowlist}
     let manifest = DeployManifest {
       deploy_path: deploy_root.join(PACKAGE).to_string_lossy().to_string(),
       backup_enabled: false,
-      backup_path: String::new(),
       before_deploy_script,
       after_deploy_script: String::new(),
     };

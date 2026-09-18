@@ -274,9 +274,6 @@ pub struct PackageConfig {
   /// Server side: snapshot the existing directory before unpacking.
   #[serde(default)]
   pub backup_enabled: bool,
-  /// Server side: where snapshots go; defaults to a directory beside the binary.
-  #[serde(default)]
-  pub backup_path: Option<String>,
 }
 
 /// Per-host overrides. Every field falls back to `[defaults]` when omitted.

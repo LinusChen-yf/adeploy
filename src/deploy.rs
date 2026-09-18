@@ -570,21 +570,13 @@ pub struct BackupInfo {
 /// Prefix every snapshot directory carries.
 const BACKUP_PREFIX: &str = "backup_";
 
-/// Where a package's snapshots live.
+/// Where a package's snapshots live: beside the server binary, under its name.
 ///
-/// Beside the deployment unless told otherwise, which is the only place left
-/// that is certain to exist and certain to be on the same filesystem now that
-/// the server keeps no root of its own.
-pub fn backup_directory(configured: &str, deploy_path: &Path) -> PathBuf {
-  if !configured.is_empty() {
-    return PathBuf::from(configured);
-  }
-
-  let name = deploy_path
-    .file_name()
-    .map(|name| name.to_string_lossy().to_string())
-    .unwrap_or_else(|| "package".to_string());
-  deploy_path.with_file_name(format!("{name}.backups"))
+/// Not somewhere the client asks for. Snapshots are the server's own record of
+/// what it replaced, and a client that could place them could also point them
+/// at a directory it wanted emptied by the next rollback.
+pub fn backup_directory(package_name: &str) -> Result<PathBuf> {
+  Ok(executable_dir()?.join(package_name))
 }
 
 /// Snapshots available for a package, newest first.
@@ -1119,17 +1111,17 @@ mod tests {
   }
 
   #[test]
-  fn snapshots_default_to_sitting_beside_the_deployment() {
-    // The only place certain to exist and to be on the same filesystem, now
-    // that the server keeps no root of its own to put them under.
-    let resolved = backup_directory("", Path::new("/opt/demo"));
-    assert_eq!(resolved, PathBuf::from("/opt/demo.backups"));
-  }
+  fn snapshots_live_beside_the_server_binary_under_the_package_name() {
+    // Not anywhere the client named: a client that could place them could also
+    // point them at a directory it wanted emptied by the next rollback.
+    let resolved = backup_directory("demo").expect("resolve");
+    let expected = std::env::current_exe()
+      .expect("exe")
+      .parent()
+      .expect("exe dir")
+      .join("demo");
 
-  #[test]
-  fn a_configured_backup_path_wins() {
-    let resolved = backup_directory("/var/backups/demo", Path::new("/opt/demo"));
-    assert_eq!(resolved, PathBuf::from("/var/backups/demo"));
+    assert_eq!(resolved, expected);
   }
 
   #[test]

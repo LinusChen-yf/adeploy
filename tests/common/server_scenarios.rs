@@ -14,7 +14,6 @@ use std::{
 pub struct ServerFixture {
   pub config_path: PathBuf,
   pub deploy_path: PathBuf,
-  pub backup_path: PathBuf,
   pub pre_script: PathBuf,
   pub post_script: PathBuf,
   pub backup_enabled: bool,
@@ -70,6 +69,15 @@ const SERVER_SCENARIOS: &[ServerScenario] = &[
   },
 ];
 
+/// Where the server under test will keep snapshots of `test-app`.
+pub fn snapshot_directory() -> PathBuf {
+  std::env::current_exe()
+    .expect("current exe")
+    .parent()
+    .expect("exe dir")
+    .join("test-app")
+}
+
 /// All available server scenarios.
 pub const fn all() -> &'static [ServerScenario] {
   SERVER_SCENARIOS
@@ -98,8 +106,10 @@ pub fn prepare_server(
   let seed_file = deploy_path.join("backup.txt");
   fs::write(&seed_file, "backup content").expect("Failed to write backup seed file");
 
-  let backup_path = server_dir.join("backup");
-  fs::create_dir_all(&backup_path).expect("Failed to create backup directory");
+  // Snapshots go beside the server binary now, which under test is whatever is
+  // running these cases. Cleared so a previous run cannot be mistaken for this
+  // one's snapshot.
+  let _ = fs::remove_dir_all(snapshot_directory());
 
   let scripts_dir = server_dir.join("scripts");
   fs::create_dir_all(&scripts_dir).expect("Failed to create scripts directory");
@@ -204,7 +214,6 @@ allowed_keys = [
   ServerFixture {
     config_path,
     deploy_path,
-    backup_path,
     pre_script: pre_script_path,
     post_script: post_script_path,
     backup_enabled,

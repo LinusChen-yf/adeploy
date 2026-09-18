@@ -78,16 +78,16 @@ message DeployStart {
 
 // What the server should do with an archive once it has it.
 message DeployManifest {
-    // Held by a field that used to say whether to wipe the directory first.
-    reserved 2;
+    // Held by fields that used to say whether to wipe the directory first, and
+    // where snapshots go.
+    reserved 2, 4;
 
     // Absolute directory to unpack into. Absolute because the server no longer
     // holds a root for a relative path to hang from.
     string deploy_path = 1;
-    // Snapshot the directory before replacing it.
+    // Snapshot the directory before replacing it. Where they go is the server's
+    // own business, so it is not described here.
     bool backup_enabled = 3;
-    // Where snapshots go. Empty means beside deploy_path.
-    string backup_path = 4;
     // Run before unpacking; a non-zero exit aborts the deployment.
     string before_deploy_script = 5;
     // Run after unpacking; failure is logged but not fatal.
