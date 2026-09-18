@@ -194,11 +194,34 @@ deploy_timeout = 1800
 ```
 
 A package describes its deployment end to end, and all of it travels to the
-server: where to unpack, whether to replace or merge, whether to snapshot, and
-the hooks to run. **A server holds no configuration for anything deployed to
-it** — only which port it listens on and whose keys it trusts. Adding a package,
-moving one, or changing a hook is a change to the project, committed with the
-code it deploys.
+server: where to unpack, whether to snapshot, and the commands to run around it.
+**A server holds no configuration for anything deployed to it** — only which
+port it listens on and whose keys it trusts. Adding a package, moving one, or
+changing a command is a change to the project, committed with the code it
+deploys.
+
+`before_deploy` and `after_deploy` take one command or a list, run in order,
+with the first failure stopping the rest. Before-deploy runs with the **unpacked
+package** as its working directory and aborts the deployment if it fails;
+after-deploy runs from the live deployment and only warns.
+
+That working directory is the point: a script the package ships is reachable by
+a relative path, so nothing has to be placed on the server by hand.
+
+```toml
+[packages.demo]
+sources = ["./dist/demo"]        # includes dist/demo/scripts/
+before_deploy = ["sc stop demo", "scripts/prepare.cmd"]
+after_deploy = "scripts/start.cmd"
+```
+
+A directory source contributes its *contents*, so `dist/demo/scripts/stop.sh`
+arrives as `scripts/stop.sh`. Executable bits survive the round trip.
+
+The order this implies is deliberate. The package is unpacked first, while the
+service is still running, so the slowest step happens outside the downtime
+window and before-deploy has the scripts to hand. Only then is the old content
+carried across and the swap made.
 
 `deploy_path` is absolute for that reason: there is no server-side root left for
 a relative path to resolve against.

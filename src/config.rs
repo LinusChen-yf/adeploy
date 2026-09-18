@@ -265,12 +265,20 @@ pub struct PackageConfig {
   /// keeps no root of its own for a relative path to hang from.
   #[serde(default)]
   pub deploy_path: Option<String>,
-  /// Server side: run before unpacking; a non-zero exit aborts the deployment.
-  #[serde(default)]
-  pub before_deploy_script: Option<String>,
-  /// Server side: run after unpacking; failure is logged but not fatal.
-  #[serde(default)]
-  pub after_deploy_script: Option<String>,
+  /// Server side: commands run before the new deployment goes live.
+  ///
+  /// Their working directory is the unpacked package, so a script shipped
+  /// alongside the code is reachable by a relative path and never has to be
+  /// placed on the server. Accepts one command or a list of them; the first
+  /// failure aborts the deployment.
+  #[serde(default, deserialize_with = "one_or_many")]
+  pub before_deploy: Vec<String>,
+  /// Server side: commands run once the deployment is live, from its directory.
+  ///
+  /// A failure is logged but does not fail the deployment: the files are
+  /// already in place by then.
+  #[serde(default, deserialize_with = "one_or_many")]
+  pub after_deploy: Vec<String>,
   /// Server side: snapshot the existing directory before unpacking.
   #[serde(default)]
   pub backup_enabled: bool,
@@ -353,6 +361,27 @@ impl ProjectConfig {
         .collect(),
     )
   }
+}
+
+/// Accept either one command or a list of them.
+///
+/// A single command is by far the common case and reads better unquoted from a
+/// list, but needing two should not mean writing a script file.
+fn one_or_many<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  #[derive(Deserialize)]
+  #[serde(untagged)]
+  enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
+  }
+
+  Ok(match OneOrMany::deserialize(deserializer)? {
+    OneOrMany::One(command) => vec![command],
+    OneOrMany::Many(commands) => commands,
+  })
 }
 
 /// Resolve `candidate` against `base_dir`, leaving absolute paths untouched.

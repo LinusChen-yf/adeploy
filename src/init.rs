@@ -49,6 +49,10 @@ deploy_timeout = 60
 [packages.demo]
 # Files and directories to archive, in order. No glob expansion. Relative to the
 # directory holding this file.
+#
+# A directory contributes its contents, not itself: "./dist/demo" puts whatever
+# is inside dist/demo at the top of the deployment. Nest anything you want in a
+# subdirectory - scripts, say - inside a source directory.
 sources = ["./dist/demo"]
 # Absolute directory on the server to unpack into. Absolute because the server
 # keeps no root of its own for a relative path to hang from.
@@ -57,12 +61,20 @@ deploy_path = "/opt/demo"
 # Snapshots are kept beside the server binary, in a directory named after the
 # package: <server dir>/demo/backup_<timestamp>/
 backup_enabled = true
-# Runs on the server before unpacking. A non-zero exit aborts the deployment, so
-# this is the place to stop a service that holds the files open.
-# before_deploy_script = "systemctl stop demo"
-# Runs on the server after unpacking. Failure is logged as a warning but the
-# deployment still counts as successful.
-# after_deploy_script = "systemctl start demo"
+# Commands run on the server before the new deployment goes live. One command or
+# a list of them; the first failure aborts the deployment, which makes this the
+# place to stop a service that holds the files open.
+#
+# They run with the unpacked package as the working directory, so a script the
+# package ships is reachable by a relative path and never has to be put on the
+# server by hand:
+#
+#   before_deploy = ["sc stop demo", "scripts/prepare.cmd"]
+#
+# before_deploy = "systemctl stop demo"
+# Commands run once the deployment is live, from its directory. A failure is
+# logged as a warning but the deployment still counts as successful.
+# after_deploy = "systemctl start demo"
 
 # Per-host overrides. Only list what differs from [defaults]; everything else is
 # inherited. The key is the host you pass on the command line. A "default" entry

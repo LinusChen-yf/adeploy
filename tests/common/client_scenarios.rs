@@ -122,8 +122,8 @@ sources = [
 ]
 deploy_path = "{deploy_path}"
 backup_enabled = {backup_enabled}
-before_deploy_script = "{pre_script}"
-after_deploy_script = "{post_script}"
+before_deploy = ["{pre_script}"]
+after_deploy = ["{post_script}"]
 {remote_block}"#,
     port = port,
     test1 = toml_escape_path(&test1_path),

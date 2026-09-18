@@ -78,9 +78,9 @@ message DeployStart {
 
 // What the server should do with an archive once it has it.
 message DeployManifest {
-    // Held by fields that used to say whether to wipe the directory first, and
-    // where snapshots go.
-    reserved 2, 4;
+    // Held by fields that used to say whether to wipe the directory first,
+    // where snapshots go, and single hook commands before they became lists.
+    reserved 2, 4, 5, 6;
 
     // Absolute directory to unpack into. Absolute because the server no longer
     // holds a root for a relative path to hang from.
@@ -88,10 +88,13 @@ message DeployManifest {
     // Snapshot the directory before replacing it. Where they go is the server's
     // own business, so it is not described here.
     bool backup_enabled = 3;
-    // Run before unpacking; a non-zero exit aborts the deployment.
-    string before_deploy_script = 5;
-    // Run after unpacking; failure is logged but not fatal.
-    string after_deploy_script = 6;
+    // Commands run in order before the new deployment goes live, with the
+    // unpacked package as the working directory - so a script the package
+    // ships is reachable by a relative path. A non-zero exit aborts.
+    repeated string before_deploy = 7;
+    // Commands run in order once it is live, from the deployment directory.
+    // Failure is logged but does not fail the deployment.
+    repeated string after_deploy = 8;
 }
 
 // Server-to-client event stream.

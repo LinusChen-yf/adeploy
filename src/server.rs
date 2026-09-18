@@ -37,7 +37,7 @@ use crate::{
     rollback_signing_payload, Auth,
   },
   config::{executable_dir, ConfigProvider, PackageConfig, ProjectConfig},
-  deploy::{backup_directory, list_backups, DeployManager, DeployTarget},
+  deploy::{backup_directory, list_backups, DeployManager},
   deploy_log::{DeployLogEntry, LogLevel, LogSink},
   error::{AdeployError, Result},
   init,
@@ -132,11 +132,6 @@ struct PackageContext {
   config: PackageConfig,
   deploy_path: PathBuf,
   backup_dir: PathBuf,
-}
-
-/// Treat an empty proto string as absent.
-fn optional(value: &str) -> Option<String> {
-  (!value.is_empty()).then(|| value.to_string())
 }
 
 /// Refuse a destination that cannot be meant seriously.
@@ -553,8 +548,8 @@ impl AdeployService {
         sources: Vec::new(),
         deploy_path: Some(manifest.deploy_path.clone()),
         backup_enabled: manifest.backup_enabled,
-        before_deploy_script: optional(&manifest.before_deploy_script),
-        after_deploy_script: optional(&manifest.after_deploy_script),
+        before_deploy: manifest.before_deploy.clone(),
+        after_deploy: manifest.after_deploy.clone(),
       },
       deploy_path,
     })
@@ -749,8 +744,9 @@ fn rollback_stream(
 
 /// Run the hooks around restoring a snapshot.
 ///
-/// The same hooks a deployment runs, because putting files back has the same
-/// requirements: the service holding them has to stop first and start after.
+/// The same hooks a deployment runs, in the same order and for the same reason:
+/// putting files back needs the service holding them stopped first, and the
+/// hook may well be a script that shipped inside the snapshot being restored.
 async fn execute_rollback(
   deploy_manager: &DeployManager,
   package_name: &str,
@@ -765,8 +761,17 @@ async fn execute_rollback(
     ))
     .await;
 
+  let tree = deploy_manager
+    .begin_restore(&chosen.path, &context.deploy_path, sink)
+    .await?;
+
   deploy_manager
-    .execute_before_deploy_script(&context.config, sink)
+    .run_hook(
+      &context.config.before_deploy,
+      "Before-deploy",
+      tree.path(),
+      sink,
+    )
     .await?;
 
   // Snapshot what is there now, so a rollback can itself be undone.
@@ -777,26 +782,22 @@ async fn execute_rollback(
       .await?;
   }
 
-  sink
-    .info(format!(
-      "Restoring {} into {}",
-      chosen.name,
-      context.deploy_path.display()
-    ))
-    .await;
   deploy_manager
-    .restore_backup(&chosen.path, &context.deploy_path)
+    .commit_deployment(tree, &context.deploy_path, sink)
     .await?;
   sink.info("Restore complete").await;
 
   if let Err(e) = deploy_manager
-    .execute_after_deploy_script(&context.config, sink)
+    .run_hook(
+      &context.config.after_deploy,
+      "After-deploy",
+      &context.deploy_path,
+      sink,
+    )
     .await
   {
-    warn!("After-deploy script failed: {}", e);
-    sink
-      .warn(format!("After-deploy script failed: {}", e))
-      .await;
+    warn!("After-deploy hook failed: {}", e);
+    sink.warn(format!("After-deploy hook failed: {}", e)).await;
   }
 
   sink
@@ -880,6 +881,12 @@ async fn receive_archive(
 }
 
 /// Run the hooks and the extraction, reporting each stage through `sink`.
+///
+/// The order matters. The package is unpacked first, so the before-deploy hook
+/// can run scripts the package itself ships; the live deployment is untouched
+/// at that point, and the slowest step happens while the service is still up.
+/// Only after the hook has stopped whatever holds the files is the old content
+/// carried across and the swap made.
 async fn execute_deployment(
   deploy_manager: &DeployManager,
   accepted: &AcceptedDeploy,
@@ -893,34 +900,56 @@ async fn execute_deployment(
     ))
     .await;
 
-  deploy_manager
-    .execute_before_deploy_script(&accepted.package_config, sink)
+  let tree = deploy_manager
+    .begin_deployment(
+      archive_path,
+      &accepted.start.file_hash,
+      &accepted.deploy_path,
+      sink,
+    )
     .await?;
 
   deploy_manager
-    .extract_files(
-      archive_path,
-      &accepted.start.file_hash,
-      &accepted.package_config,
-      DeployTarget {
-        package_name: &accepted.start.package_name,
-        deploy_path: &accepted.deploy_path,
-        backup_dir: &accepted.backup_dir,
-      },
+    .run_hook(
+      &accepted.package_config.before_deploy,
+      "Before-deploy",
+      tree.path(),
       sink,
     )
+    .await?;
+
+  deploy_manager
+    .carry_over_existing(&tree, &accepted.deploy_path, sink)
+    .await?;
+
+  if accepted.package_config.backup_enabled {
+    sink.info("Creating backup snapshot").await;
+    deploy_manager
+      .create_backup(
+        &accepted.start.package_name,
+        &accepted.deploy_path,
+        &accepted.backup_dir,
+      )
+      .await?;
+  }
+
+  deploy_manager
+    .commit_deployment(tree, &accepted.deploy_path, sink)
     .await?;
 
   // A failed after-deploy hook has never failed the deployment: the files are
   // already in place, and reverting them is not this stage's job.
   if let Err(e) = deploy_manager
-    .execute_after_deploy_script(&accepted.package_config, sink)
+    .run_hook(
+      &accepted.package_config.after_deploy,
+      "After-deploy",
+      &accepted.deploy_path,
+      sink,
+    )
     .await
   {
-    warn!("After-deploy script failed: {}", e);
-    sink
-      .warn(format!("After-deploy script failed: {}", e))
-      .await;
+    warn!("After-deploy hook failed: {}", e);
+    sink.warn(format!("After-deploy hook failed: {}", e)).await;
   }
 
   sink

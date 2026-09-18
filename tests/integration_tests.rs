@@ -145,9 +145,7 @@ fn resolve_expected_outcome(
     (HappyPath, PostDeployScriptFailure) => Some(CombinedOutcome::Success(
       SuccessExpectation::new(true, false, true),
     )),
-    (HappyPath, PreDeployScriptFailure) => Some(CombinedOutcome::ServerError(
-      "execution failed with exit code: 1",
-    )),
+    (HappyPath, PreDeployScriptFailure) => Some(CombinedOutcome::ServerError("exited with code 1")),
     (HappyPath, UnauthorizedKey) => Some(CombinedOutcome::ServerError(
       "Client public key not allowed",
     )),

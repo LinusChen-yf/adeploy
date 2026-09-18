@@ -204,7 +204,7 @@ pub fn deploy_start_signing_payload(
 ) -> Vec<u8> {
   // Bumped with the fields: a signature made for an older shape must not verify
   // against this one, where the new fields would otherwise be unauthenticated.
-  const DOMAIN: &[u8] = b"adeploy:deploy-start:v5";
+  const DOMAIN: &[u8] = b"adeploy:deploy-start:v6";
 
   let mut payload = Vec::with_capacity(DOMAIN.len() + 128);
   payload.extend_from_slice(DOMAIN);
@@ -249,7 +249,7 @@ pub fn backup_list_signing_payload(
   timestamp_ms: i64,
   manifest: Option<&DeployManifest>,
 ) -> Vec<u8> {
-  const DOMAIN: &[u8] = b"adeploy:backup-list:v4";
+  const DOMAIN: &[u8] = b"adeploy:backup-list:v5";
 
   let mut payload = Vec::with_capacity(DOMAIN.len() + 96);
   payload.extend_from_slice(DOMAIN);
@@ -276,7 +276,7 @@ pub fn rollback_signing_payload(
   deploy_timeout_secs: u64,
   manifest: Option<&DeployManifest>,
 ) -> Vec<u8> {
-  const DOMAIN: &[u8] = b"adeploy:rollback:v5";
+  const DOMAIN: &[u8] = b"adeploy:rollback:v6";
 
   let mut payload = Vec::with_capacity(DOMAIN.len() + 128);
   payload.extend_from_slice(DOMAIN);
@@ -305,8 +305,16 @@ fn push_manifest(buf: &mut Vec<u8>, manifest: Option<&DeployManifest>) {
   buf.push(1);
   push_field(buf, manifest.deploy_path.as_bytes());
   buf.push(u8::from(manifest.backup_enabled));
-  push_field(buf, manifest.before_deploy_script.as_bytes());
-  push_field(buf, manifest.after_deploy_script.as_bytes());
+  push_commands(buf, &manifest.before_deploy);
+  push_commands(buf, &manifest.after_deploy);
+}
+
+/// Append a hook's commands, counted so a different split cannot collide.
+fn push_commands(buf: &mut Vec<u8>, commands: &[String]) {
+  buf.extend_from_slice(&(commands.len() as u64).to_le_bytes());
+  for command in commands {
+    push_field(buf, command.as_bytes());
+  }
 }
 
 /// A short, comparable name for a public key, in the style of SSH.

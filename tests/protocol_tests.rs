@@ -126,7 +126,7 @@ impl Harness {
 
     // A hook that outlasts the deadline is the clearest way to ask whether the
     // server actually stops, rather than finishing with nobody listening.
-    let before_deploy_script = if slow_hook {
+    let before_deploy_commands = if slow_hook {
       let (name, body) = if cfg!(target_os = "windows") {
         // `timeout` needs a console and exits 1 when stdin is redirected, which
         // a hook's always is, so the script would fail instead of sleeping.
@@ -143,9 +143,9 @@ impl Harness {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&script, permissions).expect("hook permissions");
       }
-      script.to_string_lossy().to_string()
+      vec![script.to_string_lossy().to_string()]
     } else {
-      String::new()
+      Vec::new()
     };
     std::fs::write(
       &config_path,
@@ -161,8 +161,8 @@ allowed_keys = {allowlist}
     let manifest = DeployManifest {
       deploy_path: deploy_root.join(PACKAGE).to_string_lossy().to_string(),
       backup_enabled: false,
-      before_deploy_script,
-      after_deploy_script: String::new(),
+      before_deploy: before_deploy_commands,
+      after_deploy: Vec::new(),
     };
 
     let provider: Arc<dyn ConfigProvider> = Arc::new(FixedProvider {
