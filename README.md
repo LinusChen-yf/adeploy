@@ -47,7 +47,8 @@ forms are equivalent.
 
 `adeploy list` reads the configuration and contacts nothing — the package and
 remote names every other command wants, and a mark against any source that is
-not there. `--dry-run` really builds the archive and shows what it holds, so it
+not there. A name that matches no package is an error naming it, so a typo
+cannot quietly deploy everything except the package you meant. `--dry-run` really builds the archive and shows what it holds, so it
 also answers whether packaging works at all:
 
 ```
@@ -151,7 +152,8 @@ room for the upload — size it for what your hooks do. The server is told the
 value and stops at it too, rather than working on after the client has given up.
 It cuts both ways: too low a value aborts a deployment that was going to
 succeed, part way through, so raise it for a package whose hooks run an
-installer.
+installer. A hook still running when the deadline passes is killed with it,
+rather than left on the server with nobody waiting for it.
 
 The upload itself has no timeout and needs none. How long a transfer
 legitimately takes depends on the package and the link, so any limit would have
@@ -264,6 +266,23 @@ copying a live directory can otherwise capture a file mid-write.
 
 Files the package does not ship survive: uploads, logs, a database. A deployment
 overwrites what it ships and leaves everything else.
+
+The snapshot and the swap are the same move. The live deployment has to leave
+the deploy path either way, so with `backup_enabled` it is renamed into the
+snapshot directory rather than copied there and then deleted — nothing is
+copied at all when the two sit on one filesystem. Snapshots kept on another
+filesystem are out of `rename`'s reach and still copied.
+
+Only one deployment may hold a `deploy_path` at a time. A second is refused
+outright, before it uploads anything: two of them would each assemble a tree
+and then swap in whatever order they finished, and the one that lost would
+snapshot and carry over from the winner's half-installed state.
+
+A server killed mid-swap leaves the deployment in the directory it had just
+been moved to, and the next one puts it back rather than mistaking an empty
+deploy path for a first install. Working directories and staged uploads from
+a run that died are removed once they are old enough that nothing could still
+be using them.
 
 ## Rolling back
 
