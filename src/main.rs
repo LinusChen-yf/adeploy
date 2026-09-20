@@ -67,10 +67,14 @@ enum Commands {
     #[arg(long)]
     force: bool,
   },
-  /// Ask a server to trust this machine's key
+  /// Ask a server to trust this machine's key, and record which server it is
   Pair {
     /// Server host
     host: String,
+    /// Accept an identity that differs from the one on file, for a server that
+    /// was rebuilt or replaced
+    #[arg(long)]
+    force: bool,
   },
   /// Put a previous deployment back
   Rollback {
@@ -213,9 +217,9 @@ fn run_cli(cli: Cli) -> Result<()> {
     Some(Commands::Init { force }) => {
       init::init_project_config(force)?;
     }
-    Some(Commands::Pair { host }) => {
+    Some(Commands::Pair { host, force }) => {
       let runtime = build_runtime()?;
-      runtime.block_on(run_pair_mode(&host, config_override))?;
+      runtime.block_on(run_pair_mode(&host, force, config_override))?;
     }
     Some(Commands::Rollback {
       host,
@@ -255,11 +259,11 @@ fn run_cli(cli: Cli) -> Result<()> {
   Ok(())
 }
 
-async fn run_pair_mode(host: &str, config_override: Option<PathBuf>) -> Result<()> {
+async fn run_pair_mode(host: &str, force: bool, config_override: Option<PathBuf>) -> Result<()> {
   let provider: Arc<dyn config::ConfigProvider> =
     Arc::new(config::ConfigProviderImpl::with_override(config_override));
 
-  client::pair(host, provider.as_ref()).await
+  client::pair(host, force, provider.as_ref()).await
 }
 
 async fn run_rollback_mode(
@@ -302,7 +306,7 @@ fn usage_error(message: &str) -> Box<AdeployError> {
      \x20  or: adeploy client <HOST> <PACKAGE> [PACKAGE...]\n\
      \x20  or: adeploy server [run|install|start|stop|status|uninstall]\n\
      \x20  or: adeploy server [pending|approve|reject|keys|revoke]\n\
-     \x20  or: adeploy pair <HOST>\n\
+     \x20  or: adeploy pair <HOST> [--force]\n\
      \x20  or: adeploy rollback <HOST> <PACKAGE> [--list] [--to NAME]\n\
      \x20  or: adeploy list\n\
      \x20  or: adeploy init"

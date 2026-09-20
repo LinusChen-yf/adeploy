@@ -156,6 +156,7 @@ impl Harness {
       format!(
         r#"[server]
 listen_port = {port}
+tls = false
 allowed_keys = {allowlist}
 "#
       ),

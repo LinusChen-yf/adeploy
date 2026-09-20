@@ -10,7 +10,7 @@ use log2::*;
 use tempfile::{Builder, NamedTempFile};
 use tokio::{io::AsyncReadExt, time::timeout};
 use tokio_stream::Stream;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 use uuid::Uuid;
 
 use crate::{
@@ -26,6 +26,8 @@ use crate::{
   config::{ConfigProvider, LoadedConfig, ProjectConfig, ResolvedRemote},
   deploy::{describe_archive, DeployManager},
   error::{AdeployError, Result},
+  identity::{fetch_server_certificate, SERVER_TLS_NAME},
+  known_servers::{KnownServers, RecordOutcome},
   replay::now_ms,
 };
 
@@ -59,6 +61,45 @@ const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 /// that has stopped answering altogether.
 const DEADLINE_GRACE: Duration = Duration::from_secs(2);
 
+/// What this client will accept from the other end of a connection.
+///
+/// Signatures already say who is asking and bind a request to the archive it
+/// describes. This is the other direction: which server the client believes it
+/// reached, and whether anyone in between can read what it sends.
+enum ServerTrust {
+  /// No TLS. Everything crosses the network in the clear and any machine on
+  /// that address will do.
+  Insecure,
+  /// Exactly the certificate recorded when this machine paired with the host.
+  Pinned(String),
+}
+
+/// Work out what this client will accept from `host`.
+///
+/// A host with nothing on file is refused rather than trusted on sight: the
+/// first connection to a server is the one an impostor would most like to have,
+/// and `adeploy pair` exists to make that moment deliberate.
+fn server_trust(
+  host: &str,
+  remote: &ResolvedRemote,
+  provider: &dyn ConfigProvider,
+) -> Result<ServerTrust> {
+  if !remote.tls {
+    return Ok(ServerTrust::Insecure);
+  }
+
+  let path = provider.get_key_paths()?.known_servers();
+  let known = KnownServers::load(&path)?;
+  let server = known.get(host).ok_or_else(|| {
+    Box::new(AdeployError::Config(format!(
+      "This machine has not paired with {host}. Run `adeploy pair {host}` first, and compare the \
+       fingerprint it prints with the `Server identity` line in that server's own log."
+    )))
+  })?;
+
+  Ok(ServerTrust::Pinned(server.certificate.clone()))
+}
+
 /// Deploy specific packages using an explicit provider
 pub async fn deploy(
   host: &str,
@@ -69,7 +110,8 @@ pub async fn deploy(
   info!("Loaded configuration from {}", loaded.path.display());
 
   let remote = loaded.config.resolve_remote(host);
-  let mut client = connect_deploy_client(host, &remote).await?;
+  let trust = server_trust(host, &remote, provider)?;
+  let mut client = connect_deploy_client(host, &remote, &trust).await?;
   let deploy_manager = DeployManager::new();
   let auth_resources = prepare_auth_resources(provider)?;
   let packages_to_deploy = select_packages(&loaded, package_names)?;
@@ -248,7 +290,8 @@ pub async fn list_backups(host: &str, package: &str, provider: &dyn ConfigProvid
   );
   let signature = sign(&auth, &payload)?;
 
-  let mut client = connect_deploy_client(host, &remote).await?;
+  let trust = server_trust(host, &remote, provider)?;
+  let mut client = connect_deploy_client(host, &remote, &trust).await?;
   let response = client
     .list_backups(tonic::Request::new(BackupListRequest {
       package_name: package.to_string(),
@@ -321,7 +364,8 @@ pub async fn rollback(
     info!("Rolling {} back to {} on {}", package, backup_name, host);
   }
 
-  let mut client = connect_deploy_client(host, &remote).await?;
+  let trust = server_trust(host, &remote, provider)?;
+  let mut client = connect_deploy_client(host, &remote, &trust).await?;
   let request = tonic::Request::new(RollbackRequest {
     package_name: package.to_string(),
     backup_name,
@@ -392,7 +436,7 @@ fn format_size(bytes: u64) -> String {
 /// Deliberately a separate command rather than something a failed deployment
 /// does on its own: joining a server is a decision, and the operator on the
 /// other end has to be told to expect it.
-pub async fn pair(host: &str, provider: &dyn ConfigProvider) -> Result<()> {
+pub async fn pair(host: &str, force: bool, provider: &dyn ConfigProvider) -> Result<()> {
   let loaded = provider.load()?;
   let remote = loaded.config.resolve_remote(host);
   let auth = prepare_auth_resources(provider)?;
@@ -403,6 +447,11 @@ pub async fn pair(host: &str, provider: &dyn ConfigProvider) -> Result<()> {
   info!("Pairing with {}:{} as {}", host, remote.port, client_name);
   info!("This machine's key fingerprint: {}", key_fingerprint);
 
+  // Both directions are settled here, on the one trip an operator already
+  // makes: this machine records who the server is, and the server queues this
+  // machine's key for a person to approve.
+  let trust = record_server_identity(host, &remote, provider, force).await?;
+
   let nonce = Uuid::new_v4().to_string();
   let timestamp_ms = now_ms();
   let payload = pair_signing_payload(&auth.public_key, &client_name, &nonce, timestamp_ms);
@@ -411,7 +460,7 @@ pub async fn pair(host: &str, provider: &dyn ConfigProvider) -> Result<()> {
     .sign_data(&payload)
     .map_err(|e| Box::new(AdeployError::Auth(format!("Failed to sign request: {}", e))))?;
 
-  let mut client = connect_deploy_client(host, &remote).await?;
+  let mut client = connect_deploy_client(host, &remote, &trust).await?;
   let response = client
     .pair(tonic::Request::new(PairRequest {
       public_key: auth.public_key.clone(),
@@ -433,7 +482,80 @@ pub async fn pair(host: &str, provider: &dyn ConfigProvider) -> Result<()> {
   Ok(())
 }
 
-fn report_pair_state(host: &str, state: &i32, server_fingerprint: &str, message: &str) {
+/// Learn which server answers at `host`, and record it.
+///
+/// The one connection that cannot verify the other end, for the same reason
+/// `Pair` is the one method that cannot require a key: it is what establishes
+/// the thing every later connection checks against. That is why the fingerprint
+/// is printed rather than quietly filed - an operator running this is already
+/// on their way to the server to approve the key, and the identity to compare
+/// is in the log they are about to read.
+async fn record_server_identity(
+  host: &str,
+  remote: &ResolvedRemote,
+  provider: &dyn ConfigProvider,
+  force: bool,
+) -> Result<ServerTrust> {
+  if !remote.tls {
+    warn!(
+      "TLS is off for {}, so this pairing cannot tell that server from any other machine on its address",
+      host
+    );
+    return Ok(ServerTrust::Insecure);
+  }
+
+  let presented = fetch_server_certificate(host, remote.port).await?;
+  let path = provider.get_key_paths()?.known_servers();
+  let mut known = KnownServers::load(&path)?;
+
+  match known.record(
+    host,
+    &presented.certificate_pem,
+    &presented.fingerprint,
+    force,
+  ) {
+    RecordOutcome::Recorded => {
+      info!("Server identity: {}  (recorded)", presented.fingerprint);
+      warn!(
+        "Check it matches the `Server identity` line in {}'s own log before approving this machine",
+        host
+      );
+    }
+    RecordOutcome::Unchanged => {
+      info!(
+        "Server identity: {}  (already known)",
+        presented.fingerprint
+      );
+    }
+    RecordOutcome::Replaced { previous } => {
+      warn!("Server identity replaced for {}", host);
+      warn!("  was:  {}", previous);
+      warn!("  now:  {}", presented.fingerprint);
+    }
+    RecordOutcome::Conflict { recorded } => {
+      error!(
+        "{} presented an identity this machine has not seen before",
+        host
+      );
+      error!("  recorded:  {}", recorded);
+      error!("  presented: {}", presented.fingerprint);
+      return Err(Box::new(AdeployError::Auth(format!(
+        "{host} is not the server this machine paired with. If it was rebuilt or replaced, \
+         confirm the new fingerprint above against its own log and run \
+         `adeploy pair {host} --force`; otherwise something else is answering on that address."
+      ))));
+    }
+  }
+
+  known.save(&path)?;
+  Ok(ServerTrust::Pinned(presented.certificate_pem))
+}
+
+/// `key_fingerprint` is this machine's own key, as the server read it - the
+/// value an operator pastes into `adeploy server approve`. The server's own
+/// identity is a different fingerprint entirely, reported above by
+/// `record_server_identity`.
+fn report_pair_state(host: &str, state: &i32, key_fingerprint: &str, message: &str) {
   match PairState::try_from(*state).unwrap_or(PairState::Unspecified) {
     PairState::Approved => {
       info!(
@@ -445,7 +567,7 @@ fn report_pair_state(host: &str, state: &i32, server_fingerprint: &str, message:
       info!("Request queued on {}: {}", host, message);
       warn!(
         "Approve it on {} with:  adeploy server approve {}",
-        host, server_fingerprint
+        host, key_fingerprint
       );
       warn!("Check that fingerprint matches the one printed above before approving");
     }
@@ -481,21 +603,67 @@ struct SelectedPackage {
 async fn connect_deploy_client(
   host: &str,
   remote: &ResolvedRemote,
+  trust: &ServerTrust,
 ) -> Result<DeployServiceClient<Channel>> {
   info!("Connecting to {}:{}", host, remote.port);
 
-  let endpoint_uri = format!("http://{}:{}", host, remote.port);
-  let endpoint = Channel::from_shared(endpoint_uri)
+  let pinned = matches!(trust, ServerTrust::Pinned(_));
+  let scheme = if pinned { "https" } else { "http" };
+  let endpoint = Channel::from_shared(format!("{}://{}:{}", scheme, host, remote.port))
     .map_err(|e| Box::new(AdeployError::Network(format!("Invalid endpoint: {}", e))))?;
-  let endpoint = configure_endpoint(endpoint, remote);
+  let mut endpoint = configure_endpoint(endpoint, remote);
+
+  if let ServerTrust::Pinned(certificate) = trust {
+    // The recorded certificate is the whole trust root. No authority signed it
+    // and none needs to: the question is only whether this is the same server
+    // as last time, and the name inside it is fixed so the address can change.
+    endpoint = endpoint
+      .tls_config(
+        ClientTlsConfig::new()
+          .ca_certificate(Certificate::from_pem(certificate))
+          .domain_name(SERVER_TLS_NAME),
+      )
+      .map_err(|e| Box::new(AdeployError::Network(format!("TLS setup failed: {e}"))))?;
+  }
+
   let channel = endpoint.connect().await.map_err(|e| {
+    let hint = if pinned {
+      format!(
+        ". If {host} was rebuilt or replaced, its identity changed; run `adeploy pair {host} --force` after checking that is what happened"
+      )
+    } else {
+      String::new()
+    };
     Box::new(AdeployError::Network(format!(
-      "Failed to connect to {}:{}: {}",
-      host, remote.port, e
+      "Failed to connect to {}:{}: {}{}",
+      host,
+      remote.port,
+      describe_with_causes(&e),
+      hint
     )))
   })?;
 
   Ok(DeployServiceClient::new(channel).max_decoding_message_size(MAX_RESPONSE_SIZE))
+}
+
+/// An error together with what actually caused it.
+///
+/// tonic reports every failed connection as "transport error" and leaves the
+/// reason in the source chain, so a certificate that does not match reads as an
+/// ordinary network problem - the one case where knowing the difference matters
+/// most.
+fn describe_with_causes(error: &(dyn std::error::Error + 'static)) -> String {
+  let mut description = error.to_string();
+  let mut source = error.source();
+  while let Some(cause) = source {
+    let text = cause.to_string();
+    if !description.contains(&text) {
+      description.push_str(": ");
+      description.push_str(&text);
+    }
+    source = cause.source();
+  }
+  description
 }
 
 fn prepare_auth_resources(provider: &dyn ConfigProvider) -> Result<AuthResources> {

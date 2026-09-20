@@ -41,6 +41,17 @@ connect_timeout = 5
 # deployment that was going to succeed, part way through. Raise it for a package
 # whose hooks run an installer, per host in [remotes] if only some are slow.
 deploy_timeout = 60
+# Verify the server's identity and encrypt the connection. On by default.
+#
+# The archive is your project's code and whatever it carries with it, and
+# without this it crosses the network in the clear to whichever machine answered
+# on that address. `adeploy pair <host>` records which server that is - compare
+# the fingerprint it prints with the one the server logs at startup - and every
+# later connection checks against what was recorded, the way ssh does.
+#
+# There is no certificate authority involved and nothing to buy or renew: the
+# server generates its own certificate on first run.
+tls = true
 
 # A package describes a deployment end to end: what to archive, where it goes
 # and what runs around it. All of it travels to the server with the package, so
@@ -102,6 +113,13 @@ const SERVER_TEMPLATE: &str = r#"# adeploy server configuration, generated on fi
 [server]
 # Port to bind. Clients must dial this same port. Changing it needs a restart.
 listen_port = {port}
+# Serve over TLS. On by default.
+#
+# The certificate and key beside this file were generated on first run, and the
+# fingerprint printed at startup is what a pairing client compares against.
+# Turning this off leaves every deployment readable by anyone on the network,
+# and lets any machine on this address pass for this one.
+tls = true
 # Base64 Ed25519 public keys allowed to deploy here. A client that is not
 # listed is rejected and prints its own key, ready to be pasted in below.
 #
@@ -198,6 +216,10 @@ mod tests {
     let config: ProjectConfig = toml::from_str(&text).expect("generated config must parse");
 
     assert_eq!(config.server.listen_port, 6060);
+    assert!(
+      config.server.tls,
+      "a generated server must serve over TLS without being asked"
+    );
     // The server template carries no client settings at all.
     assert!(
       !text.contains("[defaults]"),
@@ -248,6 +270,7 @@ mod tests {
     assert_eq!(config.defaults.port, 6060);
     assert_eq!(config.defaults.connect_timeout, 5);
     assert_eq!(config.defaults.deploy_timeout, 60);
+    assert!(config.defaults.tls);
 
     let demo = config
       .packages
@@ -265,6 +288,7 @@ mod tests {
     let from_empty: ProjectConfig = toml::from_str("").expect("empty config is valid");
 
     assert_eq!(from_template.defaults.port, from_empty.defaults.port);
+    assert_eq!(from_template.defaults.tls, from_empty.defaults.tls);
     assert_eq!(
       from_template.defaults.connect_timeout,
       from_empty.defaults.connect_timeout

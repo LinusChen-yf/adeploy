@@ -200,6 +200,9 @@ touch '{}'
   let config_content = format!(
     r#"[server]
 listen_port = {port}
+# These cases are about what a deployment does, not about the transport it
+# arrives over; `tls_tests.rs` is where the transport is the subject.
+tls = false
 allowed_keys = [
   "{allowed_key}"
 ]
