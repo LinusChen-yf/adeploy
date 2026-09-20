@@ -1,10 +1,11 @@
 use std::{
+  collections::HashSet,
   env,
   ffi::OsString,
   future::Future,
   path::{Path, PathBuf},
   pin::Pin,
-  sync::Arc,
+  sync::{Arc, Mutex},
   time::Duration,
 };
 
@@ -89,6 +90,8 @@ pub struct AdeployService {
   paired_path: PathBuf,
   /// Serialises this server's own read-modify-write of that file.
   pair_lock: Arc<tokio::sync::Mutex<()>>,
+  /// Deployment directories an operation is currently holding.
+  active: ActivePaths,
 }
 
 impl AdeployService {
@@ -98,6 +101,7 @@ impl AdeployService {
       replay: Arc::new(ReplayGuard::new()),
       paired_path,
       pair_lock: Arc::new(tokio::sync::Mutex::new(())),
+      active: ActivePaths::default(),
     }
   }
 
@@ -125,6 +129,61 @@ struct AcceptedDeploy {
   deploy_path: PathBuf,
   backup_dir: PathBuf,
   staging_dir: PathBuf,
+  /// Held for as long as this deployment runs, and released however it ends.
+  _claim: DeployClaim,
+}
+
+/// The deployment directories being replaced right now.
+///
+/// Two deployments to one directory each assemble a tree of their own and then
+/// swap, in whatever order they happen to finish. The one that lost would have
+/// snapshotted the winner's half-installed state, carried over from it, and
+/// left a directory belonging to neither. Refusing the second is the only
+/// outcome anybody can reason about afterwards.
+#[derive(Clone, Default)]
+struct ActivePaths(Arc<Mutex<HashSet<PathBuf>>>);
+
+impl ActivePaths {
+  /// Take `path` for the caller, or say who already has it.
+  fn claim(&self, path: &Path) -> std::result::Result<DeployClaim, Status> {
+    let mut held = self
+      .0
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if !held.insert(path.to_path_buf()) {
+      return Err(Status::aborted(format!(
+        "Another deployment is already replacing {}; wait for it to finish",
+        path.display()
+      )));
+    }
+
+    Ok(DeployClaim {
+      path: path.to_path_buf(),
+      active: self.clone(),
+    })
+  }
+}
+
+/// A claim on one deployment directory.
+///
+/// Released on drop, which covers every way an operation ends: a normal finish,
+/// a failure, an expired deadline, or a client that simply went away and took
+/// the response stream with it.
+struct DeployClaim {
+  path: PathBuf,
+  active: ActivePaths,
+}
+
+impl Drop for DeployClaim {
+  fn drop(&mut self) {
+    self
+      .active
+      .0
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+      .remove(&self.path);
+  }
 }
 
 /// Everything a package's name resolves to on this server.
@@ -317,6 +376,11 @@ impl DeployService for AdeployService {
       .await?;
 
     let context = self.package_context(&request.package_name, request.manifest.as_ref())?;
+
+    // Restoring replaces the directory as thoroughly as deploying does, so it
+    // takes the same claim.
+    let claim = self.active.claim(&context.deploy_path)?;
+
     let backups = list_backups(&context.backup_dir)
       .map_err(|e| Status::internal(format!("Failed to read snapshots: {}", e)))?;
 
@@ -356,6 +420,7 @@ impl DeployService for AdeployService {
       context,
       chosen,
       deadline,
+      claim,
     );
     Ok(Response::new(Box::pin(stream) as Self::RollbackStream))
   }
@@ -581,12 +646,17 @@ impl AdeployService {
 
     let context = self.package_context(&start.package_name, start.manifest.as_ref())?;
 
+    // Before a byte of archive is accepted, so a client that has to wait finds
+    // out now rather than after the upload.
+    let claim = self.active.claim(&context.deploy_path)?;
+
     Ok(AcceptedDeploy {
       start,
       package_config: context.config,
       staging_dir: context.deploy_path.with_file_name(STAGING_DIR),
       deploy_path: context.deploy_path,
       backup_dir: context.backup_dir,
+      _claim: claim,
     })
   }
 }
@@ -688,8 +758,12 @@ fn rollback_stream(
   context: PackageContext,
   chosen: crate::deploy::BackupInfo,
   deadline: Option<Instant>,
+  claim: DeployClaim,
 ) -> impl Stream<Item = std::result::Result<DeployEvent, Status>> + Send + 'static {
   try_stream! {
+    // Moved in rather than left to the enclosing function, whose locals are
+    // dropped as soon as it hands the stream back.
+    let _claim = claim;
     let deploy_id = deploy_manager.deploy_id.clone();
     yield accepted_event(&deploy_id);
 
