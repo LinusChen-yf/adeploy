@@ -1566,15 +1566,17 @@ mod tests {
 
   #[test]
   fn a_snapshot_that_cannot_be_taken_at_all_leaves_the_deployment_running() {
-    // Neither moving nor copying can put a directory where a file already is.
+    // Neither moving nor copying can put a directory inside a regular file,
+    // which every platform agrees on - unlike replacing one, which they do not.
     let temp = TempDir::new().expect("temp dir");
     let deploy_path = temp.path().join("live");
 
     let first = archive_with(&temp.path().join("one"), "app.txt", "v1");
     deploy_once(&first, &deploy_path, "11111111").expect("first deploy");
 
-    let blocked = temp.path().join("snapshot");
-    fs::write(&blocked, "not a directory").expect("blocking file");
+    let in_the_way = temp.path().join("not-a-directory");
+    fs::write(&in_the_way, "a file").expect("blocking file");
+    let blocked = in_the_way.join("snapshot");
 
     let second = archive_with(&temp.path().join("two"), "app.txt", "v2");
     let failure = deploy_once_keeping(&second, &deploy_path, "22222222", Some(&blocked))

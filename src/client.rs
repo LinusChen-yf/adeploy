@@ -905,27 +905,37 @@ fn log_deploy_server_entry(entry: &DeployLog) {
 mod tests {
   use super::*;
 
+  /// A prefix that is absolute on the platform running the test.
+  ///
+  /// `manifest_for` refuses a `deploy_path` that is not absolute, and on
+  /// Windows a leading separator alone is not.
+  const ROOT: &str = if cfg!(windows) { "C:/some" } else { "/some" };
+
   fn loaded(toml_text: &str) -> LoadedConfig {
     LoadedConfig {
       config: toml::from_str(toml_text).expect("configuration should parse"),
-      base_dir: PathBuf::from("/projects/app"),
-      path: PathBuf::from("/projects/app/adeploy.toml"),
+      base_dir: PathBuf::from(format!("{ROOT}/projects/app")),
+      path: PathBuf::from(format!("{ROOT}/projects/app/adeploy.toml")),
     }
   }
 
-  const TWO_PACKAGES: &str = r#"
+  fn two_packages() -> String {
+    format!(
+      r#"
 [packages.api]
 sources = ["./dist/api"]
-deploy_path = "/opt/api"
+deploy_path = "{ROOT}/api"
 
 [packages.web]
 sources = ["./dist/web"]
-deploy_path = "/opt/web"
-"#;
+deploy_path = "{ROOT}/web"
+"#
+    )
+  }
 
   #[test]
   fn a_mistyped_name_fails_instead_of_deploying_the_rest() {
-    let loaded = loaded(TWO_PACKAGES);
+    let loaded = loaded(&two_packages());
 
     let error = select_packages(&loaded, Some(vec!["api".into(), "wbe".into()]))
       .expect_err("a name with no package must not be skipped");
@@ -943,7 +953,7 @@ deploy_path = "/opt/web"
 
   #[test]
   fn every_unknown_name_is_reported_at_once() {
-    let loaded = loaded(TWO_PACKAGES);
+    let loaded = loaded(&two_packages());
 
     let error = select_packages(&loaded, Some(vec!["one".into(), "two".into()]))
       .expect_err("unknown names must fail");
@@ -957,7 +967,7 @@ deploy_path = "/opt/web"
 
   #[test]
   fn names_that_all_exist_are_selected_in_order() {
-    let loaded = loaded(TWO_PACKAGES);
+    let loaded = loaded(&two_packages());
 
     let selected = select_packages(&loaded, Some(vec!["web".into(), "api".into()]))
       .expect("declared packages should be selected");
@@ -969,7 +979,7 @@ deploy_path = "/opt/web"
     assert_eq!(names, ["web", "api"]);
     assert_eq!(
       selected[0].sources,
-      vec![PathBuf::from("/projects/app/dist/web")]
+      vec![PathBuf::from(format!("{ROOT}/projects/app/dist/web"))]
     );
   }
 

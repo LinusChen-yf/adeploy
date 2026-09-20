@@ -794,9 +794,10 @@ async fn a_second_deployment_to_the_same_directory_is_refused() {
     }
   });
 
-  // Long enough for the opening message to be accepted; the hook it then runs
-  // lasts far longer than the rest of this test.
-  sleep(Duration::from_millis(800)).await;
+  // Long enough for the opening message to be accepted even on a slow runner;
+  // the hook it then runs lasts far longer than the rest of this test, so
+  // there is no race at the other end.
+  sleep(Duration::from_secs(2)).await;
 
   let start = harness.start_message();
   let refusal = harness
