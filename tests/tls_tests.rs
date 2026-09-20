@@ -9,7 +9,6 @@
 use std::{
   path::{Path, PathBuf},
   sync::Arc,
-  time::Duration,
 };
 
 use adeploy::{
@@ -23,7 +22,6 @@ use adeploy::{
   server,
 };
 use tempfile::TempDir;
-use tokio::time::sleep;
 
 mod common;
 
@@ -114,7 +112,7 @@ impl Harness {
     tokio::spawn(async move {
       let _ = server::start_server(provider_for_server).await;
     });
-    sleep(Duration::from_millis(400)).await;
+    common::wait_until_listening(port).await;
 
     let key_paths = KeyPairPaths::new(private_key, public_key);
     let known_servers_path = key_paths.known_servers();

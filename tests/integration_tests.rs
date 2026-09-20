@@ -15,7 +15,7 @@ use adeploy::{
 };
 use log2::*;
 use tempfile::TempDir;
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 
 /// Pins the provider to one `adeploy.toml`, bypassing the upward search so the
 /// client and the server can each be handed their own copy.
@@ -220,7 +220,7 @@ async fn run_case(case: &ScenarioCase) -> Result<(), String> {
       let _ = server::start_server(server_provider).await;
     }));
 
-    sleep(Duration::from_millis(200)).await;
+    common::wait_until_listening(test_setup.port).await;
   }
 
   let deploy_future = client::deploy(
