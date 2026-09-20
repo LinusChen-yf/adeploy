@@ -769,7 +769,7 @@ fn rollback_stream(
 
     let (sender, mut receiver) = mpsc::channel(EVENT_CHANNEL_SIZE);
     let sink = LogSink::new(sender);
-    let work = execute_rollback(&deploy_manager, &package_name, &context, &chosen, &sink);
+    let work = execute_rollback(&deploy_manager, &context, &chosen, &sink);
     tokio::pin!(work);
     let expiry = expire_at(deadline);
     tokio::pin!(expiry);
@@ -823,7 +823,6 @@ fn rollback_stream(
 /// hook may well be a script that shipped inside the snapshot being restored.
 async fn execute_rollback(
   deploy_manager: &DeployManager,
-  package_name: &str,
   context: &PackageContext,
   chosen: &crate::deploy::BackupInfo,
   sink: &LogSink,
@@ -848,16 +847,17 @@ async fn execute_rollback(
     )
     .await?;
 
-  // Snapshot what is there now, so a rollback can itself be undone.
-  if context.config.backup_enabled {
+  // Snapshot what is there now, so a rollback can itself be undone. Taken by
+  // the swap, which has to move this directory anyway.
+  let snapshot = if context.config.backup_enabled {
     sink.info("Creating backup snapshot").await;
-    deploy_manager
-      .create_backup(package_name, &context.deploy_path, &context.backup_dir)
-      .await?;
-  }
+    Some(deploy_manager.snapshot_path(&context.backup_dir)?)
+  } else {
+    None
+  };
 
   deploy_manager
-    .commit_deployment(tree, &context.deploy_path, sink)
+    .commit_deployment(tree, &context.deploy_path, snapshot, sink)
     .await?;
   sink.info("Restore complete").await;
 
@@ -1000,19 +1000,15 @@ async fn execute_deployment(
     .carry_over_existing(&tree, &accepted.deploy_path, sink)
     .await?;
 
-  if accepted.package_config.backup_enabled {
+  let snapshot = if accepted.package_config.backup_enabled {
     sink.info("Creating backup snapshot").await;
-    deploy_manager
-      .create_backup(
-        &accepted.start.package_name,
-        &accepted.deploy_path,
-        &accepted.backup_dir,
-      )
-      .await?;
-  }
+    Some(deploy_manager.snapshot_path(&accepted.backup_dir)?)
+  } else {
+    None
+  };
 
   deploy_manager
-    .commit_deployment(tree, &accepted.deploy_path, sink)
+    .commit_deployment(tree, &accepted.deploy_path, snapshot, sink)
     .await?;
 
   // A failed after-deploy hook has never failed the deployment: the files are

@@ -241,11 +241,16 @@ impl DeployManager {
     Ok(())
   }
 
-  /// Move the assembled deployment into place.
+  /// Move the assembled deployment into place, keeping `snapshot` if asked.
+  ///
+  /// The snapshot is taken here rather than beforehand because it is the same
+  /// move: the live deployment has to leave the deploy path either way, and
+  /// where it lands is the only question.
   pub async fn commit_deployment(
     &self,
     tree: IncomingTree,
     deploy_path: &Path,
+    snapshot: Option<PathBuf>,
     sink: &LogSink,
   ) -> Result<()> {
     let deploy_path_owned = deploy_path.to_path_buf();
@@ -253,12 +258,36 @@ impl DeployManager {
       .info(format!("Swapping in {}", deploy_path.display()))
       .await;
 
-    spawn_blocking(move || tree.commit(&deploy_path_owned))
+    spawn_blocking(move || tree.commit(&deploy_path_owned, snapshot.as_deref()))
       .await
       .map_err(|e| Box::new(AdeployError::Deploy(format!("Swap task failed: {}", e))))??;
 
     info!("Deployment in place: {}", deploy_path.display());
     Ok(())
+  }
+
+  /// Where this deployment's snapshot of the directory it replaces will go.
+  ///
+  /// Named from the moment the deployment started, so every phase of one run
+  /// agrees on it, and disambiguated because two snapshots can land inside the
+  /// same second - which a rollback does by design.
+  pub fn snapshot_path(&self, backup_dir: &Path) -> Result<PathBuf> {
+    fs::create_dir_all(backup_dir).map_err(|e| {
+      Box::new(AdeployError::FileSystem(format!(
+        "Failed to create backup directory {}: {}",
+        backup_dir.display(),
+        e
+      )))
+    })?;
+
+    Ok(unique_backup_path(
+      backup_dir,
+      &format!(
+        "{}{}",
+        BACKUP_PREFIX,
+        self.start_time.format("%Y%m%d_%H%M%S")
+      ),
+    ))
   }
 
   /// Short, unique enough to tell concurrent deployments apart.
@@ -401,68 +430,6 @@ impl DeployManager {
 
     Ok(())
   }
-
-  /// Create backup of existing deployment
-  pub async fn create_backup(
-    &self,
-    package_name: &str,
-    deploy_path: &Path,
-    backup_dir: &Path,
-  ) -> Result<()> {
-    let backup_dir_path = backup_dir.to_path_buf();
-    std::fs::create_dir_all(&backup_dir_path).map_err(|e| {
-      Box::new(AdeployError::FileSystem(format!(
-        "Failed to create backup directory: {}",
-        e
-      )))
-    })?;
-
-    info!("Creating backup at {}", backup_dir_path.display());
-
-    info!("Backing up {} from {}", package_name, deploy_path.display());
-    let backup_full_path = unique_backup_path(
-      &backup_dir_path,
-      &format!(
-        "{}{}",
-        BACKUP_PREFIX,
-        self.start_time.format("%Y%m%d_%H%M%S")
-      ),
-    );
-
-    self
-      .copy_existing_deploy(deploy_path, &backup_full_path)
-      .await?;
-    self.log_backup_contents(&backup_full_path)?;
-    Ok(())
-  }
-
-  /// Copy directory recursively
-  async fn copy_directory(&self, src: &Path, dst: &Path) -> Result<()> {
-    info!("Copying {} -> {}", src.display(), dst.display());
-
-    let src_path = src.to_path_buf();
-    let dst_path = dst.to_path_buf();
-
-    spawn_blocking(move || -> Result<()> {
-      copy_dir_recursive(&src_path, &dst_path).map_err(|e| {
-        Box::new(AdeployError::FileSystem(format!(
-          "Directory copy failed: {}",
-          e
-        )))
-      })?;
-      Ok(())
-    })
-    .await
-    .map_err(|e| {
-      Box::new(AdeployError::FileSystem(format!(
-        "Directory copy task failed: {}",
-        e
-      )))
-    })??;
-
-    info!("Copied {} -> {}", src.display(), dst.display());
-    Ok(())
-  }
 }
 
 impl DeployManager {
@@ -551,29 +518,6 @@ impl DeployManager {
     })
     .await
     .map_err(|e| Box::new(AdeployError::Deploy(format!("Restore task failed: {}", e))))?
-  }
-
-  async fn copy_existing_deploy(&self, deploy_path: &Path, backup_full_path: &Path) -> Result<()> {
-    if deploy_path.exists() {
-      self.copy_directory(deploy_path, backup_full_path).await?;
-      info!("Backup stored at {}", backup_full_path.display());
-    } else {
-      info!(
-        "No existing deployment at {}; skipping backup",
-        deploy_path.display()
-      );
-    }
-    Ok(())
-  }
-
-  fn log_backup_contents(&self, backup_full_path: &Path) -> Result<()> {
-    if backup_full_path.exists() {
-      for entry in backup_full_path.read_dir()? {
-        let entry = entry?;
-        info!("Backup item: {}", entry.file_name().to_string_lossy());
-      }
-    }
-    Ok(())
   }
 }
 
@@ -856,28 +800,26 @@ impl IncomingTree {
     })
   }
 
-  /// Move the tree over the live deployment.
+  /// Move the tree over the live deployment, keeping `snapshot` if asked.
   ///
   /// Two renames rather than one: the window in which `deploy_path` does not
   /// exist is the gap between them, instead of the whole extraction.
-  fn commit(mut self, deploy_path: &Path) -> Result<()> {
-    let had_existing = deploy_path.exists();
-    if had_existing {
-      fs::rename(deploy_path, &self.previous).map_err(|e| {
-        Box::new(AdeployError::FileSystem(format!(
-          "Failed to move the existing deployment aside: {}",
-          e
-        )))
-      })?;
-    }
+  fn commit(mut self, deploy_path: &Path, snapshot: Option<&Path>) -> Result<()> {
+    let displaced = if deploy_path.exists() {
+      Some(self.displace(deploy_path, snapshot)?)
+    } else {
+      None
+    };
 
     if let Err(e) = fs::rename(&self.path, deploy_path) {
       // Put the old deployment back rather than leaving nothing in its place.
-      if had_existing {
-        if let Err(restore) = fs::rename(&self.previous, deploy_path) {
+      // Costing the snapshot to do it is the right trade: the deployment it
+      // would have been rolled back from never happened.
+      if let Some(displaced) = &displaced {
+        if let Err(restore) = fs::rename(displaced.path(), deploy_path) {
           error!(
             "Failed to restore the previous deployment from {}: {}",
-            self.previous.display(),
+            displaced.path().display(),
             restore
           );
         }
@@ -892,13 +834,73 @@ impl IncomingTree {
 
     // The deployment is live, so a cleanup failure is worth reporting but not
     // worth failing over.
-    if had_existing {
-      if let Err(e) = remove_directory(&self.previous) {
-        warn!("Failed to remove {}: {}", self.previous.display(), e);
+    if let Some(Displaced::Aside(path)) = &displaced {
+      if let Err(e) = remove_directory(path) {
+        warn!("Failed to remove {}: {}", path.display(), e);
       }
     }
 
     Ok(())
+  }
+
+  /// Move the live deployment out of the way, keeping it as `snapshot` when one
+  /// was asked for.
+  ///
+  /// A snapshot used to be a full copy of the directory, taken moments before
+  /// the swap moved that same directory aside and deleted it - so on the usual
+  /// setup, where the snapshots sit on the filesystem the deployment does, an
+  /// entire deployment was copied for nothing. The rename that has to happen
+  /// anyway can land in the snapshot directory instead. Snapshots kept on
+  /// another filesystem are out of `rename`'s reach, and still copied.
+  fn displace(&self, deploy_path: &Path, snapshot: Option<&Path>) -> Result<Displaced> {
+    if let Some(snapshot) = snapshot {
+      match fs::rename(deploy_path, snapshot) {
+        Ok(()) => {
+          info!("Snapshot taken at {}", snapshot.display());
+          return Ok(Displaced::Kept(snapshot.to_path_buf()));
+        }
+        Err(e) => info!(
+          "Cannot move {} to {} ({}); copying it there instead",
+          deploy_path.display(),
+          snapshot.display(),
+          e
+        ),
+      }
+
+      copy_dir_recursive(deploy_path, snapshot).map_err(|e| {
+        Box::new(AdeployError::FileSystem(format!(
+          "Failed to snapshot {} into {}: {}",
+          deploy_path.display(),
+          snapshot.display(),
+          e
+        )))
+      })?;
+      info!("Snapshot stored at {}", snapshot.display());
+    }
+
+    fs::rename(deploy_path, &self.previous).map_err(|e| {
+      Box::new(AdeployError::FileSystem(format!(
+        "Failed to move the existing deployment aside: {}",
+        e
+      )))
+    })?;
+    Ok(Displaced::Aside(self.previous.clone()))
+  }
+}
+
+/// Where the live deployment went while the new one takes its place.
+enum Displaced {
+  /// Into the snapshot directory, where it stays.
+  Kept(PathBuf),
+  /// Beside the deployment, to be removed once the swap lands.
+  Aside(PathBuf),
+}
+
+impl Displaced {
+  fn path(&self) -> &Path {
+    match self {
+      Self::Kept(path) | Self::Aside(path) => path,
+    }
   }
 }
 
@@ -1241,13 +1243,23 @@ mod tests {
   /// The deployment sequence a server runs, minus the hooks that sit between
   /// its phases.
   fn deploy_once(archive: &Path, deploy_path: &Path, suffix: &str) -> Result<()> {
+    deploy_once_keeping(archive, deploy_path, suffix, None)
+  }
+
+  /// The same, snapshotting what it replaces.
+  fn deploy_once_keeping(
+    archive: &Path,
+    deploy_path: &Path,
+    suffix: &str,
+    snapshot: Option<&Path>,
+  ) -> Result<()> {
     let tree = IncomingTree::prepare(deploy_path, suffix)?;
     unpack_archive_into(archive, tree.path())?;
     if deploy_path.exists() {
       copy_dir_missing_only(deploy_path, tree.path())
         .map_err(|e| Box::new(AdeployError::FileSystem(format!("carry over failed: {e}"))))?;
     }
-    tree.commit(deploy_path)
+    tree.commit(deploy_path, snapshot)
   }
 
   /// Restoring a snapshot, which replaces rather than merges.
@@ -1255,7 +1267,7 @@ mod tests {
     let tree = IncomingTree::prepare(deploy_path, suffix)?;
     copy_dir_recursive(snapshot, tree.path())
       .map_err(|e| Box::new(AdeployError::FileSystem(format!("restore failed: {e}"))))?;
-    tree.commit(deploy_path)
+    tree.commit(deploy_path, None)
   }
 
   /// A real tar.gz containing one file, built the way the client would.
@@ -1475,6 +1487,128 @@ mod tests {
 
     sweep_uploads_older_than(&staging, Duration::ZERO);
     assert!(!stale.exists(), "an abandoned upload must be removed");
+  }
+
+  #[test]
+  fn a_snapshot_holds_what_the_deployment_replaced() {
+    let temp = TempDir::new().expect("temp dir");
+    let deploy_path = temp.path().join("live");
+    let snapshots = temp.path().join("snapshots");
+    fs::create_dir_all(&snapshots).expect("snapshot dir");
+
+    let first = archive_with(&temp.path().join("one"), "app.txt", "v1");
+    deploy_once(&first, &deploy_path, "11111111").expect("first deploy");
+    fs::write(deploy_path.join("runtime.db"), "state").expect("runtime file");
+
+    let snapshot = snapshots.join("backup_20260920_120000");
+    let second = archive_with(&temp.path().join("two"), "app.txt", "v2");
+    deploy_once_keeping(&second, &deploy_path, "22222222", Some(&snapshot)).expect("second deploy");
+
+    assert_eq!(
+      fs::read_to_string(deploy_path.join("app.txt")).expect("read live"),
+      "v2",
+      "the new deployment is live"
+    );
+    assert_eq!(
+      fs::read_to_string(snapshot.join("app.txt")).expect("read snapshot"),
+      "v1",
+      "and the snapshot is exactly what it replaced"
+    );
+    assert_eq!(
+      fs::read_to_string(snapshot.join("runtime.db")).expect("read snapshot"),
+      "state",
+      "including what the deployment did not ship"
+    );
+    assert!(
+      siblings_of(&deploy_path).is_empty(),
+      "the directory moved into the snapshot, so nothing is left beside the deployment"
+    );
+  }
+
+  #[test]
+  fn a_snapshot_rename_cannot_take_is_copied_instead() {
+    // `rename` cannot leave a filesystem, so a snapshot directory on another
+    // one has to be copied into. A second filesystem is not something a test
+    // can conjure; a destination `rename` refuses while a copy can still fill
+    // it takes the same fork in the same code.
+    let temp = TempDir::new().expect("temp dir");
+    let deploy_path = temp.path().join("live");
+
+    let first = archive_with(&temp.path().join("one"), "app.txt", "v1");
+    deploy_once(&first, &deploy_path, "11111111").expect("first deploy");
+    fs::write(deploy_path.join("runtime.db"), "state").expect("runtime file");
+
+    let snapshot = temp.path().join("snapshot");
+    fs::create_dir_all(&snapshot).expect("snapshot dir");
+    fs::write(snapshot.join("occupied.txt"), "in the way").expect("occupying file");
+
+    let second = archive_with(&temp.path().join("two"), "app.txt", "v2");
+    deploy_once_keeping(&second, &deploy_path, "22222222", Some(&snapshot)).expect("second deploy");
+
+    assert_eq!(
+      fs::read_to_string(deploy_path.join("app.txt")).expect("read live"),
+      "v2"
+    );
+    assert_eq!(
+      fs::read_to_string(snapshot.join("app.txt")).expect("read snapshot"),
+      "v1",
+      "the snapshot is filled by copying when it cannot be moved into"
+    );
+    assert_eq!(
+      fs::read_to_string(snapshot.join("runtime.db")).expect("read snapshot"),
+      "state"
+    );
+    assert!(
+      siblings_of(&deploy_path).is_empty(),
+      "and the directory it copied from is still cleared away"
+    );
+  }
+
+  #[test]
+  fn a_snapshot_that_cannot_be_taken_at_all_leaves_the_deployment_running() {
+    // Neither moving nor copying can put a directory where a file already is.
+    let temp = TempDir::new().expect("temp dir");
+    let deploy_path = temp.path().join("live");
+
+    let first = archive_with(&temp.path().join("one"), "app.txt", "v1");
+    deploy_once(&first, &deploy_path, "11111111").expect("first deploy");
+
+    let blocked = temp.path().join("snapshot");
+    fs::write(&blocked, "not a directory").expect("blocking file");
+
+    let second = archive_with(&temp.path().join("two"), "app.txt", "v2");
+    let failure = deploy_once_keeping(&second, &deploy_path, "22222222", Some(&blocked))
+      .expect_err("a snapshot that cannot be taken must fail the deployment");
+
+    assert!(
+      failure.to_string().contains("snapshot"),
+      "the error should say the snapshot failed, got: {failure}"
+    );
+    assert_eq!(
+      fs::read_to_string(deploy_path.join("app.txt")).expect("read"),
+      "v1",
+      "the live deployment must be exactly as it was"
+    );
+    assert!(
+      siblings_of(&deploy_path).is_empty(),
+      "and nothing may be left beside it"
+    );
+  }
+
+  #[test]
+  fn a_deployment_without_a_snapshot_leaves_nothing_behind() {
+    let temp = TempDir::new().expect("temp dir");
+    let deploy_path = temp.path().join("live");
+
+    let first = archive_with(&temp.path().join("one"), "app.txt", "v1");
+    deploy_once(&first, &deploy_path, "11111111").expect("first deploy");
+    let second = archive_with(&temp.path().join("two"), "app.txt", "v2");
+    deploy_once(&second, &deploy_path, "22222222").expect("second deploy");
+
+    assert!(
+      siblings_of(&deploy_path).is_empty(),
+      "the replaced deployment must be removed once the swap lands"
+    );
   }
 
   #[test]
