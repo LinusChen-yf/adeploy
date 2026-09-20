@@ -3,6 +3,7 @@ use std::{
   io::Read,
   path::{Path, PathBuf},
   process::Stdio,
+  time::Duration,
 };
 
 use chrono::{DateTime, Utc};
@@ -225,7 +226,7 @@ impl DeployManager {
 
   /// Short, unique enough to tell concurrent deployments apart.
   fn suffix(&self) -> String {
-    self.deploy_id.chars().take(8).collect()
+    self.deploy_id.chars().take(SUFFIX_LEN).collect()
   }
 
   /// Run a hook's commands in order, in `working_dir`.
@@ -731,8 +732,8 @@ impl IncomingTree {
   /// Siblings rather than a shared staging directory: `rename` cannot cross
   /// filesystems, and a sibling is on the same one by construction.
   fn prepare(deploy_path: &Path, suffix: &str) -> Result<Self> {
-    let path = sibling_path(deploy_path, "incoming", suffix)?;
-    let previous = sibling_path(deploy_path, "previous", suffix)?;
+    let path = sibling_path(deploy_path, INCOMING_TAG, suffix)?;
+    let previous = sibling_path(deploy_path, PREVIOUS_TAG, suffix)?;
 
     if let Some(parent) = deploy_path.parent() {
       fs::create_dir_all(parent).map_err(|e| {
@@ -744,7 +745,13 @@ impl IncomingTree {
       })?;
     }
 
-    // Anything left by a crashed run would otherwise merge into this one.
+    // Before anything else, because what it puts back is what this deployment
+    // is about to carry over from.
+    restore_interrupted_swap(deploy_path)?;
+    sweep_abandoned_trees(deploy_path, ABANDONED_AGE);
+
+    // This suffix is new, so nothing should be here; a collision would merge
+    // into the tree rather than announce itself.
     remove_directory(&path)?;
     fs::create_dir_all(&path).map_err(|e| {
       Box::new(AdeployError::FileSystem(format!(
@@ -865,6 +872,165 @@ fn unpack_archive_into(archive_path: &Path, target: &Path) -> Result<()> {
     )))
   })?;
   Ok(())
+}
+
+/// Characters of the deployment's UUID used to tell working directories apart.
+///
+/// The sweep recognises its own directories by this shape, so the two have to
+/// agree; keeping the length here is what makes them.
+const SUFFIX_LEN: usize = 8;
+
+/// Tag on the directory a new deployment is assembled in.
+const INCOMING_TAG: &str = "incoming";
+
+/// Tag on the directory the live deployment is moved to during a swap.
+const PREVIOUS_TAG: &str = "previous";
+
+/// How long a working directory may sit beside a deployment before it is taken
+/// for the remains of a crash.
+///
+/// A deployment that is still running owns its own directories, and a server
+/// caps how long one may run at six hours, so nothing this old belongs to
+/// anybody. Generous on purpose: leaving a stale directory costs disk, and
+/// removing a live one costs the deployment.
+const ABANDONED_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Put back a deployment that was interrupted part way through its swap.
+///
+/// `commit` moves the live deployment aside and then moves the new one in. A
+/// crash between the two leaves nothing at `deploy_path` and everything in the
+/// directory it was moved to. The next deployment would have found no live
+/// deployment, taken itself for a first install, and carried nothing over -
+/// losing exactly the uploads, logs and databases that carrying over exists to
+/// keep.
+fn restore_interrupted_swap(deploy_path: &Path) -> Result<()> {
+  if deploy_path.exists() {
+    return Ok(());
+  }
+
+  // Newest wins: older ones are the remains of earlier crashes, and this is the
+  // deployment that was live when the last one happened.
+  let Some(stranded) = siblings_tagged(deploy_path, PREVIOUS_TAG)
+    .into_iter()
+    .max_by_key(|path| modified_at(path))
+  else {
+    return Ok(());
+  };
+
+  warn!(
+    "Found {} with no deployment at {}: a swap was interrupted, putting it back",
+    stranded.display(),
+    deploy_path.display()
+  );
+  fs::rename(&stranded, deploy_path).map_err(|e| {
+    Box::new(AdeployError::FileSystem(format!(
+      "Failed to restore the interrupted deployment from {}: {}",
+      stranded.display(),
+      e
+    )))
+  })
+}
+
+/// Remove working directories no deployment can still be using.
+///
+/// `prepare` only ever removed the directory for the suffix it was about to
+/// use, which is drawn fresh each run and so never matched what an earlier
+/// crash left behind. Every interrupted deployment therefore stranded a full
+/// copy of a deployment next to the live one, for good.
+fn sweep_abandoned_trees(deploy_path: &Path, older_than: Duration) {
+  for tag in [INCOMING_TAG, PREVIOUS_TAG] {
+    for path in siblings_tagged(deploy_path, tag) {
+      if !is_older_than(&path, older_than) {
+        continue;
+      }
+      match remove_directory(&path) {
+        Ok(()) => warn!("Removed {}, left behind by an earlier run", path.display()),
+        Err(e) => warn!("Failed to remove {}: {}", path.display(), e),
+      }
+    }
+  }
+}
+
+/// Remove staged uploads no deployment can still be using.
+///
+/// An upload is removed when the deployment reading it ends, however it ends -
+/// but only if the process lives to do it. One killed mid-deployment left a
+/// whole archive in the staging directory with nothing to remove it.
+pub fn sweep_abandoned_uploads(staging_dir: &Path) {
+  sweep_uploads_older_than(staging_dir, ABANDONED_AGE)
+}
+
+fn sweep_uploads_older_than(staging_dir: &Path, older_than: Duration) {
+  let Ok(entries) = fs::read_dir(staging_dir) else {
+    return;
+  };
+
+  for entry in entries.filter_map(|entry| entry.ok()) {
+    let path = entry.path();
+    if !path.is_file() || !is_older_than(&path, older_than) {
+      continue;
+    }
+    match fs::remove_file(&path) {
+      Ok(()) => warn!(
+        "Removed staged upload {}, left behind by an earlier run",
+        path.display()
+      ),
+      Err(e) => warn!("Failed to remove {}: {}", path.display(), e),
+    }
+  }
+}
+
+/// The working directories beside `deploy_path` carrying `tag`.
+fn siblings_tagged(deploy_path: &Path, tag: &str) -> Vec<PathBuf> {
+  let (Some(parent), Some(name)) = (deploy_path.parent(), deploy_path.file_name()) else {
+    return Vec::new();
+  };
+  let Ok(entries) = fs::read_dir(parent) else {
+    return Vec::new();
+  };
+
+  // Matched down to the shape of the suffix, not just the prefix: a deployment
+  // of its own called `app.incoming-extras` is somebody's directory, and this
+  // decides what gets removed.
+  let prefix = format!("{}.{}-", name.to_string_lossy(), tag);
+  entries
+    .filter_map(|entry| entry.ok())
+    .filter(|entry| {
+      entry
+        .file_name()
+        .to_string_lossy()
+        .strip_prefix(&prefix)
+        .is_some_and(is_tree_suffix)
+    })
+    .map(|entry| entry.path())
+    .filter(|path| path.is_dir())
+    .collect()
+}
+
+/// Does this look like a suffix `DeployManager::suffix` produced?
+///
+/// It is the head of a UUID, so hex of a fixed length. Checking the shape is
+/// what keeps the sweep to directories this tool made.
+fn is_tree_suffix(candidate: &str) -> bool {
+  candidate.len() == SUFFIX_LEN
+    && candidate
+      .chars()
+      .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+}
+
+fn modified_at(path: &Path) -> std::time::SystemTime {
+  fs::metadata(path)
+    .and_then(|metadata| metadata.modified())
+    .unwrap_or(std::time::UNIX_EPOCH)
+}
+
+/// Untouched for longer than `age`. A timestamp in the future reads as young,
+/// since a clock that has moved is not evidence of an abandoned directory.
+fn is_older_than(path: &Path, age: Duration) -> bool {
+  modified_at(path)
+    .elapsed()
+    .map(|elapsed| elapsed > age)
+    .unwrap_or(false)
 }
 
 /// A working directory next to `deploy_path`, on the same filesystem.
@@ -1131,6 +1297,98 @@ mod tests {
       "a stale working directory must be cleared, not reused"
     );
     assert!(deploy_path.join("app.txt").exists());
+  }
+
+  #[test]
+  fn a_swap_interrupted_half_way_does_not_cost_the_live_deployment() {
+    let temp = TempDir::new().expect("temp dir");
+    let deploy_path = temp.path().join("live");
+    fs::create_dir_all(&deploy_path).expect("live dir");
+    fs::write(deploy_path.join("runtime.db"), "keep me").expect("runtime file");
+
+    // Exactly what `commit` does first, with the process dying before the
+    // second rename: nothing at the deploy path, everything beside it.
+    let stranded = sibling_path(&deploy_path, PREVIOUS_TAG, "11111111").expect("sibling");
+    fs::rename(&deploy_path, &stranded).expect("interrupted swap");
+    assert!(!deploy_path.exists());
+
+    let archive = archive_with(temp.path(), "app.txt", "v1");
+    deploy_once(&archive, &deploy_path, "22222222").expect("deploy");
+
+    assert_eq!(
+      fs::read_to_string(deploy_path.join("runtime.db")).expect("read"),
+      "keep me",
+      "the next deployment must not mistake an interrupted swap for a first install"
+    );
+    assert!(deploy_path.join("app.txt").exists(), "and still deploy");
+    assert!(!stranded.exists(), "nothing left beside the deployment");
+  }
+
+  #[test]
+  fn working_directories_an_earlier_run_left_are_swept() {
+    let temp = TempDir::new().expect("temp dir");
+    let deploy_path = temp.path().join("live");
+    fs::create_dir_all(&deploy_path).expect("live dir");
+
+    // Two suffixes that are not the one the next run will draw, which is what
+    // made these survive: each run only ever cleared its own.
+    let incoming = sibling_path(&deploy_path, INCOMING_TAG, "deadbeef").expect("sibling");
+    let previous = sibling_path(&deploy_path, PREVIOUS_TAG, "beefcafe").expect("sibling");
+    for path in [&incoming, &previous] {
+      fs::create_dir_all(path).expect("stale dir");
+      fs::write(path.join("bulk.bin"), "megabytes").expect("stale file");
+    }
+
+    // A deployment whose name merely starts the same way is not ours to remove.
+    let neighbour = temp.path().join("live.incoming-extras");
+    fs::create_dir_all(&neighbour).expect("neighbour");
+    let other_package = temp.path().join("other.incoming-deadbeef");
+    fs::create_dir_all(&other_package).expect("other package");
+
+    sweep_abandoned_trees(&deploy_path, Duration::ZERO);
+
+    assert!(!incoming.exists(), "a stale incoming tree must be removed");
+    assert!(!previous.exists(), "so must a stale previous one");
+    assert!(
+      deploy_path.exists(),
+      "the live deployment is not a leftover"
+    );
+    assert!(neighbour.exists(), "nor is a deployment named like one");
+    assert!(other_package.exists(), "nor another package's working tree");
+  }
+
+  #[test]
+  fn a_tree_young_enough_to_belong_to_a_running_deployment_is_left_alone() {
+    let temp = TempDir::new().expect("temp dir");
+    let deploy_path = temp.path().join("live");
+    fs::create_dir_all(&deploy_path).expect("live dir");
+
+    let in_flight = sibling_path(&deploy_path, INCOMING_TAG, "abcd1234").expect("sibling");
+    fs::create_dir_all(&in_flight).expect("in-flight dir");
+
+    sweep_abandoned_trees(&deploy_path, ABANDONED_AGE);
+
+    assert!(
+      in_flight.exists(),
+      "a directory a running deployment may still be filling must survive"
+    );
+  }
+
+  #[test]
+  fn staged_uploads_an_earlier_run_left_are_swept() {
+    let temp = TempDir::new().expect("temp dir");
+    let staging = temp.path().join(".staging");
+    fs::create_dir_all(&staging).expect("staging dir");
+
+    let stale = staging.join("00000000-0000-0000-0000-000000000000.tar.gz");
+    fs::write(&stale, vec![0u8; 64]).expect("stale upload");
+
+    // The age is the point: an upload this run is still writing must survive.
+    sweep_abandoned_uploads(&staging);
+    assert!(stale.exists(), "a fresh upload is in use, not abandoned");
+
+    sweep_uploads_older_than(&staging, Duration::ZERO);
+    assert!(!stale.exists(), "an abandoned upload must be removed");
   }
 
   #[test]

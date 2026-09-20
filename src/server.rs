@@ -37,7 +37,7 @@ use crate::{
     rollback_signing_payload, Auth,
   },
   config::{executable_dir, ConfigProvider, PackageConfig, ProjectConfig},
-  deploy::{backup_directory, list_backups, DeployManager},
+  deploy::{backup_directory, list_backups, sweep_abandoned_uploads, DeployManager},
   deploy_log::{DeployLogEntry, LogLevel, LogSink},
   error::{AdeployError, Result},
   init,
@@ -824,6 +824,10 @@ async fn receive_archive(
         e
       ))
     })?;
+
+  // A run that was killed mid-deployment never got to remove what it had
+  // staged, and nothing else was ever going to.
+  sweep_abandoned_uploads(&accepted.staging_dir);
 
   let path = accepted.staging_dir.join(format!("{}.tar.gz", deploy_id));
   let staged = StagedArchive { path };
