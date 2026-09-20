@@ -40,19 +40,27 @@ impl DeployManager {
     }
   }
 
-  /// Package files from sources with hash verification
+  /// Package `sources` into `destination`, returning its size and SHA256.
+  ///
+  /// Written straight to disk rather than handed back as bytes. The whole
+  /// archive used to sit in memory for as long as the deployment took, and
+  /// every chunk on the way to the wire was copied out of it again, so a large
+  /// package cost more than its own size in a process that only ever needs to
+  /// read it once, in order.
   ///
   /// `sources` are already absolute: the caller resolved them against the
   /// directory holding `adeploy.toml`, so packaging does not depend on the
   /// working directory.
-  pub async fn package_files(
+  pub async fn package_files_into(
     &self,
     package_name: &str,
     sources: &[PathBuf],
-  ) -> Result<(Vec<u8>, String)> {
+    destination: &Path,
+  ) -> Result<(u64, String)> {
     let package_name = package_name.to_string();
     let sources = sources.to_vec();
-    spawn_blocking(move || Self::package_files_blocking(&package_name, &sources))
+    let destination = destination.to_path_buf();
+    spawn_blocking(move || Self::package_files_blocking(&package_name, &sources, &destination))
       .await
       .map_err(|e| {
         Box::new(AdeployError::Deploy(format!(
@@ -62,12 +70,26 @@ impl DeployManager {
       })?
   }
 
-  fn package_files_blocking(package_name: &str, sources: &[PathBuf]) -> Result<(Vec<u8>, String)> {
+  fn package_files_blocking(
+    package_name: &str,
+    sources: &[PathBuf],
+    destination: &Path,
+  ) -> Result<(u64, String)> {
     info!("Packaging {} sources: {:?}", package_name, sources);
 
-    let mut archive = Vec::new();
-    {
-      let encoder = GzEncoder::new(&mut archive, Compression::default());
+    let file = fs::File::create(destination).map_err(|e| {
+      Box::new(AdeployError::FileSystem(format!(
+        "Failed to create {}: {}",
+        destination.display(),
+        e
+      )))
+    })?;
+
+    let measured = {
+      // Hashing sits between the compressor and the file, so what it reports is
+      // exactly what landed on disk - no second pass over the finished archive.
+      let sink = MeasuringWriter::new(io::BufWriter::with_capacity(STREAM_BUFFER_SIZE, file));
+      let encoder = GzEncoder::new(sink, Compression::default());
       let mut tar = Builder::new(encoder);
 
       for path in sources {
@@ -112,19 +134,34 @@ impl DeployManager {
           e
         )))
       })?;
-    }
 
-    let mut hasher = Sha256::new();
-    hasher.update(&archive);
-    let hash = format!("{:x}", hasher.finalize());
+      let encoder = tar.into_inner().map_err(|e| {
+        Box::new(AdeployError::FileSystem(format!(
+          "Failed to finalize archive: {}",
+          e
+        )))
+      })?;
+      encoder.finish().map_err(|e| {
+        Box::new(AdeployError::FileSystem(format!(
+          "Failed to compress archive: {}",
+          e
+        )))
+      })?
+    };
+
+    let (size, hash) = measured.finish().map_err(|e| {
+      Box::new(AdeployError::FileSystem(format!(
+        "Failed to write {}: {}",
+        destination.display(),
+        e
+      )))
+    })?;
 
     info!(
       "Created package {} ({} bytes, hash {})",
-      package_name,
-      archive.len(),
-      hash
+      package_name, size, hash
     );
-    Ok((archive, hash))
+    Ok((size, hash))
   }
 
   /// Assemble the new deployment beside the live one.
@@ -547,13 +584,64 @@ pub struct ArchiveEntry {
   pub size: u64,
 }
 
+/// Counts and hashes what passes through it on the way to disk.
+///
+/// The archive is written once and never held, so its size and digest have to
+/// be taken as it goes by; reading the finished file back would be a second
+/// pass over every byte.
+struct MeasuringWriter<W> {
+  inner: W,
+  hasher: Sha256,
+  written: u64,
+}
+
+impl<W: io::Write> MeasuringWriter<W> {
+  fn new(inner: W) -> Self {
+    Self {
+      inner,
+      hasher: Sha256::new(),
+      written: 0,
+    }
+  }
+
+  /// Flush everything still buffered, then report what went through.
+  fn finish(mut self) -> io::Result<(u64, String)> {
+    self.inner.flush()?;
+    Ok((self.written, format!("{:x}", self.hasher.finalize())))
+  }
+}
+
+impl<W: io::Write> io::Write for MeasuringWriter<W> {
+  fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+    let written = self.inner.write(buf)?;
+    // Only what the writer accepted: a short write must not be counted or
+    // hashed as though all of it had landed.
+    self.hasher.update(&buf[..written]);
+    self.written += written as u64;
+    Ok(written)
+  }
+
+  fn flush(&mut self) -> io::Result<()> {
+    self.inner.flush()
+  }
+}
+
 /// Read back what an archive holds.
 ///
 /// Listing the built archive rather than walking the sources again means a
 /// preview cannot disagree with what would actually be sent, and proves the
 /// archive is readable in the first place.
-pub fn describe_archive(archive: &[u8]) -> Result<Vec<ArchiveEntry>> {
-  let decoder = flate2::read::GzDecoder::new(archive);
+pub fn describe_archive(archive_path: &Path) -> Result<Vec<ArchiveEntry>> {
+  let file = fs::File::open(archive_path).map_err(|e| {
+    Box::new(AdeployError::Deploy(format!(
+      "Failed to open {}: {}",
+      archive_path.display(),
+      e
+    )))
+  })?;
+
+  let reader = io::BufReader::with_capacity(STREAM_BUFFER_SIZE, file);
+  let decoder = flate2::read::GzDecoder::new(reader);
   let mut tar = tar::Archive::new(decoder);
 
   let entries = tar.entries().map_err(|e| {
@@ -1176,10 +1264,8 @@ mod tests {
     fs::create_dir_all(&source).expect("source dir");
     fs::write(source.join(name), contents).expect("source file");
 
-    let (bytes, _) =
-      DeployManager::package_files_blocking("demo", &[source]).expect("build archive");
     let path = dir.join("archive.tar.gz");
-    fs::write(&path, bytes).expect("write archive");
+    DeployManager::package_files_blocking("demo", &[source], &path).expect("build archive");
     path
   }
 
@@ -1502,8 +1588,8 @@ mod tests {
     fs::write(source.join("app.txt"), "1234567890").expect("file");
     fs::write(source.join("nested/lib.txt"), "abc").expect("nested file");
 
-    let (archive, _) =
-      DeployManager::package_files_blocking("demo", &[source]).expect("build archive");
+    let archive = temp.path().join("archive.tar.gz");
+    DeployManager::package_files_blocking("demo", &[source], &archive).expect("build archive");
     let mut entries = describe_archive(&archive).expect("describe");
     entries.sort_by(|a, b| a.path.cmp(&b.path));
 
@@ -1518,8 +1604,38 @@ mod tests {
   #[test]
   fn describing_something_that_is_not_an_archive_is_an_error() {
     // A preview must not claim an archive is fine when it cannot be read.
-    let failure = describe_archive(&[0x42u8; 512]).expect_err("not a gzip stream");
+    let temp = TempDir::new().expect("temp dir");
+    let not_an_archive = temp.path().join("nonsense.tar.gz");
+    fs::write(&not_an_archive, [0x42u8; 512]).expect("write");
+
+    let failure = describe_archive(&not_an_archive).expect_err("not a gzip stream");
     assert!(failure.to_string().contains("archive"));
+  }
+
+  #[test]
+  fn a_packaged_archive_reports_the_size_and_digest_of_the_file_on_disk() {
+    // Both are taken as the bytes go past rather than by reading the finished
+    // file back, so they have to be checked against it.
+    let temp = TempDir::new().expect("temp dir");
+    let source = temp.path().join("sources");
+    fs::create_dir_all(&source).expect("source dir");
+    fs::write(source.join("app.txt"), "contents").expect("source file");
+
+    let archive = temp.path().join("archive.tar.gz");
+    let (size, hash) =
+      DeployManager::package_files_blocking("demo", &[source], &archive).expect("build archive");
+
+    let written = fs::read(&archive).expect("read archive");
+    assert_eq!(
+      size,
+      written.len() as u64,
+      "the reported size is the file's"
+    );
+    assert_eq!(
+      hash,
+      format!("{:x}", Sha256::digest(&written)),
+      "the reported digest is the file's"
+    );
   }
 
   #[test]

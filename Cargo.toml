@@ -38,6 +38,8 @@ ed25519-dalek = { version = "2.2", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["std"] }
 service-manager = "0.8"
 hostname = "0.4"
+# The client builds its archive into a temporary file rather than memory.
+tempfile = "3.23"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.6"
@@ -47,5 +49,4 @@ windows-sys = { version = "0.52", features = ["Win32_Foundation"] }
 tonic-prost-build = "0.14"
 
 [dev-dependencies]
-tempfile = "3.23"
 tokio-test = "0.4"

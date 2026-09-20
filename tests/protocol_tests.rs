@@ -109,10 +109,14 @@ impl Harness {
     std::fs::create_dir_all(&source_dir).expect("source dir");
     std::fs::write(source_dir.join("payload.txt"), "payload").expect("source file");
 
-    let (archive, file_hash) = DeployManager::new()
-      .package_files(PACKAGE, &[source_dir])
+    // These tests build their chunks by hand, so they need the bytes; the
+    // client itself streams the same file straight to the wire.
+    let archive_path = root.join("package.tar.gz");
+    let (_, file_hash) = DeployManager::new()
+      .package_files_into(PACKAGE, &[source_dir], &archive_path)
       .await
       .expect("package sources");
+    let archive = std::fs::read(&archive_path).expect("read archive");
 
     let port = common::find_available_port().await;
     let deploy_root = root.join("root");

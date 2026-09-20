@@ -7,7 +7,8 @@ use std::{
 use async_stream::stream;
 use base64::{engine::general_purpose, Engine as _};
 use log2::*;
-use tokio::time::timeout;
+use tempfile::{Builder, NamedTempFile};
+use tokio::{io::AsyncReadExt, time::timeout};
 use tokio_stream::Stream;
 use tonic::transport::{Channel, Endpoint};
 use uuid::Uuid;
@@ -204,11 +205,12 @@ pub async fn dry_run(
   let packages = select_packages(&loaded, package_names)?;
 
   for package in packages {
-    let (archive, hash) = deploy_manager
-      .package_files(&package.name, &package.sources)
+    let archive = staged_archive()?;
+    let (size, hash) = deploy_manager
+      .package_files_into(&package.name, &package.sources, archive.path())
       .await?;
 
-    let entries = describe_archive(&archive)?;
+    let entries = describe_archive(archive.path())?;
     let uncompressed: u64 = entries.iter().map(|entry| entry.size).sum();
 
     info!("Would deploy {} to {}:{}", package.name, host, remote.port);
@@ -219,7 +221,7 @@ pub async fn dry_run(
       "  {} file(s), {} packed into {}, sha256 {}",
       entries.len(),
       format_size(uncompressed),
-      format_size(archive.len() as u64),
+      format_size(size),
       hash
     );
   }
@@ -594,22 +596,24 @@ async fn deploy_single_package(
   let package_name = package.name.as_str();
   info!("Deploying {}", package_name);
 
-  let (archive_data, file_hash) = deploy_manager
-    .package_files(package_name, &package.sources)
+  // Held until the deployment is over: the upload reads from it as it goes,
+  // and dropping it removes the file however this ends.
+  let archive = staged_archive()?;
+  let (total_size, file_hash) = deploy_manager
+    .package_files_into(package_name, &package.sources, archive.path())
     .await?;
 
   let start = build_start_message(
     ssh_auth,
     public_key,
     package_name,
-    &archive_data,
+    total_size,
     file_hash,
     remote,
     package,
   )?;
-  let total_size = start.total_size;
 
-  let request = tonic::Request::new(upload_stream(start, archive_data));
+  let request = tonic::Request::new(upload_stream(start, archive.path().to_path_buf()));
 
   // Send the deadline with the request rather than keeping it on the channel.
   // `Endpoint::timeout` is client-side only, so the server kept unpacking and
@@ -655,12 +659,11 @@ fn build_start_message(
   ssh_auth: &Auth,
   public_key: &str,
   package_name: &str,
-  archive_data: &[u8],
+  total_size: u64,
   file_hash: String,
   remote: &ResolvedRemote,
   package: &SelectedPackage,
 ) -> Result<DeployStart> {
-  let total_size = archive_data.len() as u64;
   let nonce = Uuid::new_v4().to_string();
   let timestamp_ms = now_ms();
 
@@ -693,35 +696,77 @@ fn build_start_message(
   })
 }
 
-/// The opening message followed by the archive, split into chunks.
+/// The opening message followed by the archive, read a chunk at a time.
+///
+/// Nothing but the chunk in flight is held: each one is read into a buffer that
+/// is then handed to the message, rather than copied out of an archive the
+/// process was keeping in memory for the duration.
+///
+/// A read that fails ends the stream early. There is no way to report it
+/// through a stream of messages, but the server counts what it receives and
+/// refuses an upload that stops short of its declared size, so the deployment
+/// fails rather than half-lands - and the real cause is logged here.
 fn upload_stream(
   start: DeployStart,
-  archive_data: Vec<u8>,
+  archive_path: PathBuf,
 ) -> impl Stream<Item = DeployChunk> + Send + 'static {
   let total_size = start.total_size.max(1);
 
   stream! {
     yield DeployChunk { payload: Some(Payload::Start(start)) };
 
-    let mut offset = 0usize;
+    let mut file = match tokio::fs::File::open(&archive_path).await {
+      Ok(file) => file,
+      Err(e) => {
+        error!("Failed to read {}: {}", archive_path.display(), e);
+        return;
+      }
+    };
+
+    let mut sent = 0u64;
     let mut next_report = PROGRESS_STEP;
 
-    while offset < archive_data.len() {
-      let end = (offset + CHUNK_SIZE).min(archive_data.len());
-      let chunk = archive_data[offset..end].to_vec();
-      offset = end;
+    loop {
+      let mut chunk = vec![0u8; CHUNK_SIZE];
+      let read = match file.read(&mut chunk).await {
+        Ok(0) => break,
+        Ok(read) => read,
+        Err(e) => {
+          error!("Failed to read {}: {}", archive_path.display(), e);
+          return;
+        }
+      };
+      chunk.truncate(read);
+      sent += read as u64;
 
       yield DeployChunk { payload: Some(Payload::Data(chunk)) };
 
-      let percent = (offset as u64).saturating_mul(100) / total_size;
+      let percent = sent.saturating_mul(100) / total_size;
       if percent >= next_report {
-        info!("Uploaded {}% ({}/{} bytes)", percent, offset, total_size);
+        info!("Uploaded {}% ({}/{} bytes)", percent, sent, total_size);
         while next_report <= percent {
           next_report += PROGRESS_STEP;
         }
       }
     }
   }
+}
+
+/// A temporary file for the archive about to be built.
+///
+/// Honours `TMPDIR` and its equivalents, which is the lever to pull when the
+/// system temporary directory is small or sits in memory.
+fn staged_archive() -> Result<NamedTempFile> {
+  Builder::new()
+    .prefix("adeploy-")
+    .suffix(".tar.gz")
+    .tempfile()
+    .map_err(|e| {
+      Box::new(AdeployError::FileSystem(format!(
+        "Failed to create a temporary file for the archive: {}",
+        e
+      )))
+    })
 }
 
 /// What the event stream is reporting on, so its messages can say so.
