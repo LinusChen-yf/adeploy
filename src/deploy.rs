@@ -287,7 +287,13 @@ impl DeployManager {
     process
       .current_dir(working_dir)
       .stdout(Stdio::piped())
-      .stderr(Stdio::piped());
+      .stderr(Stdio::piped())
+      // A deployment that runs out of time is abandoned by dropping the future
+      // running it, and tokio's default is to let the child outlive that. The
+      // hook that was still going then became a process nobody was waiting for,
+      // holding the deployment's files open, with the next deployment starting
+      // another one beside it.
+      .kill_on_drop(true);
 
     let mut child = process.spawn().map_err(|e| {
       Box::new(AdeployError::Deploy(format!(
@@ -934,9 +940,49 @@ impl Default for DeployManager {
 
 #[cfg(test)]
 mod tests {
+  use std::time::Duration;
+
   use tempfile::TempDir;
 
   use super::*;
+
+  /// A hook must not outlive the deployment that started it.
+  ///
+  /// The command sleeps and only then leaves a mark, so the mark appearing is
+  /// proof the process was still running after the deployment was abandoned.
+  #[tokio::test]
+  async fn a_hook_is_killed_with_the_deployment_that_started_it() {
+    let temp = TempDir::new().expect("temp dir");
+    let marker = temp.path().join("still-running.txt");
+    let command = if cfg!(target_os = "windows") {
+      format!(
+        "ping -n 2 127.0.0.1 > NUL & echo x > \"{}\"",
+        marker.display()
+      )
+    } else {
+      format!("sleep 1; echo x > '{}'", marker.display())
+    };
+
+    let manager = DeployManager::new();
+    let (sender, _receiver) = tokio::sync::mpsc::channel(16);
+    let sink = LogSink::new(sender);
+
+    // Boxed so dropping it really drops the future, the way the generator
+    // running a deployment drops the work it was holding.
+    let mut work = Box::pin(manager.execute_command(&command, temp.path(), &sink));
+
+    // Abandon it the way an expired deadline does: stop polling and drop it.
+    let _ = tokio::time::timeout(Duration::from_millis(200), &mut work).await;
+    drop(work);
+
+    // Well past the point the command would have written its mark.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    assert!(
+      !marker.exists(),
+      "the hook kept running after the deployment was abandoned"
+    );
+  }
 
   /// The deployment sequence a server runs, minus the hooks that sit between
   /// its phases.
