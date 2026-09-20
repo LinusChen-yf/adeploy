@@ -109,10 +109,14 @@ impl Harness {
     std::fs::create_dir_all(&source_dir).expect("source dir");
     std::fs::write(source_dir.join("payload.txt"), "payload").expect("source file");
 
-    let (archive, file_hash) = DeployManager::new()
-      .package_files(PACKAGE, &[source_dir])
+    // These tests build their chunks by hand, so they need the bytes; the
+    // client itself streams the same file straight to the wire.
+    let archive_path = root.join("package.tar.gz");
+    let (_, file_hash) = DeployManager::new()
+      .package_files_into(PACKAGE, &[source_dir], &archive_path)
       .await
       .expect("package sources");
+    let archive = std::fs::read(&archive_path).expect("read archive");
 
     let port = common::find_available_port().await;
     let deploy_root = root.join("root");
@@ -768,5 +772,70 @@ async fn a_slow_transfer_is_not_cut_off_for_taking_long() {
   assert!(
     success,
     "a transfer outlasting the deployment budget must still be allowed to finish"
+  );
+}
+
+#[tokio::test]
+async fn a_second_deployment_to_the_same_directory_is_refused() {
+  // Two of them would each assemble a tree and then swap in whatever order
+  // they finished, with the loser snapshotting and carrying over from the
+  // winner's half-installed state.
+  let mut harness = Harness::start_slow().await;
+  // Unbounded, so the first deployment is still inside its hook when the
+  // second arrives rather than having already been cut off by its deadline.
+  harness.deploy_timeout_secs = 0;
+  let harness = Arc::new(harness);
+
+  let first = tokio::spawn({
+    let harness = harness.clone();
+    async move {
+      let start = harness.start_message();
+      harness.send(start, harness.archive.clone()).await
+    }
+  });
+
+  // Long enough for the opening message to be accepted even on a slow runner;
+  // the hook it then runs lasts far longer than the rest of this test, so
+  // there is no race at the other end.
+  sleep(Duration::from_secs(2)).await;
+
+  let start = harness.start_message();
+  let refusal = harness
+    .send(start, harness.archive.clone())
+    .await
+    .expect_err("a second deployment to the same directory must be refused");
+
+  assert_eq!(
+    refusal.code(),
+    tonic::Code::Aborted,
+    "a directory already being replaced is a concurrency conflict, got: {refusal}"
+  );
+  assert!(
+    refusal.message().contains("Another deployment"),
+    "the refusal should say what is in the way, got: {refusal}"
+  );
+
+  // Dropping the first stream releases the claim, which the next deployment
+  // needs; without it this would be the only deployment the server ever took.
+  first.abort();
+  let _ = first.await;
+  sleep(Duration::from_millis(300)).await;
+
+  // Deliberately one byte short of what it declares. That fails inside the
+  // upload, before the hook this harness makes slow, so the status it comes
+  // back with answers whether the directory was free without waiting thirty
+  // seconds for a hook nobody is testing.
+  let start = harness.start_message();
+  let mut truncated = harness.archive.clone();
+  truncated.pop();
+  let status = harness
+    .send(start, truncated)
+    .await
+    .expect_err("an upload short of its declared size fails either way");
+
+  assert_eq!(
+    status.code(),
+    tonic::Code::InvalidArgument,
+    "the directory must be free once the deployment holding it ends, got: {status}"
   );
 }

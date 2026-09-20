@@ -1,29 +1,19 @@
 use std::{path::PathBuf, process, sync::Arc};
 
+// The binary is a front end over the library, rather than a second copy of it.
+// Declaring the modules here as well built every one of them twice and ran the
+// unit tests twice, against two sets of types that only looked identical.
+use adeploy::{
+  client,
+  config::{self, ConfigProvider},
+  error::{AdeployError, Result},
+  init,
+  pairing::{self, PairStore},
+  server,
+};
 use clap::{Args, Parser, Subcommand};
 use log2::*;
 use tokio::runtime::Builder as RuntimeBuilder;
-
-mod auth;
-mod client;
-mod config;
-mod deploy;
-mod deploy_log;
-mod error;
-mod init;
-mod pairing;
-mod replay;
-mod server;
-use crate::{
-  config::ConfigProvider,
-  error::{AdeployError, Result},
-  pairing::PairStore,
-};
-
-// Generated gRPC bindings
-pub mod adeploy {
-  tonic::include_proto!("adeploy");
-}
 
 #[derive(Parser)]
 #[command(name = "adeploy")]

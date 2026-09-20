@@ -7,7 +7,8 @@ use std::{
 use async_stream::stream;
 use base64::{engine::general_purpose, Engine as _};
 use log2::*;
-use tokio::time::timeout;
+use tempfile::{Builder, NamedTempFile};
+use tokio::{io::AsyncReadExt, time::timeout};
 use tokio_stream::Stream;
 use tonic::transport::{Channel, Endpoint};
 use uuid::Uuid;
@@ -204,11 +205,12 @@ pub async fn dry_run(
   let packages = select_packages(&loaded, package_names)?;
 
   for package in packages {
-    let (archive, hash) = deploy_manager
-      .package_files(&package.name, &package.sources)
+    let archive = staged_archive()?;
+    let (size, hash) = deploy_manager
+      .package_files_into(&package.name, &package.sources, archive.path())
       .await?;
 
-    let entries = describe_archive(&archive)?;
+    let entries = describe_archive(archive.path())?;
     let uncompressed: u64 = entries.iter().map(|entry| entry.size).sum();
 
     info!("Would deploy {} to {}:{}", package.name, host, remote.port);
@@ -219,7 +221,7 @@ pub async fn dry_run(
       "  {} file(s), {} packed into {}, sha256 {}",
       entries.len(),
       format_size(uncompressed),
-      format_size(archive.len() as u64),
+      format_size(size),
       hash
     );
   }
@@ -469,6 +471,7 @@ fn local_hostname() -> String {
 
 /// A package selected for deployment, with its sources already resolved to
 /// absolute paths against the directory holding `adeploy.toml`.
+#[derive(Debug)]
 struct SelectedPackage {
   name: String,
   sources: Vec<PathBuf>,
@@ -532,8 +535,10 @@ fn select_packages(
   };
 
   let mut packages = Vec::new();
+  let mut unknown = Vec::new();
   for name in names {
     let Some(sources) = loaded.config.resolved_sources(&name, &loaded.base_dir) else {
+      unknown.push(name);
       continue;
     };
     let manifest = manifest_for(&loaded.config, &name)?;
@@ -544,6 +549,22 @@ fn select_packages(
     });
   }
 
+  // A name with no package used to be skipped in silence, so a typo deployed
+  // whatever else was asked for and reported success - which reads exactly like
+  // having deployed all of them.
+  if !unknown.is_empty() {
+    return Err(Box::new(AdeployError::Config(format!(
+      "No package named {} in {}. {}",
+      unknown
+        .iter()
+        .map(|name| format!("'{}'", name))
+        .collect::<Vec<_>>()
+        .join(", "),
+      loaded.path.display(),
+      declared_packages(&loaded.config),
+    ))));
+  }
+
   if packages.is_empty() {
     return Err(Box::new(AdeployError::Config(
       "No packages found to deploy".to_string(),
@@ -551,6 +572,17 @@ fn select_packages(
   }
 
   Ok(packages)
+}
+
+/// The names that would have worked, for an error saying one did not.
+fn declared_packages(config: &ProjectConfig) -> String {
+  let mut names: Vec<&str> = config.packages.keys().map(String::as_str).collect();
+  if names.is_empty() {
+    return "It declares no packages; add a [packages.<name>] table.".to_string();
+  }
+
+  names.sort_unstable();
+  format!("Declared: {}", names.join(", "))
 }
 
 async fn deploy_single_package(
@@ -564,22 +596,24 @@ async fn deploy_single_package(
   let package_name = package.name.as_str();
   info!("Deploying {}", package_name);
 
-  let (archive_data, file_hash) = deploy_manager
-    .package_files(package_name, &package.sources)
+  // Held until the deployment is over: the upload reads from it as it goes,
+  // and dropping it removes the file however this ends.
+  let archive = staged_archive()?;
+  let (total_size, file_hash) = deploy_manager
+    .package_files_into(package_name, &package.sources, archive.path())
     .await?;
 
   let start = build_start_message(
     ssh_auth,
     public_key,
     package_name,
-    &archive_data,
+    total_size,
     file_hash,
     remote,
     package,
   )?;
-  let total_size = start.total_size;
 
-  let request = tonic::Request::new(upload_stream(start, archive_data));
+  let request = tonic::Request::new(upload_stream(start, archive.path().to_path_buf()));
 
   // Send the deadline with the request rather than keeping it on the channel.
   // `Endpoint::timeout` is client-side only, so the server kept unpacking and
@@ -625,12 +659,11 @@ fn build_start_message(
   ssh_auth: &Auth,
   public_key: &str,
   package_name: &str,
-  archive_data: &[u8],
+  total_size: u64,
   file_hash: String,
   remote: &ResolvedRemote,
   package: &SelectedPackage,
 ) -> Result<DeployStart> {
-  let total_size = archive_data.len() as u64;
   let nonce = Uuid::new_v4().to_string();
   let timestamp_ms = now_ms();
 
@@ -663,35 +696,77 @@ fn build_start_message(
   })
 }
 
-/// The opening message followed by the archive, split into chunks.
+/// The opening message followed by the archive, read a chunk at a time.
+///
+/// Nothing but the chunk in flight is held: each one is read into a buffer that
+/// is then handed to the message, rather than copied out of an archive the
+/// process was keeping in memory for the duration.
+///
+/// A read that fails ends the stream early. There is no way to report it
+/// through a stream of messages, but the server counts what it receives and
+/// refuses an upload that stops short of its declared size, so the deployment
+/// fails rather than half-lands - and the real cause is logged here.
 fn upload_stream(
   start: DeployStart,
-  archive_data: Vec<u8>,
+  archive_path: PathBuf,
 ) -> impl Stream<Item = DeployChunk> + Send + 'static {
   let total_size = start.total_size.max(1);
 
   stream! {
     yield DeployChunk { payload: Some(Payload::Start(start)) };
 
-    let mut offset = 0usize;
+    let mut file = match tokio::fs::File::open(&archive_path).await {
+      Ok(file) => file,
+      Err(e) => {
+        error!("Failed to read {}: {}", archive_path.display(), e);
+        return;
+      }
+    };
+
+    let mut sent = 0u64;
     let mut next_report = PROGRESS_STEP;
 
-    while offset < archive_data.len() {
-      let end = (offset + CHUNK_SIZE).min(archive_data.len());
-      let chunk = archive_data[offset..end].to_vec();
-      offset = end;
+    loop {
+      let mut chunk = vec![0u8; CHUNK_SIZE];
+      let read = match file.read(&mut chunk).await {
+        Ok(0) => break,
+        Ok(read) => read,
+        Err(e) => {
+          error!("Failed to read {}: {}", archive_path.display(), e);
+          return;
+        }
+      };
+      chunk.truncate(read);
+      sent += read as u64;
 
       yield DeployChunk { payload: Some(Payload::Data(chunk)) };
 
-      let percent = (offset as u64).saturating_mul(100) / total_size;
+      let percent = sent.saturating_mul(100) / total_size;
       if percent >= next_report {
-        info!("Uploaded {}% ({}/{} bytes)", percent, offset, total_size);
+        info!("Uploaded {}% ({}/{} bytes)", percent, sent, total_size);
         while next_report <= percent {
           next_report += PROGRESS_STEP;
         }
       }
     }
   }
+}
+
+/// A temporary file for the archive about to be built.
+///
+/// Honours `TMPDIR` and its equivalents, which is the lever to pull when the
+/// system temporary directory is small or sits in memory.
+fn staged_archive() -> Result<NamedTempFile> {
+  Builder::new()
+    .prefix("adeploy-")
+    .suffix(".tar.gz")
+    .tempfile()
+    .map_err(|e| {
+      Box::new(AdeployError::FileSystem(format!(
+        "Failed to create a temporary file for the archive: {}",
+        e
+      )))
+    })
 }
 
 /// What the event stream is reporting on, so its messages can say so.
@@ -823,5 +898,101 @@ fn log_deploy_server_entry(entry: &DeployLog) {
     DeployLogLevel::Error => error!("{}", message),
     DeployLogLevel::Warn => warn!("{}", message),
     DeployLogLevel::Unspecified | DeployLogLevel::Info => info!("{}", message),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// A prefix that is absolute on the platform running the test.
+  ///
+  /// `manifest_for` refuses a `deploy_path` that is not absolute, and on
+  /// Windows a leading separator alone is not.
+  const ROOT: &str = if cfg!(windows) { "C:/some" } else { "/some" };
+
+  fn loaded(toml_text: &str) -> LoadedConfig {
+    LoadedConfig {
+      config: toml::from_str(toml_text).expect("configuration should parse"),
+      base_dir: PathBuf::from(format!("{ROOT}/projects/app")),
+      path: PathBuf::from(format!("{ROOT}/projects/app/adeploy.toml")),
+    }
+  }
+
+  fn two_packages() -> String {
+    format!(
+      r#"
+[packages.api]
+sources = ["./dist/api"]
+deploy_path = "{ROOT}/api"
+
+[packages.web]
+sources = ["./dist/web"]
+deploy_path = "{ROOT}/web"
+"#
+    )
+  }
+
+  #[test]
+  fn a_mistyped_name_fails_instead_of_deploying_the_rest() {
+    let loaded = loaded(&two_packages());
+
+    let error = select_packages(&loaded, Some(vec!["api".into(), "wbe".into()]))
+      .expect_err("a name with no package must not be skipped");
+
+    let message = error.to_string();
+    assert!(
+      message.contains("'wbe'"),
+      "must name the typo, got: {message}"
+    );
+    assert!(
+      message.contains("api, web"),
+      "must say what would have worked, got: {message}"
+    );
+  }
+
+  #[test]
+  fn every_unknown_name_is_reported_at_once() {
+    let loaded = loaded(&two_packages());
+
+    let error = select_packages(&loaded, Some(vec!["one".into(), "two".into()]))
+      .expect_err("unknown names must fail");
+
+    let message = error.to_string();
+    assert!(
+      message.contains("'one'") && message.contains("'two'"),
+      "got: {message}"
+    );
+  }
+
+  #[test]
+  fn names_that_all_exist_are_selected_in_order() {
+    let loaded = loaded(&two_packages());
+
+    let selected = select_packages(&loaded, Some(vec!["web".into(), "api".into()]))
+      .expect("declared packages should be selected");
+
+    let names: Vec<&str> = selected
+      .iter()
+      .map(|package| package.name.as_str())
+      .collect();
+    assert_eq!(names, ["web", "api"]);
+    assert_eq!(
+      selected[0].sources,
+      vec![PathBuf::from(format!("{ROOT}/projects/app/dist/web"))]
+    );
+  }
+
+  #[test]
+  fn an_empty_project_says_so_rather_than_listing_nothing() {
+    let loaded = loaded("");
+
+    let error = select_packages(&loaded, Some(vec!["api".into()]))
+      .expect_err("an empty project cannot deploy anything");
+
+    assert!(
+      error.to_string().contains("[packages.<name>]"),
+      "got: {error}"
+    );
   }
 }

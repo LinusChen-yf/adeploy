@@ -157,9 +157,11 @@ fn resolve_expected_outcome(
     (MissingKeyMaterial, StandardSuccess) => Some(CombinedOutcome::ClientError(
       "Failed to load signing key pair",
     )),
-    (UnknownPackageName, StandardSuccess) => {
-      Some(CombinedOutcome::ClientError("No packages found to deploy"))
-    }
+    // Named rather than counted: a name with no package is a typo worth
+    // repeating back, not a reason to report that nothing was found.
+    (UnknownPackageName, StandardSuccess) => Some(CombinedOutcome::ClientError(
+      "No package named 'missing-app'",
+    )),
     _ => None,
   }
 }

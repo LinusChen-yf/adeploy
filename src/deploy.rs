@@ -3,6 +3,7 @@ use std::{
   io::Read,
   path::{Path, PathBuf},
   process::Stdio,
+  time::Duration,
 };
 
 use chrono::{DateTime, Utc};
@@ -39,19 +40,27 @@ impl DeployManager {
     }
   }
 
-  /// Package files from sources with hash verification
+  /// Package `sources` into `destination`, returning its size and SHA256.
+  ///
+  /// Written straight to disk rather than handed back as bytes. The whole
+  /// archive used to sit in memory for as long as the deployment took, and
+  /// every chunk on the way to the wire was copied out of it again, so a large
+  /// package cost more than its own size in a process that only ever needs to
+  /// read it once, in order.
   ///
   /// `sources` are already absolute: the caller resolved them against the
   /// directory holding `adeploy.toml`, so packaging does not depend on the
   /// working directory.
-  pub async fn package_files(
+  pub async fn package_files_into(
     &self,
     package_name: &str,
     sources: &[PathBuf],
-  ) -> Result<(Vec<u8>, String)> {
+    destination: &Path,
+  ) -> Result<(u64, String)> {
     let package_name = package_name.to_string();
     let sources = sources.to_vec();
-    spawn_blocking(move || Self::package_files_blocking(&package_name, &sources))
+    let destination = destination.to_path_buf();
+    spawn_blocking(move || Self::package_files_blocking(&package_name, &sources, &destination))
       .await
       .map_err(|e| {
         Box::new(AdeployError::Deploy(format!(
@@ -61,12 +70,26 @@ impl DeployManager {
       })?
   }
 
-  fn package_files_blocking(package_name: &str, sources: &[PathBuf]) -> Result<(Vec<u8>, String)> {
+  fn package_files_blocking(
+    package_name: &str,
+    sources: &[PathBuf],
+    destination: &Path,
+  ) -> Result<(u64, String)> {
     info!("Packaging {} sources: {:?}", package_name, sources);
 
-    let mut archive = Vec::new();
-    {
-      let encoder = GzEncoder::new(&mut archive, Compression::default());
+    let file = fs::File::create(destination).map_err(|e| {
+      Box::new(AdeployError::FileSystem(format!(
+        "Failed to create {}: {}",
+        destination.display(),
+        e
+      )))
+    })?;
+
+    let measured = {
+      // Hashing sits between the compressor and the file, so what it reports is
+      // exactly what landed on disk - no second pass over the finished archive.
+      let sink = MeasuringWriter::new(io::BufWriter::with_capacity(STREAM_BUFFER_SIZE, file));
+      let encoder = GzEncoder::new(sink, Compression::default());
       let mut tar = Builder::new(encoder);
 
       for path in sources {
@@ -111,19 +134,34 @@ impl DeployManager {
           e
         )))
       })?;
-    }
 
-    let mut hasher = Sha256::new();
-    hasher.update(&archive);
-    let hash = format!("{:x}", hasher.finalize());
+      let encoder = tar.into_inner().map_err(|e| {
+        Box::new(AdeployError::FileSystem(format!(
+          "Failed to finalize archive: {}",
+          e
+        )))
+      })?;
+      encoder.finish().map_err(|e| {
+        Box::new(AdeployError::FileSystem(format!(
+          "Failed to compress archive: {}",
+          e
+        )))
+      })?
+    };
+
+    let (size, hash) = measured.finish().map_err(|e| {
+      Box::new(AdeployError::FileSystem(format!(
+        "Failed to write {}: {}",
+        destination.display(),
+        e
+      )))
+    })?;
 
     info!(
       "Created package {} ({} bytes, hash {})",
-      package_name,
-      archive.len(),
-      hash
+      package_name, size, hash
     );
-    Ok((archive, hash))
+    Ok((size, hash))
   }
 
   /// Assemble the new deployment beside the live one.
@@ -203,11 +241,16 @@ impl DeployManager {
     Ok(())
   }
 
-  /// Move the assembled deployment into place.
+  /// Move the assembled deployment into place, keeping `snapshot` if asked.
+  ///
+  /// The snapshot is taken here rather than beforehand because it is the same
+  /// move: the live deployment has to leave the deploy path either way, and
+  /// where it lands is the only question.
   pub async fn commit_deployment(
     &self,
     tree: IncomingTree,
     deploy_path: &Path,
+    snapshot: Option<PathBuf>,
     sink: &LogSink,
   ) -> Result<()> {
     let deploy_path_owned = deploy_path.to_path_buf();
@@ -215,7 +258,7 @@ impl DeployManager {
       .info(format!("Swapping in {}", deploy_path.display()))
       .await;
 
-    spawn_blocking(move || tree.commit(&deploy_path_owned))
+    spawn_blocking(move || tree.commit(&deploy_path_owned, snapshot.as_deref()))
       .await
       .map_err(|e| Box::new(AdeployError::Deploy(format!("Swap task failed: {}", e))))??;
 
@@ -223,9 +266,33 @@ impl DeployManager {
     Ok(())
   }
 
+  /// Where this deployment's snapshot of the directory it replaces will go.
+  ///
+  /// Named from the moment the deployment started, so every phase of one run
+  /// agrees on it, and disambiguated because two snapshots can land inside the
+  /// same second - which a rollback does by design.
+  pub fn snapshot_path(&self, backup_dir: &Path) -> Result<PathBuf> {
+    fs::create_dir_all(backup_dir).map_err(|e| {
+      Box::new(AdeployError::FileSystem(format!(
+        "Failed to create backup directory {}: {}",
+        backup_dir.display(),
+        e
+      )))
+    })?;
+
+    Ok(unique_backup_path(
+      backup_dir,
+      &format!(
+        "{}{}",
+        BACKUP_PREFIX,
+        self.start_time.format("%Y%m%d_%H%M%S")
+      ),
+    ))
+  }
+
   /// Short, unique enough to tell concurrent deployments apart.
   fn suffix(&self) -> String {
-    self.deploy_id.chars().take(8).collect()
+    self.deploy_id.chars().take(SUFFIX_LEN).collect()
   }
 
   /// Run a hook's commands in order, in `working_dir`.
@@ -287,7 +354,13 @@ impl DeployManager {
     process
       .current_dir(working_dir)
       .stdout(Stdio::piped())
-      .stderr(Stdio::piped());
+      .stderr(Stdio::piped())
+      // A deployment that runs out of time is abandoned by dropping the future
+      // running it, and tokio's default is to let the child outlive that. The
+      // hook that was still going then became a process nobody was waiting for,
+      // holding the deployment's files open, with the next deployment starting
+      // another one beside it.
+      .kill_on_drop(true);
 
     let mut child = process.spawn().map_err(|e| {
       Box::new(AdeployError::Deploy(format!(
@@ -355,68 +428,6 @@ impl DeployManager {
       ))));
     }
 
-    Ok(())
-  }
-
-  /// Create backup of existing deployment
-  pub async fn create_backup(
-    &self,
-    package_name: &str,
-    deploy_path: &Path,
-    backup_dir: &Path,
-  ) -> Result<()> {
-    let backup_dir_path = backup_dir.to_path_buf();
-    std::fs::create_dir_all(&backup_dir_path).map_err(|e| {
-      Box::new(AdeployError::FileSystem(format!(
-        "Failed to create backup directory: {}",
-        e
-      )))
-    })?;
-
-    info!("Creating backup at {}", backup_dir_path.display());
-
-    info!("Backing up {} from {}", package_name, deploy_path.display());
-    let backup_full_path = unique_backup_path(
-      &backup_dir_path,
-      &format!(
-        "{}{}",
-        BACKUP_PREFIX,
-        self.start_time.format("%Y%m%d_%H%M%S")
-      ),
-    );
-
-    self
-      .copy_existing_deploy(deploy_path, &backup_full_path)
-      .await?;
-    self.log_backup_contents(&backup_full_path)?;
-    Ok(())
-  }
-
-  /// Copy directory recursively
-  async fn copy_directory(&self, src: &Path, dst: &Path) -> Result<()> {
-    info!("Copying {} -> {}", src.display(), dst.display());
-
-    let src_path = src.to_path_buf();
-    let dst_path = dst.to_path_buf();
-
-    spawn_blocking(move || -> Result<()> {
-      copy_dir_recursive(&src_path, &dst_path).map_err(|e| {
-        Box::new(AdeployError::FileSystem(format!(
-          "Directory copy failed: {}",
-          e
-        )))
-      })?;
-      Ok(())
-    })
-    .await
-    .map_err(|e| {
-      Box::new(AdeployError::FileSystem(format!(
-        "Directory copy task failed: {}",
-        e
-      )))
-    })??;
-
-    info!("Copied {} -> {}", src.display(), dst.display());
     Ok(())
   }
 }
@@ -508,29 +519,6 @@ impl DeployManager {
     .await
     .map_err(|e| Box::new(AdeployError::Deploy(format!("Restore task failed: {}", e))))?
   }
-
-  async fn copy_existing_deploy(&self, deploy_path: &Path, backup_full_path: &Path) -> Result<()> {
-    if deploy_path.exists() {
-      self.copy_directory(deploy_path, backup_full_path).await?;
-      info!("Backup stored at {}", backup_full_path.display());
-    } else {
-      info!(
-        "No existing deployment at {}; skipping backup",
-        deploy_path.display()
-      );
-    }
-    Ok(())
-  }
-
-  fn log_backup_contents(&self, backup_full_path: &Path) -> Result<()> {
-    if backup_full_path.exists() {
-      for entry in backup_full_path.read_dir()? {
-        let entry = entry?;
-        info!("Backup item: {}", entry.file_name().to_string_lossy());
-      }
-    }
-    Ok(())
-  }
 }
 
 /// One file inside an archive, as it will land on the server.
@@ -540,13 +528,64 @@ pub struct ArchiveEntry {
   pub size: u64,
 }
 
+/// Counts and hashes what passes through it on the way to disk.
+///
+/// The archive is written once and never held, so its size and digest have to
+/// be taken as it goes by; reading the finished file back would be a second
+/// pass over every byte.
+struct MeasuringWriter<W> {
+  inner: W,
+  hasher: Sha256,
+  written: u64,
+}
+
+impl<W: io::Write> MeasuringWriter<W> {
+  fn new(inner: W) -> Self {
+    Self {
+      inner,
+      hasher: Sha256::new(),
+      written: 0,
+    }
+  }
+
+  /// Flush everything still buffered, then report what went through.
+  fn finish(mut self) -> io::Result<(u64, String)> {
+    self.inner.flush()?;
+    Ok((self.written, format!("{:x}", self.hasher.finalize())))
+  }
+}
+
+impl<W: io::Write> io::Write for MeasuringWriter<W> {
+  fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+    let written = self.inner.write(buf)?;
+    // Only what the writer accepted: a short write must not be counted or
+    // hashed as though all of it had landed.
+    self.hasher.update(&buf[..written]);
+    self.written += written as u64;
+    Ok(written)
+  }
+
+  fn flush(&mut self) -> io::Result<()> {
+    self.inner.flush()
+  }
+}
+
 /// Read back what an archive holds.
 ///
 /// Listing the built archive rather than walking the sources again means a
 /// preview cannot disagree with what would actually be sent, and proves the
 /// archive is readable in the first place.
-pub fn describe_archive(archive: &[u8]) -> Result<Vec<ArchiveEntry>> {
-  let decoder = flate2::read::GzDecoder::new(archive);
+pub fn describe_archive(archive_path: &Path) -> Result<Vec<ArchiveEntry>> {
+  let file = fs::File::open(archive_path).map_err(|e| {
+    Box::new(AdeployError::Deploy(format!(
+      "Failed to open {}: {}",
+      archive_path.display(),
+      e
+    )))
+  })?;
+
+  let reader = io::BufReader::with_capacity(STREAM_BUFFER_SIZE, file);
+  let decoder = flate2::read::GzDecoder::new(reader);
   let mut tar = tar::Archive::new(decoder);
 
   let entries = tar.entries().map_err(|e| {
@@ -725,8 +764,8 @@ impl IncomingTree {
   /// Siblings rather than a shared staging directory: `rename` cannot cross
   /// filesystems, and a sibling is on the same one by construction.
   fn prepare(deploy_path: &Path, suffix: &str) -> Result<Self> {
-    let path = sibling_path(deploy_path, "incoming", suffix)?;
-    let previous = sibling_path(deploy_path, "previous", suffix)?;
+    let path = sibling_path(deploy_path, INCOMING_TAG, suffix)?;
+    let previous = sibling_path(deploy_path, PREVIOUS_TAG, suffix)?;
 
     if let Some(parent) = deploy_path.parent() {
       fs::create_dir_all(parent).map_err(|e| {
@@ -738,7 +777,13 @@ impl IncomingTree {
       })?;
     }
 
-    // Anything left by a crashed run would otherwise merge into this one.
+    // Before anything else, because what it puts back is what this deployment
+    // is about to carry over from.
+    restore_interrupted_swap(deploy_path)?;
+    sweep_abandoned_trees(deploy_path, ABANDONED_AGE);
+
+    // This suffix is new, so nothing should be here; a collision would merge
+    // into the tree rather than announce itself.
     remove_directory(&path)?;
     fs::create_dir_all(&path).map_err(|e| {
       Box::new(AdeployError::FileSystem(format!(
@@ -755,28 +800,26 @@ impl IncomingTree {
     })
   }
 
-  /// Move the tree over the live deployment.
+  /// Move the tree over the live deployment, keeping `snapshot` if asked.
   ///
   /// Two renames rather than one: the window in which `deploy_path` does not
   /// exist is the gap between them, instead of the whole extraction.
-  fn commit(mut self, deploy_path: &Path) -> Result<()> {
-    let had_existing = deploy_path.exists();
-    if had_existing {
-      fs::rename(deploy_path, &self.previous).map_err(|e| {
-        Box::new(AdeployError::FileSystem(format!(
-          "Failed to move the existing deployment aside: {}",
-          e
-        )))
-      })?;
-    }
+  fn commit(mut self, deploy_path: &Path, snapshot: Option<&Path>) -> Result<()> {
+    let displaced = if deploy_path.exists() {
+      Some(self.displace(deploy_path, snapshot)?)
+    } else {
+      None
+    };
 
     if let Err(e) = fs::rename(&self.path, deploy_path) {
       // Put the old deployment back rather than leaving nothing in its place.
-      if had_existing {
-        if let Err(restore) = fs::rename(&self.previous, deploy_path) {
+      // Costing the snapshot to do it is the right trade: the deployment it
+      // would have been rolled back from never happened.
+      if let Some(displaced) = &displaced {
+        if let Err(restore) = fs::rename(displaced.path(), deploy_path) {
           error!(
             "Failed to restore the previous deployment from {}: {}",
-            self.previous.display(),
+            displaced.path().display(),
             restore
           );
         }
@@ -791,13 +834,73 @@ impl IncomingTree {
 
     // The deployment is live, so a cleanup failure is worth reporting but not
     // worth failing over.
-    if had_existing {
-      if let Err(e) = remove_directory(&self.previous) {
-        warn!("Failed to remove {}: {}", self.previous.display(), e);
+    if let Some(Displaced::Aside(path)) = &displaced {
+      if let Err(e) = remove_directory(path) {
+        warn!("Failed to remove {}: {}", path.display(), e);
       }
     }
 
     Ok(())
+  }
+
+  /// Move the live deployment out of the way, keeping it as `snapshot` when one
+  /// was asked for.
+  ///
+  /// A snapshot used to be a full copy of the directory, taken moments before
+  /// the swap moved that same directory aside and deleted it - so on the usual
+  /// setup, where the snapshots sit on the filesystem the deployment does, an
+  /// entire deployment was copied for nothing. The rename that has to happen
+  /// anyway can land in the snapshot directory instead. Snapshots kept on
+  /// another filesystem are out of `rename`'s reach, and still copied.
+  fn displace(&self, deploy_path: &Path, snapshot: Option<&Path>) -> Result<Displaced> {
+    if let Some(snapshot) = snapshot {
+      match fs::rename(deploy_path, snapshot) {
+        Ok(()) => {
+          info!("Snapshot taken at {}", snapshot.display());
+          return Ok(Displaced::Kept(snapshot.to_path_buf()));
+        }
+        Err(e) => info!(
+          "Cannot move {} to {} ({}); copying it there instead",
+          deploy_path.display(),
+          snapshot.display(),
+          e
+        ),
+      }
+
+      copy_dir_recursive(deploy_path, snapshot).map_err(|e| {
+        Box::new(AdeployError::FileSystem(format!(
+          "Failed to snapshot {} into {}: {}",
+          deploy_path.display(),
+          snapshot.display(),
+          e
+        )))
+      })?;
+      info!("Snapshot stored at {}", snapshot.display());
+    }
+
+    fs::rename(deploy_path, &self.previous).map_err(|e| {
+      Box::new(AdeployError::FileSystem(format!(
+        "Failed to move the existing deployment aside: {}",
+        e
+      )))
+    })?;
+    Ok(Displaced::Aside(self.previous.clone()))
+  }
+}
+
+/// Where the live deployment went while the new one takes its place.
+enum Displaced {
+  /// Into the snapshot directory, where it stays.
+  Kept(PathBuf),
+  /// Beside the deployment, to be removed once the swap lands.
+  Aside(PathBuf),
+}
+
+impl Displaced {
+  fn path(&self) -> &Path {
+    match self {
+      Self::Kept(path) | Self::Aside(path) => path,
+    }
   }
 }
 
@@ -859,6 +962,165 @@ fn unpack_archive_into(archive_path: &Path, target: &Path) -> Result<()> {
     )))
   })?;
   Ok(())
+}
+
+/// Characters of the deployment's UUID used to tell working directories apart.
+///
+/// The sweep recognises its own directories by this shape, so the two have to
+/// agree; keeping the length here is what makes them.
+const SUFFIX_LEN: usize = 8;
+
+/// Tag on the directory a new deployment is assembled in.
+const INCOMING_TAG: &str = "incoming";
+
+/// Tag on the directory the live deployment is moved to during a swap.
+const PREVIOUS_TAG: &str = "previous";
+
+/// How long a working directory may sit beside a deployment before it is taken
+/// for the remains of a crash.
+///
+/// A deployment that is still running owns its own directories, and a server
+/// caps how long one may run at six hours, so nothing this old belongs to
+/// anybody. Generous on purpose: leaving a stale directory costs disk, and
+/// removing a live one costs the deployment.
+const ABANDONED_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Put back a deployment that was interrupted part way through its swap.
+///
+/// `commit` moves the live deployment aside and then moves the new one in. A
+/// crash between the two leaves nothing at `deploy_path` and everything in the
+/// directory it was moved to. The next deployment would have found no live
+/// deployment, taken itself for a first install, and carried nothing over -
+/// losing exactly the uploads, logs and databases that carrying over exists to
+/// keep.
+fn restore_interrupted_swap(deploy_path: &Path) -> Result<()> {
+  if deploy_path.exists() {
+    return Ok(());
+  }
+
+  // Newest wins: older ones are the remains of earlier crashes, and this is the
+  // deployment that was live when the last one happened.
+  let Some(stranded) = siblings_tagged(deploy_path, PREVIOUS_TAG)
+    .into_iter()
+    .max_by_key(|path| modified_at(path))
+  else {
+    return Ok(());
+  };
+
+  warn!(
+    "Found {} with no deployment at {}: a swap was interrupted, putting it back",
+    stranded.display(),
+    deploy_path.display()
+  );
+  fs::rename(&stranded, deploy_path).map_err(|e| {
+    Box::new(AdeployError::FileSystem(format!(
+      "Failed to restore the interrupted deployment from {}: {}",
+      stranded.display(),
+      e
+    )))
+  })
+}
+
+/// Remove working directories no deployment can still be using.
+///
+/// `prepare` only ever removed the directory for the suffix it was about to
+/// use, which is drawn fresh each run and so never matched what an earlier
+/// crash left behind. Every interrupted deployment therefore stranded a full
+/// copy of a deployment next to the live one, for good.
+fn sweep_abandoned_trees(deploy_path: &Path, older_than: Duration) {
+  for tag in [INCOMING_TAG, PREVIOUS_TAG] {
+    for path in siblings_tagged(deploy_path, tag) {
+      if !is_older_than(&path, older_than) {
+        continue;
+      }
+      match remove_directory(&path) {
+        Ok(()) => warn!("Removed {}, left behind by an earlier run", path.display()),
+        Err(e) => warn!("Failed to remove {}: {}", path.display(), e),
+      }
+    }
+  }
+}
+
+/// Remove staged uploads no deployment can still be using.
+///
+/// An upload is removed when the deployment reading it ends, however it ends -
+/// but only if the process lives to do it. One killed mid-deployment left a
+/// whole archive in the staging directory with nothing to remove it.
+pub fn sweep_abandoned_uploads(staging_dir: &Path) {
+  sweep_uploads_older_than(staging_dir, ABANDONED_AGE)
+}
+
+fn sweep_uploads_older_than(staging_dir: &Path, older_than: Duration) {
+  let Ok(entries) = fs::read_dir(staging_dir) else {
+    return;
+  };
+
+  for entry in entries.filter_map(|entry| entry.ok()) {
+    let path = entry.path();
+    if !path.is_file() || !is_older_than(&path, older_than) {
+      continue;
+    }
+    match fs::remove_file(&path) {
+      Ok(()) => warn!(
+        "Removed staged upload {}, left behind by an earlier run",
+        path.display()
+      ),
+      Err(e) => warn!("Failed to remove {}: {}", path.display(), e),
+    }
+  }
+}
+
+/// The working directories beside `deploy_path` carrying `tag`.
+fn siblings_tagged(deploy_path: &Path, tag: &str) -> Vec<PathBuf> {
+  let (Some(parent), Some(name)) = (deploy_path.parent(), deploy_path.file_name()) else {
+    return Vec::new();
+  };
+  let Ok(entries) = fs::read_dir(parent) else {
+    return Vec::new();
+  };
+
+  // Matched down to the shape of the suffix, not just the prefix: a deployment
+  // of its own called `app.incoming-extras` is somebody's directory, and this
+  // decides what gets removed.
+  let prefix = format!("{}.{}-", name.to_string_lossy(), tag);
+  entries
+    .filter_map(|entry| entry.ok())
+    .filter(|entry| {
+      entry
+        .file_name()
+        .to_string_lossy()
+        .strip_prefix(&prefix)
+        .is_some_and(is_tree_suffix)
+    })
+    .map(|entry| entry.path())
+    .filter(|path| path.is_dir())
+    .collect()
+}
+
+/// Does this look like a suffix `DeployManager::suffix` produced?
+///
+/// It is the head of a UUID, so hex of a fixed length. Checking the shape is
+/// what keeps the sweep to directories this tool made.
+fn is_tree_suffix(candidate: &str) -> bool {
+  candidate.len() == SUFFIX_LEN
+    && candidate
+      .chars()
+      .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+}
+
+fn modified_at(path: &Path) -> std::time::SystemTime {
+  fs::metadata(path)
+    .and_then(|metadata| metadata.modified())
+    .unwrap_or(std::time::UNIX_EPOCH)
+}
+
+/// Untouched for longer than `age`. A timestamp in the future reads as young,
+/// since a clock that has moved is not evidence of an abandoned directory.
+fn is_older_than(path: &Path, age: Duration) -> bool {
+  modified_at(path)
+    .elapsed()
+    .map(|elapsed| elapsed > age)
+    .unwrap_or(false)
 }
 
 /// A working directory next to `deploy_path`, on the same filesystem.
@@ -934,20 +1196,70 @@ impl Default for DeployManager {
 
 #[cfg(test)]
 mod tests {
+  use std::time::Duration;
+
   use tempfile::TempDir;
 
   use super::*;
 
+  /// A hook must not outlive the deployment that started it.
+  ///
+  /// The command sleeps and only then leaves a mark, so the mark appearing is
+  /// proof the process was still running after the deployment was abandoned.
+  #[tokio::test]
+  async fn a_hook_is_killed_with_the_deployment_that_started_it() {
+    let temp = TempDir::new().expect("temp dir");
+    let marker = temp.path().join("still-running.txt");
+    let command = if cfg!(target_os = "windows") {
+      format!(
+        "ping -n 2 127.0.0.1 > NUL & echo x > \"{}\"",
+        marker.display()
+      )
+    } else {
+      format!("sleep 1; echo x > '{}'", marker.display())
+    };
+
+    let manager = DeployManager::new();
+    let (sender, _receiver) = tokio::sync::mpsc::channel(16);
+    let sink = LogSink::new(sender);
+
+    // Boxed so dropping it really drops the future, the way the generator
+    // running a deployment drops the work it was holding.
+    let mut work = Box::pin(manager.execute_command(&command, temp.path(), &sink));
+
+    // Abandon it the way an expired deadline does: stop polling and drop it.
+    let _ = tokio::time::timeout(Duration::from_millis(200), &mut work).await;
+    drop(work);
+
+    // Well past the point the command would have written its mark.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    assert!(
+      !marker.exists(),
+      "the hook kept running after the deployment was abandoned"
+    );
+  }
+
   /// The deployment sequence a server runs, minus the hooks that sit between
   /// its phases.
   fn deploy_once(archive: &Path, deploy_path: &Path, suffix: &str) -> Result<()> {
+    deploy_once_keeping(archive, deploy_path, suffix, None)
+  }
+
+  /// The same, snapshotting what it replaces.
+  fn deploy_once_keeping(
+    archive: &Path,
+    deploy_path: &Path,
+    suffix: &str,
+    snapshot: Option<&Path>,
+  ) -> Result<()> {
     let tree = IncomingTree::prepare(deploy_path, suffix)?;
     unpack_archive_into(archive, tree.path())?;
     if deploy_path.exists() {
       copy_dir_missing_only(deploy_path, tree.path())
         .map_err(|e| Box::new(AdeployError::FileSystem(format!("carry over failed: {e}"))))?;
     }
-    tree.commit(deploy_path)
+    tree.commit(deploy_path, snapshot)
   }
 
   /// Restoring a snapshot, which replaces rather than merges.
@@ -955,7 +1267,7 @@ mod tests {
     let tree = IncomingTree::prepare(deploy_path, suffix)?;
     copy_dir_recursive(snapshot, tree.path())
       .map_err(|e| Box::new(AdeployError::FileSystem(format!("restore failed: {e}"))))?;
-    tree.commit(deploy_path)
+    tree.commit(deploy_path, None)
   }
 
   /// A real tar.gz containing one file, built the way the client would.
@@ -964,10 +1276,8 @@ mod tests {
     fs::create_dir_all(&source).expect("source dir");
     fs::write(source.join(name), contents).expect("source file");
 
-    let (bytes, _) =
-      DeployManager::package_files_blocking("demo", &[source]).expect("build archive");
     let path = dir.join("archive.tar.gz");
-    fs::write(&path, bytes).expect("write archive");
+    DeployManager::package_files_blocking("demo", &[source], &path).expect("build archive");
     path
   }
 
@@ -1088,6 +1398,222 @@ mod tests {
   }
 
   #[test]
+  fn a_swap_interrupted_half_way_does_not_cost_the_live_deployment() {
+    let temp = TempDir::new().expect("temp dir");
+    let deploy_path = temp.path().join("live");
+    fs::create_dir_all(&deploy_path).expect("live dir");
+    fs::write(deploy_path.join("runtime.db"), "keep me").expect("runtime file");
+
+    // Exactly what `commit` does first, with the process dying before the
+    // second rename: nothing at the deploy path, everything beside it.
+    let stranded = sibling_path(&deploy_path, PREVIOUS_TAG, "11111111").expect("sibling");
+    fs::rename(&deploy_path, &stranded).expect("interrupted swap");
+    assert!(!deploy_path.exists());
+
+    let archive = archive_with(temp.path(), "app.txt", "v1");
+    deploy_once(&archive, &deploy_path, "22222222").expect("deploy");
+
+    assert_eq!(
+      fs::read_to_string(deploy_path.join("runtime.db")).expect("read"),
+      "keep me",
+      "the next deployment must not mistake an interrupted swap for a first install"
+    );
+    assert!(deploy_path.join("app.txt").exists(), "and still deploy");
+    assert!(!stranded.exists(), "nothing left beside the deployment");
+  }
+
+  #[test]
+  fn working_directories_an_earlier_run_left_are_swept() {
+    let temp = TempDir::new().expect("temp dir");
+    let deploy_path = temp.path().join("live");
+    fs::create_dir_all(&deploy_path).expect("live dir");
+
+    // Two suffixes that are not the one the next run will draw, which is what
+    // made these survive: each run only ever cleared its own.
+    let incoming = sibling_path(&deploy_path, INCOMING_TAG, "deadbeef").expect("sibling");
+    let previous = sibling_path(&deploy_path, PREVIOUS_TAG, "beefcafe").expect("sibling");
+    for path in [&incoming, &previous] {
+      fs::create_dir_all(path).expect("stale dir");
+      fs::write(path.join("bulk.bin"), "megabytes").expect("stale file");
+    }
+
+    // A deployment whose name merely starts the same way is not ours to remove.
+    let neighbour = temp.path().join("live.incoming-extras");
+    fs::create_dir_all(&neighbour).expect("neighbour");
+    let other_package = temp.path().join("other.incoming-deadbeef");
+    fs::create_dir_all(&other_package).expect("other package");
+
+    sweep_abandoned_trees(&deploy_path, Duration::ZERO);
+
+    assert!(!incoming.exists(), "a stale incoming tree must be removed");
+    assert!(!previous.exists(), "so must a stale previous one");
+    assert!(
+      deploy_path.exists(),
+      "the live deployment is not a leftover"
+    );
+    assert!(neighbour.exists(), "nor is a deployment named like one");
+    assert!(other_package.exists(), "nor another package's working tree");
+  }
+
+  #[test]
+  fn a_tree_young_enough_to_belong_to_a_running_deployment_is_left_alone() {
+    let temp = TempDir::new().expect("temp dir");
+    let deploy_path = temp.path().join("live");
+    fs::create_dir_all(&deploy_path).expect("live dir");
+
+    let in_flight = sibling_path(&deploy_path, INCOMING_TAG, "abcd1234").expect("sibling");
+    fs::create_dir_all(&in_flight).expect("in-flight dir");
+
+    sweep_abandoned_trees(&deploy_path, ABANDONED_AGE);
+
+    assert!(
+      in_flight.exists(),
+      "a directory a running deployment may still be filling must survive"
+    );
+  }
+
+  #[test]
+  fn staged_uploads_an_earlier_run_left_are_swept() {
+    let temp = TempDir::new().expect("temp dir");
+    let staging = temp.path().join(".staging");
+    fs::create_dir_all(&staging).expect("staging dir");
+
+    let stale = staging.join("00000000-0000-0000-0000-000000000000.tar.gz");
+    fs::write(&stale, vec![0u8; 64]).expect("stale upload");
+
+    // The age is the point: an upload this run is still writing must survive.
+    sweep_abandoned_uploads(&staging);
+    assert!(stale.exists(), "a fresh upload is in use, not abandoned");
+
+    sweep_uploads_older_than(&staging, Duration::ZERO);
+    assert!(!stale.exists(), "an abandoned upload must be removed");
+  }
+
+  #[test]
+  fn a_snapshot_holds_what_the_deployment_replaced() {
+    let temp = TempDir::new().expect("temp dir");
+    let deploy_path = temp.path().join("live");
+    let snapshots = temp.path().join("snapshots");
+    fs::create_dir_all(&snapshots).expect("snapshot dir");
+
+    let first = archive_with(&temp.path().join("one"), "app.txt", "v1");
+    deploy_once(&first, &deploy_path, "11111111").expect("first deploy");
+    fs::write(deploy_path.join("runtime.db"), "state").expect("runtime file");
+
+    let snapshot = snapshots.join("backup_20260920_120000");
+    let second = archive_with(&temp.path().join("two"), "app.txt", "v2");
+    deploy_once_keeping(&second, &deploy_path, "22222222", Some(&snapshot)).expect("second deploy");
+
+    assert_eq!(
+      fs::read_to_string(deploy_path.join("app.txt")).expect("read live"),
+      "v2",
+      "the new deployment is live"
+    );
+    assert_eq!(
+      fs::read_to_string(snapshot.join("app.txt")).expect("read snapshot"),
+      "v1",
+      "and the snapshot is exactly what it replaced"
+    );
+    assert_eq!(
+      fs::read_to_string(snapshot.join("runtime.db")).expect("read snapshot"),
+      "state",
+      "including what the deployment did not ship"
+    );
+    assert!(
+      siblings_of(&deploy_path).is_empty(),
+      "the directory moved into the snapshot, so nothing is left beside the deployment"
+    );
+  }
+
+  #[test]
+  fn a_snapshot_rename_cannot_take_is_copied_instead() {
+    // `rename` cannot leave a filesystem, so a snapshot directory on another
+    // one has to be copied into. A second filesystem is not something a test
+    // can conjure; a destination `rename` refuses while a copy can still fill
+    // it takes the same fork in the same code.
+    let temp = TempDir::new().expect("temp dir");
+    let deploy_path = temp.path().join("live");
+
+    let first = archive_with(&temp.path().join("one"), "app.txt", "v1");
+    deploy_once(&first, &deploy_path, "11111111").expect("first deploy");
+    fs::write(deploy_path.join("runtime.db"), "state").expect("runtime file");
+
+    let snapshot = temp.path().join("snapshot");
+    fs::create_dir_all(&snapshot).expect("snapshot dir");
+    fs::write(snapshot.join("occupied.txt"), "in the way").expect("occupying file");
+
+    let second = archive_with(&temp.path().join("two"), "app.txt", "v2");
+    deploy_once_keeping(&second, &deploy_path, "22222222", Some(&snapshot)).expect("second deploy");
+
+    assert_eq!(
+      fs::read_to_string(deploy_path.join("app.txt")).expect("read live"),
+      "v2"
+    );
+    assert_eq!(
+      fs::read_to_string(snapshot.join("app.txt")).expect("read snapshot"),
+      "v1",
+      "the snapshot is filled by copying when it cannot be moved into"
+    );
+    assert_eq!(
+      fs::read_to_string(snapshot.join("runtime.db")).expect("read snapshot"),
+      "state"
+    );
+    assert!(
+      siblings_of(&deploy_path).is_empty(),
+      "and the directory it copied from is still cleared away"
+    );
+  }
+
+  #[test]
+  fn a_snapshot_that_cannot_be_taken_at_all_leaves_the_deployment_running() {
+    // Neither moving nor copying can put a directory inside a regular file,
+    // which every platform agrees on - unlike replacing one, which they do not.
+    let temp = TempDir::new().expect("temp dir");
+    let deploy_path = temp.path().join("live");
+
+    let first = archive_with(&temp.path().join("one"), "app.txt", "v1");
+    deploy_once(&first, &deploy_path, "11111111").expect("first deploy");
+
+    let in_the_way = temp.path().join("not-a-directory");
+    fs::write(&in_the_way, "a file").expect("blocking file");
+    let blocked = in_the_way.join("snapshot");
+
+    let second = archive_with(&temp.path().join("two"), "app.txt", "v2");
+    let failure = deploy_once_keeping(&second, &deploy_path, "22222222", Some(&blocked))
+      .expect_err("a snapshot that cannot be taken must fail the deployment");
+
+    assert!(
+      failure.to_string().contains("snapshot"),
+      "the error should say the snapshot failed, got: {failure}"
+    );
+    assert_eq!(
+      fs::read_to_string(deploy_path.join("app.txt")).expect("read"),
+      "v1",
+      "the live deployment must be exactly as it was"
+    );
+    assert!(
+      siblings_of(&deploy_path).is_empty(),
+      "and nothing may be left beside it"
+    );
+  }
+
+  #[test]
+  fn a_deployment_without_a_snapshot_leaves_nothing_behind() {
+    let temp = TempDir::new().expect("temp dir");
+    let deploy_path = temp.path().join("live");
+
+    let first = archive_with(&temp.path().join("one"), "app.txt", "v1");
+    deploy_once(&first, &deploy_path, "11111111").expect("first deploy");
+    let second = archive_with(&temp.path().join("two"), "app.txt", "v2");
+    deploy_once(&second, &deploy_path, "22222222").expect("second deploy");
+
+    assert!(
+      siblings_of(&deploy_path).is_empty(),
+      "the replaced deployment must be removed once the swap lands"
+    );
+  }
+
+  #[test]
   fn snapshots_are_listed_newest_first() {
     let temp = TempDir::new().expect("temp dir");
     let backups = temp.path().join("backups");
@@ -1198,8 +1724,8 @@ mod tests {
     fs::write(source.join("app.txt"), "1234567890").expect("file");
     fs::write(source.join("nested/lib.txt"), "abc").expect("nested file");
 
-    let (archive, _) =
-      DeployManager::package_files_blocking("demo", &[source]).expect("build archive");
+    let archive = temp.path().join("archive.tar.gz");
+    DeployManager::package_files_blocking("demo", &[source], &archive).expect("build archive");
     let mut entries = describe_archive(&archive).expect("describe");
     entries.sort_by(|a, b| a.path.cmp(&b.path));
 
@@ -1214,8 +1740,38 @@ mod tests {
   #[test]
   fn describing_something_that_is_not_an_archive_is_an_error() {
     // A preview must not claim an archive is fine when it cannot be read.
-    let failure = describe_archive(&[0x42u8; 512]).expect_err("not a gzip stream");
+    let temp = TempDir::new().expect("temp dir");
+    let not_an_archive = temp.path().join("nonsense.tar.gz");
+    fs::write(&not_an_archive, [0x42u8; 512]).expect("write");
+
+    let failure = describe_archive(&not_an_archive).expect_err("not a gzip stream");
     assert!(failure.to_string().contains("archive"));
+  }
+
+  #[test]
+  fn a_packaged_archive_reports_the_size_and_digest_of_the_file_on_disk() {
+    // Both are taken as the bytes go past rather than by reading the finished
+    // file back, so they have to be checked against it.
+    let temp = TempDir::new().expect("temp dir");
+    let source = temp.path().join("sources");
+    fs::create_dir_all(&source).expect("source dir");
+    fs::write(source.join("app.txt"), "contents").expect("source file");
+
+    let archive = temp.path().join("archive.tar.gz");
+    let (size, hash) =
+      DeployManager::package_files_blocking("demo", &[source], &archive).expect("build archive");
+
+    let written = fs::read(&archive).expect("read archive");
+    assert_eq!(
+      size,
+      written.len() as u64,
+      "the reported size is the file's"
+    );
+    assert_eq!(
+      hash,
+      format!("{:x}", Sha256::digest(&written)),
+      "the reported digest is the file's"
+    );
   }
 
   #[test]

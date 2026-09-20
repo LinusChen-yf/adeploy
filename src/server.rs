@@ -1,10 +1,11 @@
 use std::{
+  collections::HashSet,
   env,
   ffi::OsString,
   future::Future,
   path::{Path, PathBuf},
   pin::Pin,
-  sync::Arc,
+  sync::{Arc, Mutex},
   time::Duration,
 };
 
@@ -37,7 +38,7 @@ use crate::{
     rollback_signing_payload, Auth,
   },
   config::{executable_dir, ConfigProvider, PackageConfig, ProjectConfig},
-  deploy::{backup_directory, list_backups, DeployManager},
+  deploy::{backup_directory, list_backups, sweep_abandoned_uploads, DeployManager},
   deploy_log::{DeployLogEntry, LogLevel, LogSink},
   error::{AdeployError, Result},
   init,
@@ -89,6 +90,8 @@ pub struct AdeployService {
   paired_path: PathBuf,
   /// Serialises this server's own read-modify-write of that file.
   pair_lock: Arc<tokio::sync::Mutex<()>>,
+  /// Deployment directories an operation is currently holding.
+  active: ActivePaths,
 }
 
 impl AdeployService {
@@ -98,6 +101,7 @@ impl AdeployService {
       replay: Arc::new(ReplayGuard::new()),
       paired_path,
       pair_lock: Arc::new(tokio::sync::Mutex::new(())),
+      active: ActivePaths::default(),
     }
   }
 
@@ -125,6 +129,61 @@ struct AcceptedDeploy {
   deploy_path: PathBuf,
   backup_dir: PathBuf,
   staging_dir: PathBuf,
+  /// Held for as long as this deployment runs, and released however it ends.
+  _claim: DeployClaim,
+}
+
+/// The deployment directories being replaced right now.
+///
+/// Two deployments to one directory each assemble a tree of their own and then
+/// swap, in whatever order they happen to finish. The one that lost would have
+/// snapshotted the winner's half-installed state, carried over from it, and
+/// left a directory belonging to neither. Refusing the second is the only
+/// outcome anybody can reason about afterwards.
+#[derive(Clone, Default)]
+struct ActivePaths(Arc<Mutex<HashSet<PathBuf>>>);
+
+impl ActivePaths {
+  /// Take `path` for the caller, or say who already has it.
+  fn claim(&self, path: &Path) -> std::result::Result<DeployClaim, Status> {
+    let mut held = self
+      .0
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if !held.insert(path.to_path_buf()) {
+      return Err(Status::aborted(format!(
+        "Another deployment is already replacing {}; wait for it to finish",
+        path.display()
+      )));
+    }
+
+    Ok(DeployClaim {
+      path: path.to_path_buf(),
+      active: self.clone(),
+    })
+  }
+}
+
+/// A claim on one deployment directory.
+///
+/// Released on drop, which covers every way an operation ends: a normal finish,
+/// a failure, an expired deadline, or a client that simply went away and took
+/// the response stream with it.
+struct DeployClaim {
+  path: PathBuf,
+  active: ActivePaths,
+}
+
+impl Drop for DeployClaim {
+  fn drop(&mut self) {
+    self
+      .active
+      .0
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+      .remove(&self.path);
+  }
 }
 
 /// Everything a package's name resolves to on this server.
@@ -317,6 +376,11 @@ impl DeployService for AdeployService {
       .await?;
 
     let context = self.package_context(&request.package_name, request.manifest.as_ref())?;
+
+    // Restoring replaces the directory as thoroughly as deploying does, so it
+    // takes the same claim.
+    let claim = self.active.claim(&context.deploy_path)?;
+
     let backups = list_backups(&context.backup_dir)
       .map_err(|e| Status::internal(format!("Failed to read snapshots: {}", e)))?;
 
@@ -356,6 +420,7 @@ impl DeployService for AdeployService {
       context,
       chosen,
       deadline,
+      claim,
     );
     Ok(Response::new(Box::pin(stream) as Self::RollbackStream))
   }
@@ -581,12 +646,17 @@ impl AdeployService {
 
     let context = self.package_context(&start.package_name, start.manifest.as_ref())?;
 
+    // Before a byte of archive is accepted, so a client that has to wait finds
+    // out now rather than after the upload.
+    let claim = self.active.claim(&context.deploy_path)?;
+
     Ok(AcceptedDeploy {
       start,
       package_config: context.config,
       staging_dir: context.deploy_path.with_file_name(STAGING_DIR),
       deploy_path: context.deploy_path,
       backup_dir: context.backup_dir,
+      _claim: claim,
     })
   }
 }
@@ -688,14 +758,18 @@ fn rollback_stream(
   context: PackageContext,
   chosen: crate::deploy::BackupInfo,
   deadline: Option<Instant>,
+  claim: DeployClaim,
 ) -> impl Stream<Item = std::result::Result<DeployEvent, Status>> + Send + 'static {
   try_stream! {
+    // Moved in rather than left to the enclosing function, whose locals are
+    // dropped as soon as it hands the stream back.
+    let _claim = claim;
     let deploy_id = deploy_manager.deploy_id.clone();
     yield accepted_event(&deploy_id);
 
     let (sender, mut receiver) = mpsc::channel(EVENT_CHANNEL_SIZE);
     let sink = LogSink::new(sender);
-    let work = execute_rollback(&deploy_manager, &package_name, &context, &chosen, &sink);
+    let work = execute_rollback(&deploy_manager, &context, &chosen, &sink);
     tokio::pin!(work);
     let expiry = expire_at(deadline);
     tokio::pin!(expiry);
@@ -749,7 +823,6 @@ fn rollback_stream(
 /// hook may well be a script that shipped inside the snapshot being restored.
 async fn execute_rollback(
   deploy_manager: &DeployManager,
-  package_name: &str,
   context: &PackageContext,
   chosen: &crate::deploy::BackupInfo,
   sink: &LogSink,
@@ -774,16 +847,17 @@ async fn execute_rollback(
     )
     .await?;
 
-  // Snapshot what is there now, so a rollback can itself be undone.
-  if context.config.backup_enabled {
+  // Snapshot what is there now, so a rollback can itself be undone. Taken by
+  // the swap, which has to move this directory anyway.
+  let snapshot = if context.config.backup_enabled {
     sink.info("Creating backup snapshot").await;
-    deploy_manager
-      .create_backup(package_name, &context.deploy_path, &context.backup_dir)
-      .await?;
-  }
+    Some(deploy_manager.snapshot_path(&context.backup_dir)?)
+  } else {
+    None
+  };
 
   deploy_manager
-    .commit_deployment(tree, &context.deploy_path, sink)
+    .commit_deployment(tree, &context.deploy_path, snapshot, sink)
     .await?;
   sink.info("Restore complete").await;
 
@@ -824,6 +898,10 @@ async fn receive_archive(
         e
       ))
     })?;
+
+  // A run that was killed mid-deployment never got to remove what it had
+  // staged, and nothing else was ever going to.
+  sweep_abandoned_uploads(&accepted.staging_dir);
 
   let path = accepted.staging_dir.join(format!("{}.tar.gz", deploy_id));
   let staged = StagedArchive { path };
@@ -922,19 +1000,15 @@ async fn execute_deployment(
     .carry_over_existing(&tree, &accepted.deploy_path, sink)
     .await?;
 
-  if accepted.package_config.backup_enabled {
+  let snapshot = if accepted.package_config.backup_enabled {
     sink.info("Creating backup snapshot").await;
-    deploy_manager
-      .create_backup(
-        &accepted.start.package_name,
-        &accepted.deploy_path,
-        &accepted.backup_dir,
-      )
-      .await?;
-  }
+    Some(deploy_manager.snapshot_path(&accepted.backup_dir)?)
+  } else {
+    None
+  };
 
   deploy_manager
-    .commit_deployment(tree, &accepted.deploy_path, sink)
+    .commit_deployment(tree, &accepted.deploy_path, snapshot, sink)
     .await?;
 
   // A failed after-deploy hook has never failed the deployment: the files are
@@ -1048,7 +1122,7 @@ where
       DeployServiceServer::new(adeploy_service)
         .max_decoding_message_size(MAX_INBOUND_MESSAGE_SIZE)
         .max_encoding_message_size(MAX_INBOUND_MESSAGE_SIZE),
-    ) // 100 MB
+    )
     .serve_with_shutdown(addr, shutdown)
     .await
     .map_err(|e| Box::new(AdeployError::Network(format!("Server error: {}", e))))?;
