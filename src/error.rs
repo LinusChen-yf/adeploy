@@ -9,7 +9,6 @@ pub enum AdeployError {
   Network(String),
 
   #[error("Authentication error: {0}")]
-  #[allow(dead_code)]
   Auth(String),
 
   #[error("Deploy error: {0}")]
@@ -33,14 +32,11 @@ pub enum AdeployError {
 
   #[error("TOML parsing error: {0}")]
   Toml(#[from] toml::de::Error),
-
-  #[error("Serialization error: {0}")]
-  Serde(#[from] serde_json::Error),
 }
 
-// Allow AdeployError to cross thread boundaries
-unsafe impl Send for AdeployError {}
-unsafe impl Sync for AdeployError {}
+// `Send` and `Sync` used to be asserted here by hand. Every variant already
+// satisfies both, so the impls bought nothing and cost the compiler's check: a
+// variant holding something that is not thread-safe would have kept compiling.
 
 // Support converting std::io::Error into Box<AdeployError>
 impl From<std::io::Error> for Box<AdeployError> {

@@ -8,28 +8,33 @@ edition = "2021"
 tonic = "0.14"
 prost = "0.14"
 clap = { version = "4.5", features = ["derive"] }
-tokio = { version = "1.47", features = ["full"] }
-env_logger = "0.11"
+# Only what the code reaches for: the runtime, the hook child processes, the
+# staging file, and the channels and timers the deployment loop is built from.
+tokio = { version = "1.47", features = [
+  "fs",
+  "io-util",
+  "macros",
+  "process",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
 log2 = "0.2.2"
 tonic-prost = "0.14"
 
 # Auxiliary dependencies
-ssh2 = "0.9"
 tar = "0.4"
 flate2 = "1.1"
 uuid = { version = "1.18", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 toml = "0.9"
 tokio-stream = "0.1"
 async-stream = "0.3"
-anyhow = "1.0"
 thiserror = "2.0"
 base64 = "0.22"
 sha2 = "0.10"
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }
-rand = "0.9"
 rand_core = { version = "0.6", features = ["std"] }
 service-manager = "0.8"
 hostname = "0.4"

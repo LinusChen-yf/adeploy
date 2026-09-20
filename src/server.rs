@@ -1048,7 +1048,7 @@ where
       DeployServiceServer::new(adeploy_service)
         .max_decoding_message_size(MAX_INBOUND_MESSAGE_SIZE)
         .max_encoding_message_size(MAX_INBOUND_MESSAGE_SIZE),
-    ) // 100 MB
+    )
     .serve_with_shutdown(addr, shutdown)
     .await
     .map_err(|e| Box::new(AdeployError::Network(format!("Server error: {}", e))))?;
