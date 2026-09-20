@@ -53,3 +53,11 @@ tonic-prost-build = "0.14"
 
 [dev-dependencies]
 tokio-test = "0.4"
+
+[profile.release]
+# Symbol names nothing reads.
+strip = true
+# Collapses the duplicate copies of a function that separate codegen units each
+# keep. Costs build time, which only `--release` pays.
+lto = "fat"
+codegen-units = 1
