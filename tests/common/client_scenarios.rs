@@ -114,6 +114,8 @@ port = {port}
 port = {port}
 connect_timeout = 5
 deploy_timeout = 30
+# Matches the server fixture: see the note there.
+tls = false
 
 [packages.test-app]
 sources = [

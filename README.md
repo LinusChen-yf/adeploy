@@ -11,6 +11,8 @@ the binary and a key to trust.
   description travels with the package, signed
 - Ed25519 signing checked *before* any upload, with pairing instead of copying
   keys by hand
+- **Encrypted, with both ends identified, and no certificate to obtain** — the
+  server generates its own on first run and the client records it while pairing
 - Chunked uploads with live progress, and the server's own output streamed back
   as it happens
 - Hooks that run scripts the package ships, so nothing has to be put on the
@@ -32,7 +34,7 @@ In the project you want to deploy:
 ```bash
 adeploy init                       # write a commented adeploy.toml here
 adeploy list                       # what this project declares
-adeploy pair <host>                # ask the server to trust this machine
+adeploy pair <host>                # exchange identities with the server
 adeploy <host> <pkg> --dry-run     # what would be sent, without sending it
 adeploy <host> <pkg> [pkg...]      # deploy one or more packages
 adeploy rollback <host> <pkg>      # put the previous deployment back
@@ -109,6 +111,7 @@ behave identically on every machine. `--config <path>` overrides the search.
 port = 6060            # port to dial; must match the server's listen_port
 connect_timeout = 5    # seconds to establish the connection
 deploy_timeout = 60    # seconds for the server's work, from the last byte
+tls = true             # verify the server and encrypt the connection
 
 [packages.demo]
 sources = ["./dist/demo"]        # includes dist/demo/scripts/
@@ -165,24 +168,30 @@ enable it.
 ### On the server
 
 The server generates its own `adeploy.toml` on first run, and during
-`adeploy server install`, then reports at startup where it is and whether any
-client key is authorized yet. It never overwrites a file that already exists.
+`adeploy server install`, then reports at startup where it is, which identity it
+is presenting, and whether any client key is authorized yet. Its TLS certificate
+is generated the same way and at the same time. It never overwrites a file that
+already exists.
 
 It reads only the copy beside its own binary, never one found by searching
 upward — starting the server from inside a project checkout must not make it
 adopt that project's configuration. `--config <path>` points it elsewhere.
 
-There are two settings, and neither mentions a package:
+There are three settings, and none of them mentions a package:
 
 ```toml
 [server]
 listen_port = 6060
+tls = true
 allowed_keys = []
 ```
 
 - `listen_port` — the port to bind. Clients dial it through their own `port`;
   the two are separate fields because they are separate decisions that merely
   share a default. Changing it requires a restart.
+- `tls` — serve over TLS, using the certificate generated beside this file on
+  first run. On by default; see [Who the client thinks it is talking
+  to](#who-the-client-thinks-it-is-talking-to).
 - `allowed_keys` — the base64 Ed25519 keys permitted to deploy, which the client
   prints when it is rejected, and which `adeploy server approve` maintains
   through pairing.
@@ -198,10 +207,24 @@ adeploy server pending             # on the server: who is waiting, and from whe
 adeploy server approve 1           # by position, or by fingerprint
 ```
 
-Both ends print the same fingerprint. **Comparing them is what makes the
-approval mean anything**, rather than trusting whoever reached the queue first.
-`adeploy server keys` lists who is trusted and `adeploy server revoke` withdraws
-it; the running server picks all of this up without a restart.
+Pairing settles both directions in the one trip an operator already makes. The
+client records which server answered, and the server queues the client's key for
+a person to approve:
+
+```
+# on the server, at startup
+Server identity: SHA256:Ee8JHrdPheCK6SvTa7mFvHMAU6lNW2li+LtGjktdnRg
+
+# on the client
+This machine's key fingerprint: SHA256:DPHRhwwNlQe81FJZJcXN0fwnhMsqRX0hJ4Ty7awZzHk
+Server identity: SHA256:Ee8JHrdPheCK6SvTa7mFvHMAU6lNW2li+LtGjktdnRg  (recorded)
+Check it matches the `Server identity` line in 192.0.2.10's own log
+```
+
+**Comparing the fingerprints is what makes any of this mean anything**, rather
+than trusting whoever reached the queue first or whoever answered on that
+address. `adeploy server keys` lists who is trusted and `adeploy server revoke`
+withdraws it; the running server picks all of this up without a restart.
 
 `Pair` is the one method that cannot require a key, since establishing one is
 the point. A request is self-signed, which proves the sender holds the key it is
@@ -213,6 +236,39 @@ Approvals live in `paired.toml` beside the server binary, written by the tool
 and kept out of `adeploy.toml` so the server never rewrites a file an operator
 hand-edited. `allowed_keys` still works and is simply unioned with what has been
 approved.
+
+### Who the client thinks it is talking to
+
+There is no certificate authority here and nothing to obtain or renew. The
+server generates a certificate for itself on first run — `server.crt` and
+`server.key`, beside its configuration — and the client records it the first
+time it pairs, in `known_servers.toml` beside its own key. Every later
+connection is checked against that record. It is what SSH does with host keys,
+for the same reason: both machines belong to you, so you are the authority.
+
+The certificate is issued for the fixed name `adeploy` rather than for a host
+name or an address. A server cannot know which of its addresses a client will
+dial, and an address baked into a certificate is one that cannot change without
+reissuing it. What decides trust is the recorded certificate, so the address is
+free to move.
+
+A server whose identity no longer matches is refused outright:
+
+```
+Failed to connect to 192.0.2.10:6060: transport error: invalid peer certificate:
+UnknownIssuer. If 192.0.2.10 was rebuilt or replaced, its identity changed; run
+`adeploy pair 192.0.2.10 --force` after checking that is what happened
+```
+
+That is the only new flag: `--force` accepts an identity that differs from the
+one on file, for a machine that really was rebuilt. Without it, nothing
+overwrites a recorded identity.
+
+Both ends can be turned off with `tls = false` — under `[server]` on the server,
+under `[defaults]` or one `[remotes.*]` on the client — which exists for
+reaching a server too old to offer it. It leaves every deployment readable by
+anyone on the network, and lets any machine on that address pass for the real
+one.
 
 ## What travels to the server
 
@@ -240,6 +296,13 @@ Worth being plain about what this does and does not buy. An approved client
 chooses the commands the server runs as itself, so approving one is trusting it
 with the machine. The server refuses only what is certainly a mistake — a
 relative `deploy_path`, the filesystem root, or its own directory.
+
+The signature and the transport answer different questions, which is why both
+are there. The signature says who is asking and binds these bytes to this
+package, this path and these hooks — it is checked before a byte of archive is
+accepted, and holds across the upload, the rollback and everything else. TLS
+says nothing about any of that; it keeps the archive from being read on the way
+and tells the client which machine it reached.
 
 ## How a deployment is applied
 

@@ -22,7 +22,10 @@ use tokio::{
   time::{sleep_until, Instant},
 };
 use tokio_stream::Stream;
-use tonic::{transport::Server, Request, Response, Status, Streaming};
+use tonic::{
+  transport::{Identity as TlsIdentity, Server, ServerTlsConfig},
+  Request, Response, Status, Streaming,
+};
 
 use crate::{
   adeploy::{
@@ -41,6 +44,7 @@ use crate::{
   deploy::{backup_directory, list_backups, sweep_abandoned_uploads, DeployManager},
   deploy_log::{DeployLogEntry, LogLevel, LogSink},
   error::{AdeployError, Result},
+  identity::{ensure_server_identity, ServerIdentity},
   init,
   pairing::{PairOutcome, PairStore, PAIRED_FILE_NAME},
   replay::ReplayGuard,
@@ -1085,19 +1089,33 @@ where
   let generated = init::ensure_server_config(&config_path)?;
   let config = provider.load_project_config(config_path.as_path())?;
 
+  // Beside the configuration, which is beside the binary in a real install and
+  // inside the temporary directory under test.
+  let directory = config_path
+    .parent()
+    .map(Path::to_path_buf)
+    .unwrap_or_else(|| PathBuf::from("."));
+
+  // Generated on first run like everything else the server needs, because an
+  // identity an operator has to produce by hand is a step that gets skipped.
+  let identity = if config.server.tls {
+    let (identity, generated) = ensure_server_identity(&directory)?;
+    if generated {
+      info!("First run: generated this server's TLS identity");
+    }
+    Some(identity)
+  } else {
+    None
+  };
+
   let port = config.server.listen_port;
-  log_startup_state(&config_path, &config, generated);
+  log_startup_state(&config_path, &config, generated, identity.as_ref());
 
   let addr = format!("0.0.0.0:{}", port)
     .parse()
     .map_err(|e| Box::new(AdeployError::Network(format!("Invalid address: {}", e))))?;
 
-  // Beside the configuration, which is beside the binary in a real install and
-  // inside the temporary directory under test.
-  let paired_path = config_path
-    .parent()
-    .map(|parent| parent.join(PAIRED_FILE_NAME))
-    .unwrap_or_else(|| PathBuf::from(PAIRED_FILE_NAME));
+  let paired_path = directory.join(PAIRED_FILE_NAME);
 
   let shared_config = Arc::new(RwLock::new(config));
   let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -1115,9 +1133,20 @@ where
 
   info!("Binding ADeploy server on {}", addr);
 
-  Server::builder()
+  let mut builder = Server::builder()
     .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
-    .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT))
+    .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT));
+
+  if let Some(identity) = &identity {
+    builder = builder
+      .tls_config(ServerTlsConfig::new().identity(TlsIdentity::from_pem(
+        &identity.certificate_pem,
+        &identity.key_pem,
+      )))
+      .map_err(|e| Box::new(AdeployError::Network(format!("Failed to enable TLS: {e}"))))?;
+  }
+
+  builder
     .add_service(
       DeployServiceServer::new(adeploy_service)
         .max_decoding_message_size(MAX_INBOUND_MESSAGE_SIZE)
@@ -1134,11 +1163,27 @@ where
 ///
 /// Everything here was previously only discoverable by reading the config file,
 /// which a freshly installed server does not have until this run creates it.
-fn log_startup_state(config_path: &Path, config: &ProjectConfig, generated: bool) {
+fn log_startup_state(
+  config_path: &Path,
+  config: &ProjectConfig,
+  generated: bool,
+  identity: Option<&ServerIdentity>,
+) {
   if generated {
     info!("First run: generated {}", config_path.display());
   }
   info!("Configuration: {}", config_path.display());
+
+  // Printed every start, not only the first: it is what a client pairing with
+  // this machine has to compare against, and whoever is doing the comparing is
+  // looking at this log now, not at the one from the day it was installed.
+  match identity {
+    Some(identity) => info!("Server identity: {}", identity.fingerprint),
+    None => warn!(
+      "TLS is off: deployments cross the network in the clear, and a client cannot tell this server from any other machine on its address. Set `tls = true` under [server] in {}.",
+      config_path.display()
+    ),
+  }
 
   if config.server.allowed_keys.is_empty() {
     warn!(

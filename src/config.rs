@@ -32,6 +32,19 @@ impl KeyPairPaths {
       public_key,
     }
   }
+
+  /// Where this client records the servers it trusts.
+  ///
+  /// Beside its own key, because the two are the same kind of thing: who this
+  /// machine is, and who it has decided the other end is. They move together,
+  /// and a test that redirects one redirects both.
+  pub fn known_servers(&self) -> PathBuf {
+    self
+      .private_key
+      .parent()
+      .map(|directory| directory.join(crate::known_servers::KNOWN_SERVERS_FILE_NAME))
+      .unwrap_or_else(|| PathBuf::from(crate::known_servers::KNOWN_SERVERS_FILE_NAME))
+  }
 }
 
 /// A parsed `adeploy.toml` together with the directory it was loaded from.
@@ -240,6 +253,14 @@ pub struct Defaults {
   /// HTTP/2 keepalive.
   #[serde(default = "default_deploy_timeout")]
   pub deploy_timeout: u64,
+  /// Verify the server's identity and encrypt the connection.
+  ///
+  /// On by default. The archive is the project's own code and whatever it
+  /// carries with it, and without this it crosses the network in the clear to
+  /// whichever machine answered on that address. Turn it off only to reach a
+  /// server too old to offer TLS.
+  #[serde(default = "default_tls")]
+  pub tls: bool,
 }
 
 impl Default for Defaults {
@@ -248,6 +269,7 @@ impl Default for Defaults {
       port: default_port(),
       connect_timeout: default_connect_timeout(),
       deploy_timeout: default_deploy_timeout(),
+      tls: default_tls(),
     }
   }
 }
@@ -294,6 +316,8 @@ pub struct RemoteOverride {
   pub connect_timeout: Option<u64>,
   #[serde(default)]
   pub deploy_timeout: Option<u64>,
+  #[serde(default)]
+  pub tls: Option<bool>,
 }
 
 /// Machine-local server settings. Not meaningful in a project checkout.
@@ -309,6 +333,12 @@ pub struct ServerSettings {
   /// Base64 Ed25519 public keys permitted to deploy.
   #[serde(default)]
   pub allowed_keys: Vec<String>,
+  /// Serve over TLS, using a certificate generated on first run.
+  ///
+  /// On by default. Turning it off leaves every deployment readable by anyone
+  /// on the network and lets any machine on that address impersonate this one.
+  #[serde(default = "default_tls")]
+  pub tls: bool,
 }
 
 impl Default for ServerSettings {
@@ -316,6 +346,7 @@ impl Default for ServerSettings {
     Self {
       listen_port: default_port(),
       allowed_keys: Vec::new(),
+      tls: default_tls(),
     }
   }
 }
@@ -326,6 +357,7 @@ pub struct ResolvedRemote {
   pub port: u16,
   pub connect_timeout: u64,
   pub deploy_timeout: u64,
+  pub tls: bool,
 }
 
 impl ProjectConfig {
@@ -347,6 +379,7 @@ impl ProjectConfig {
       deploy_timeout: over
         .and_then(|o| o.deploy_timeout)
         .unwrap_or(self.defaults.deploy_timeout),
+      tls: over.and_then(|o| o.tls).unwrap_or(self.defaults.tls),
     }
   }
 
@@ -463,6 +496,10 @@ const fn default_connect_timeout() -> u64 {
 
 const fn default_deploy_timeout() -> u64 {
   60
+}
+
+const fn default_tls() -> bool {
+  true
 }
 
 /// Directory containing the running executable.

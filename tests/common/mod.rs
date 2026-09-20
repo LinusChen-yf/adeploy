@@ -1,6 +1,6 @@
 //! Common test utilities and helpers
 
-use std::{collections::BTreeSet, path::Path, sync::Mutex};
+use std::{collections::BTreeSet, path::Path, sync::Mutex, time::Duration};
 
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -42,6 +42,29 @@ pub async fn find_available_port() -> u16 {
   }
 
   panic!("No free port found starting from {base}");
+}
+
+/// Wait until something answers on `port`, rather than guessing how long a
+/// server takes to come up.
+///
+/// A fixed sleep is a bet on the slowest machine that will ever run the suite,
+/// and the machines that lose it are the loaded CI runners where a failure is
+/// hardest to read.
+#[allow(dead_code)]
+pub async fn wait_until_listening(port: u16) {
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+
+  while std::time::Instant::now() < deadline {
+    if tokio::net::TcpStream::connect(("127.0.0.1", port))
+      .await
+      .is_ok()
+    {
+      return;
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+  }
+
+  panic!("nothing was listening on {port} after 10s");
 }
 
 /// Escape Windows backslashes so TOML paths parse correctly across platforms.

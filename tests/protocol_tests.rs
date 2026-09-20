@@ -156,6 +156,7 @@ impl Harness {
       format!(
         r#"[server]
 listen_port = {port}
+tls = false
 allowed_keys = {allowlist}
 "#
       ),
@@ -176,7 +177,7 @@ allowed_keys = {allowlist}
     tokio::spawn(async move {
       let _ = server::start_server(provider).await;
     });
-    sleep(Duration::from_millis(300)).await;
+    common::wait_until_listening(port).await;
 
     Self {
       _temp: temp,
