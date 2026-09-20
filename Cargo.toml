@@ -53,3 +53,30 @@ tonic-prost-build = "0.14"
 
 [dev-dependencies]
 tokio-test = "0.4"
+
+# Release binaries are downloaded and copied to servers, so their size is part
+# of what this tool costs to use. 10.0MB -> 5.5MB.
+[profile.release]
+# Symbol names are two megabytes of the ten this used to be, and nothing reads
+# them: a panic reports its own message, and the backtrace behind it is not
+# something a deployment log is any use for.
+strip = true
+# The largest win, and the reason `codegen-units` is here too. Without it the
+# same function is emitted into several codegen units and every copy is kept -
+# three copies of `client::pair`'s state machine, at 22KiB each, were in the
+# binary. Thin LTO does not collapse them and came out slightly *larger* than
+# no LTO at all, so this has to be "fat".
+#
+# It costs build time: a rebuild after a one-line change goes from 6s to 38s.
+# Only `--release` pays that, so day-to-day `cargo build` and `cargo test` are
+# untouched; CI pays it once per platform when a release is cut.
+lto = "fat"
+codegen-units = 1
+# Deliberately left at the default. `opt-level = "s"` would take another 1.3MB
+# but costs about 10% on everything that compresses or hashes, at every package
+# size measured - and that is the work a deployment is made of.
+#
+# Also deliberately not `panic = "abort"`, which would save 0.7MB by dropping
+# the unwinding tables. Aborting runs no destructors, and the destructors are
+# where a hook gets killed, a staged upload is removed, and an unfinished
+# deployment is cleaned up.
