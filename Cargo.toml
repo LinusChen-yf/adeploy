@@ -54,7 +54,6 @@ tonic-prost-build = "0.14"
 [dev-dependencies]
 tokio-test = "0.4"
 
-# Smaller release binaries: 10.0MB -> 5.5MB.
 [profile.release]
 # Symbol names nothing reads.
 strip = true
