@@ -1,7 +1,7 @@
 use std::{
   convert::TryFrom,
   path::{Path, PathBuf},
-  time::Duration,
+  time::{Duration, Instant},
 };
 
 use async_stream::stream;
@@ -17,7 +17,8 @@ use crate::{
   adeploy::{
     deploy_chunk::Payload, deploy_event::Event, deploy_log::Level as DeployLogLevel,
     deploy_service_client::DeployServiceClient, BackupListRequest, DeployChunk, DeployEvent,
-    DeployLog, DeployManifest, DeployResult, DeployStart, PairRequest, PairState, RollbackRequest,
+    DeployLog, DeployManifest, DeployResult, DeployStart, PairRequest, PairResponse, PairState,
+    RollbackRequest,
   },
   auth::{
     backup_list_signing_payload, deploy_start_signing_payload, fingerprint, pair_signing_payload,
@@ -436,7 +437,12 @@ fn format_size(bytes: u64) -> String {
 /// Deliberately a separate command rather than something a failed deployment
 /// does on its own: joining a server is a decision, and the operator on the
 /// other end has to be told to expect it.
-pub async fn pair(host: &str, force: bool, provider: &dyn ConfigProvider) -> Result<()> {
+pub async fn pair(
+  host: &str,
+  force: bool,
+  wait: bool,
+  provider: &dyn ConfigProvider,
+) -> Result<()> {
   let loaded = provider.load()?;
   let remote = loaded.config.resolve_remote(host);
   let auth = prepare_auth_resources(provider)?;
@@ -451,35 +457,115 @@ pub async fn pair(host: &str, force: bool, provider: &dyn ConfigProvider) -> Res
   // makes: this machine records who the server is, and the server queues this
   // machine's key for a person to approve.
   let trust = record_server_identity(host, &remote, provider, force).await?;
-
-  let nonce = Uuid::new_v4().to_string();
-  let timestamp_ms = now_ms();
-  let payload = pair_signing_payload(&auth.public_key, &client_name, &nonce, timestamp_ms);
-  let signature = auth
-    .ssh_auth
-    .sign_data(&payload)
-    .map_err(|e| Box::new(AdeployError::Auth(format!("Failed to sign request: {}", e))))?;
-
   let mut client = connect_deploy_client(host, &remote, &trust).await?;
-  let response = client
-    .pair(tonic::Request::new(PairRequest {
-      public_key: auth.public_key.clone(),
-      client_name,
-      nonce,
-      timestamp_ms,
-      signature: general_purpose::STANDARD.encode(&signature),
-    }))
-    .await
-    .map_err(|status| Box::new(AdeployError::Grpc(status)))?
-    .into_inner();
 
+  let response = send_pair_request(&mut client, &auth, &client_name).await?;
   report_pair_state(
     host,
     &response.state,
     &response.fingerprint,
     &response.message,
   );
+
+  let queued = matches!(PairState::try_from(response.state), Ok(PairState::Pending));
+  if wait && queued {
+    await_approval(&mut client, host, &auth, &client_name).await?;
+  }
   Ok(())
+}
+
+/// Build and send one pairing request.
+///
+/// A fresh nonce and timestamp each time, which is what lets the same call be
+/// repeated while waiting without the server's replay protection turning the
+/// second one away.
+async fn send_pair_request(
+  client: &mut DeployServiceClient<Channel>,
+  auth: &AuthResources,
+  client_name: &str,
+) -> Result<PairResponse> {
+  let nonce = Uuid::new_v4().to_string();
+  let timestamp_ms = now_ms();
+  let payload = pair_signing_payload(&auth.public_key, client_name, &nonce, timestamp_ms);
+  let signature = auth
+    .ssh_auth
+    .sign_data(&payload)
+    .map_err(|e| Box::new(AdeployError::Auth(format!("Failed to sign request: {}", e))))?;
+
+  Ok(
+    client
+      .pair(tonic::Request::new(PairRequest {
+        public_key: auth.public_key.clone(),
+        client_name: client_name.to_string(),
+        nonce,
+        timestamp_ms,
+        signature: general_purpose::STANDARD.encode(&signature),
+      }))
+      .await
+      .map_err(|status| Box::new(AdeployError::Grpc(status)))?
+      .into_inner(),
+  )
+}
+
+/// Hold the command open until a person on the server has decided.
+///
+/// `Pair` is idempotent - a key already queued gets its state back rather than
+/// a second slot in the queue - so waiting needs no protocol of its own, only
+/// the same call repeated. Nothing is lost by giving up either: the request is
+/// already recorded on the server, so Ctrl-C costs the wait and not the work.
+async fn await_approval(
+  client: &mut DeployServiceClient<Channel>,
+  host: &str,
+  auth: &AuthResources,
+  client_name: &str,
+) -> Result<()> {
+  info!("Waiting for that approval - Ctrl-C is safe, the request stays queued");
+
+  let started = Instant::now();
+  let mut last_heartbeat = Instant::now();
+  loop {
+    tokio::time::sleep(PAIR_POLL_INTERVAL).await;
+    let response = send_pair_request(client, auth, client_name).await?;
+
+    match PairState::try_from(response.state).unwrap_or(PairState::Unspecified) {
+      PairState::Approved => {
+        info!(
+          "Approved by {} after {}; deployments will work now",
+          host,
+          describe_elapsed(started.elapsed())
+        );
+        return Ok(());
+      }
+      PairState::Rejected => {
+        return Err(Box::new(AdeployError::Auth(format!(
+          "{} refused this key: {}",
+          host, response.message
+        ))));
+      }
+      PairState::Pending | PairState::Unspecified => {
+        // Say something occasionally, so a long wait stays distinguishable
+        // from the silent hang this command used to be able to produce.
+        if last_heartbeat.elapsed() >= PAIR_WAIT_HEARTBEAT {
+          info!(
+            "Still waiting on {} ({} so far)",
+            host,
+            describe_elapsed(started.elapsed())
+          );
+          last_heartbeat = Instant::now();
+        }
+      }
+    }
+  }
+}
+
+/// A wait in the units a person waiting would use.
+fn describe_elapsed(elapsed: Duration) -> String {
+  let seconds = elapsed.as_secs();
+  if seconds < 60 {
+    format!("{seconds}s")
+  } else {
+    format!("{}m{:02}s", seconds / 60, seconds % 60)
+  }
 }
 
 /// Learn which server answers at `host`, and record it.
@@ -1052,6 +1138,15 @@ async fn consume_events(
 /// error already, and a silently dead one is what the keepalive pings are for.
 /// The deployment deadline travels in the request instead, so the server
 /// applies the same one from the moment the last byte lands.
+/// How often to ask whether a queued request has been dealt with.
+///
+/// Paced for a person walking to another machine, not for a machine: the
+/// answer arrives when somebody types, and polling faster only adds load.
+const PAIR_POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+/// How often to speak up while waiting.
+const PAIR_WAIT_HEARTBEAT: Duration = Duration::from_secs(30);
+
 fn configure_endpoint(endpoint: Endpoint, remote: &ResolvedRemote) -> Endpoint {
   let endpoint = endpoint
     .http2_keep_alive_interval(KEEPALIVE_INTERVAL)

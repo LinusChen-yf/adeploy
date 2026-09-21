@@ -131,6 +131,50 @@ async fn within<T>(
   }
 }
 
+/// What to go and check when nothing answers at all.
+///
+/// A timeout means the packets may not even be arriving, which is a different
+/// search from a refusal - so it names the things that silently drop them.
+fn unreachable_advice(host: &str, port: u16, waited: Duration) -> String {
+  format!(
+    "Timed out reaching {host}:{port} after {}s. Nothing answered, so check:\n  \
+     - is `adeploy server` running on that machine?\n  \
+     - does its firewall allow inbound TCP {port}? Windows blocks this by \
+     default when the network is set to \"Public\"\n  \
+     - is {port} the port it listens on (`listen_port` on the server)?",
+    waited.as_secs()
+  )
+}
+
+/// What to go and check when the machine is up and said no.
+///
+/// A refusal is good news by comparison: it proves the host is reachable and
+/// the firewall is not in the way, leaving only what is or is not listening.
+fn refused_advice(host: &str, port: u16, error: &std::io::Error) -> String {
+  let mut message = format!("Failed to reach {host}:{port}: {error}");
+  if error.kind() == std::io::ErrorKind::ConnectionRefused {
+    message.push_str(&format!(
+      "\n  The machine is up and refused the connection, so the network is \
+       fine and nothing is listening on {port}:\n  \
+       - is `adeploy server` running?\n  \
+       - does its `listen_port` match the port this project is using?"
+    ));
+  }
+  message
+}
+
+/// What to go and check when the connection is accepted and then goes quiet.
+fn handshake_timeout_advice(host: &str, port: u16, waited: Duration) -> String {
+  format!(
+    "TLS handshake with {host}:{port} timed out after {}s. The connection was \
+     accepted and then nothing came back, which is exactly what a server \
+     running without TLS looks like:\n  \
+     - does that server have `tls = true`? This client is using TLS\n  \
+     - is something other than adeploy listening on {port}?",
+    waited.as_secs()
+  )
+}
+
 /// Ask `host` what certificate it serves, without trusting the answer.
 ///
 /// The one connection that cannot verify the server, for the same reason
@@ -161,14 +205,10 @@ pub async fn fetch_server_certificate(
   let stream = within(
     connect_timeout,
     tokio::net::TcpStream::connect((host, port)),
-    || format!("Timed out reaching {host}:{port}"),
+    || unreachable_advice(host, port, connect_timeout.unwrap_or_default()),
   )
   .await?
-  .map_err(|e| {
-    Box::new(AdeployError::Network(format!(
-      "Failed to reach {host}:{port}: {e}"
-    )))
-  })?;
+  .map_err(|e| Box::new(AdeployError::Network(refused_advice(host, port, &e))))?;
 
   let name = ServerName::try_from(SERVER_TLS_NAME)
     .map_err(|e| Box::new(AdeployError::Network(format!("Invalid TLS name: {e}"))))?
@@ -176,12 +216,7 @@ pub async fn fetch_server_certificate(
   let session = within(
     connect_timeout,
     tokio_rustls::TlsConnector::from(Arc::new(config)).connect(name, stream),
-    || {
-      format!(
-        "TLS handshake with {host}:{port} timed out. A server running without TLS \
-         accepts the connection and then never answers, which looks exactly like this."
-      )
-    },
+    || handshake_timeout_advice(host, port, connect_timeout.unwrap_or_default()),
   )
   .await?
   .map_err(|e| {

@@ -34,7 +34,7 @@ In the project you want to deploy:
 ```bash
 adeploy init                       # write a commented adeploy.toml here
 adeploy list                       # what this project declares
-adeploy pair <host>                # exchange identities with the server
+adeploy pair <host>                # exchange identities, then wait to be approved
 adeploy <host> <pkg> --dry-run     # what would be sent, without sending it
 adeploy <host> <pkg> [pkg...]      # deploy one or more packages
 adeploy rollback <host> <pkg>      # put the previous deployment back
@@ -226,6 +226,20 @@ than trusting whoever reached the queue first or whoever answered on that
 address. `adeploy server keys` lists who is trusted and `adeploy server revoke`
 withdraws it; the running server picks all of this up without a restart.
 
+`adeploy pair` then holds until somebody has decided, because the person
+running it is usually the person walking over to approve it:
+
+```
+Request queued on 192.0.2.10: Queued for approval
+Approve it on 192.0.2.10 with:  adeploy server approve SHA256:DPHRhww...
+Waiting for that approval - Ctrl-C is safe, the request stays queued
+Approved by 192.0.2.10 after 34s; deployments will work now
+```
+
+Ctrl-C really is safe: the request is already recorded on the server, so
+stopping the wait costs the wait and not the work. `--no-wait` returns as soon
+as the request is queued, for scripts that have nobody to wait for.
+
 `Pair` is the one method that cannot require a key, since establishing one is
 the point. A request is self-signed, which proves the sender holds the key it is
 presenting — enough to stop anyone queueing keys they do not control — and then
@@ -260,9 +274,8 @@ UnknownIssuer. If 192.0.2.10 was rebuilt or replaced, its identity changed; run
 `adeploy pair 192.0.2.10 --force` after checking that is what happened
 ```
 
-That is the only new flag: `--force` accepts an identity that differs from the
-one on file, for a machine that really was rebuilt. Without it, nothing
-overwrites a recorded identity.
+`--force` accepts an identity that differs from the one on file, for a machine
+that really was rebuilt. Without it, nothing overwrites a recorded identity.
 
 Both ends can be turned off with `tls = false` — under `[server]` on the server,
 under `[defaults]` or one `[remotes.*]` on the client — which exists for

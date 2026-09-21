@@ -9,6 +9,7 @@
 use std::{
   path::{Path, PathBuf},
   sync::Arc,
+  time::{Duration, Instant},
 };
 
 use adeploy::{
@@ -58,7 +59,17 @@ struct Harness {
 
 impl Harness {
   /// A server with a generated identity, and a client that knows nothing yet.
+  /// A server that already lists this client in `allowed_keys`.
   async fn start() -> Self {
+    Self::start_with(true).await
+  }
+
+  /// A server that has never heard of this client, so pairing has to queue.
+  async fn start_unknown() -> Self {
+    Self::start_with(false).await
+  }
+
+  async fn start_with(pre_trusted: bool) -> Self {
     let temp = TempDir::new().expect("temp dir");
     let root = temp.path();
 
@@ -89,7 +100,14 @@ impl Harness {
     let server_config = server_dir.join("adeploy.toml");
     std::fs::write(
       &server_config,
-      format!("[server]\nlisten_port = {port}\nallowed_keys = [\"{public_key_text}\"]\n"),
+      format!(
+        "[server]\nlisten_port = {port}\nallowed_keys = [{keys}]\n",
+        keys = if pre_trusted {
+          format!("\"{public_key_text}\"")
+        } else {
+          String::new()
+        }
+      ),
     )
     .expect("write server config");
 
@@ -150,8 +168,25 @@ impl Harness {
     store.save(&self.paired_path).expect("save store");
   }
 
+  fn reject_all_pending(&self) {
+    let mut store = PairStore::load(&self.paired_path).expect("load store");
+    while !store.pending.is_empty() {
+      store.reject("1").expect("reject");
+    }
+    store.save(&self.paired_path).expect("save store");
+  }
+
+  /// Pair and return as soon as the request is queued.
+  ///
+  /// These tests approve out of band afterwards, so waiting here would be
+  /// waiting on something this task is the one that has to go and do.
   async fn pair(&self, force: bool) -> AdeployResult<()> {
-    client::pair("127.0.0.1", force, self.provider.as_ref()).await
+    client::pair("127.0.0.1", force, false, self.provider.as_ref()).await
+  }
+
+  /// Pair and hold until somebody approves, which is what an operator gets.
+  async fn pair_and_wait(&self, force: bool) -> AdeployResult<()> {
+    client::pair("127.0.0.1", force, true, self.provider.as_ref()).await
   }
 
   async fn deploy(&self) -> AdeployResult<()> {
@@ -315,5 +350,64 @@ async fn pairing_twice_with_the_same_server_is_not_a_change() {
     harness.known_servers().servers.len(),
     1,
     "and must not add a second entry"
+  );
+}
+
+#[tokio::test]
+async fn pairing_holds_until_someone_approves() {
+  // What an operator actually does: start the pair, walk to the other machine,
+  // approve, and have the first command notice. Before this the client printed
+  // the approval instructions and exited, leaving them to run it all again.
+  let harness = Harness::start_unknown().await;
+
+  let waiting = async {
+    let outcome = harness.pair_and_wait(false).await;
+    (outcome, Instant::now())
+  };
+  let approving = async {
+    // Long enough that the request is queued and the wait is really underway.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    harness.approve_all_pending();
+    Instant::now()
+  };
+
+  let started = Instant::now();
+  let ((outcome, returned_at), approved_at) = tokio::join!(waiting, approving);
+  outcome.expect("an approved request must return successfully");
+
+  // The ordering is the whole claim. Returning early and happening to be
+  // approved afterwards would satisfy every other assertion here.
+  assert!(
+    returned_at > approved_at,
+    "pairing returned {:?} before the approval, so it is not waiting on it",
+    approved_at.duration_since(returned_at)
+  );
+  assert!(
+    started.elapsed() < Duration::from_secs(30),
+    "it waited {:?}, so it is not noticing the approval either",
+    started.elapsed()
+  );
+
+  // And the wait left something usable behind, not just a happy exit code.
+  harness.deploy().await.expect("deploying after the wait");
+}
+
+#[tokio::test]
+async fn pairing_gives_up_when_the_server_refuses() {
+  // The other way a wait can end. Rejection is a decision, not a failure to
+  // reach anyone, so it has to break the loop rather than be polled forever.
+  let harness = Harness::start_unknown().await;
+
+  let waiting = harness.pair_and_wait(false);
+  let rejecting = async {
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    harness.reject_all_pending();
+  };
+
+  let (outcome, ()) = tokio::join!(waiting, rejecting);
+  let failure = outcome.expect_err("a refused key must not be reported as paired");
+  assert!(
+    failure.to_string().contains("refused"),
+    "the error should say it was refused, got: {failure}"
   );
 }
