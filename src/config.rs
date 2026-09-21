@@ -520,6 +520,29 @@ pub fn executable_dir() -> Result<PathBuf> {
   Ok(current_dir.to_path_buf())
 }
 
+/// Is this absolute for *some* machine?
+///
+/// `Path::is_absolute` answers for the machine asking, which is the wrong one:
+/// the path belongs to the server, and deploying from Linux to Windows is the
+/// case this tool exists for. Judging a Windows path by POSIX rules refused
+/// `C:\...` outright and left no way to state the destination at all.
+///
+/// So the client only rules out what is relative under every convention, and
+/// the server - which does know its own platform - makes the real decision
+/// with `Path::is_absolute` when the manifest arrives.
+pub fn is_absolute_somewhere(path: &str) -> bool {
+  let bytes = path.as_bytes();
+  match bytes {
+    // POSIX, and a UNC share under either slash.
+    [b'/', ..] | [b'\\', b'\\', ..] => true,
+    // A drive letter only counts with a separator after it: `C:app` is
+    // relative to whatever directory that drive is sitting in, which is
+    // exactly the kind of path this check is here to catch.
+    [drive, b':', b'\\' | b'/', ..] => drive.is_ascii_alphabetic(),
+    _ => false,
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use std::fs;

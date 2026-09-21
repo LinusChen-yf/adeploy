@@ -1,6 +1,6 @@
 use std::{
   convert::TryFrom,
-  path::{Path, PathBuf},
+  path::PathBuf,
   time::{Duration, Instant},
 };
 
@@ -24,7 +24,7 @@ use crate::{
     backup_list_signing_payload, deploy_start_signing_payload, fingerprint, pair_signing_payload,
     rollback_signing_payload, Auth,
   },
-  config::{ConfigProvider, LoadedConfig, ProjectConfig, ResolvedRemote},
+  config::{is_absolute_somewhere, ConfigProvider, LoadedConfig, ProjectConfig, ResolvedRemote},
   deploy::{describe_archive, DeployManager},
   error::{AdeployError, Result},
   identity::{fetch_server_certificate, SERVER_TLS_NAME},
@@ -159,9 +159,11 @@ fn manifest_for(config: &ProjectConfig, package: &str) -> Result<DeployManifest>
   // Absolute because there is no server-side root to resolve against any more,
   // and a path that means something different on each machine is worse than one
   // that is refused here.
-  if !Path::new(&deploy_path).is_absolute() {
+  if !is_absolute_somewhere(&deploy_path) {
     return Err(Box::new(AdeployError::Config(format!(
-      "deploy_path for '{}' must be absolute, got '{}'",
+      "deploy_path for '{}' must be absolute, got '{}'. Absolute means \
+       /srv/app, C:\\srv\\app or \\\\host\\share\\app, depending on the \
+       server - this machine does not decide which.",
       package, deploy_path
     ))));
   }
@@ -1173,6 +1175,41 @@ mod tests {
   /// `manifest_for` refuses a `deploy_path` that is not absolute, and on
   /// Windows a leading separator alone is not.
   const ROOT: &str = if cfg!(windows) { "C:/some" } else { "/some" };
+
+  #[test]
+  fn a_destination_on_the_other_kind_of_machine_is_still_absolute() {
+    // Deploying from Linux to Windows is the case this tool exists for, and
+    // `Path::is_absolute` answers for the machine asking. It called
+    // `C:\Program Files\app` relative and refused it, which left no way to
+    // name a destination on a Windows server at all.
+    for accepted in [
+      "/srv/app",
+      "C:\\Program Files\\app",
+      "c:/tools/app",
+      "\\\\fileserver\\share\\app",
+      "//fileserver/share/app",
+    ] {
+      assert!(
+        is_absolute_somewhere(accepted),
+        "{accepted} is absolute on some machine and must be allowed through"
+      );
+    }
+  }
+
+  #[test]
+  fn what_is_relative_everywhere_is_still_refused() {
+    for refused in [
+      "", "app", "dist/app", "./app", "..\\app",
+      // Relative to wherever that drive happens to be sitting, and to the
+      // current drive respectively - the mistakes this check is here for.
+      "C:app", "\\app", "1:/app",
+    ] {
+      assert!(
+        !is_absolute_somewhere(refused),
+        "{refused:?} is relative under every convention and must be refused"
+      );
+    }
+  }
 
   fn loaded(toml_text: &str) -> LoadedConfig {
     LoadedConfig {
