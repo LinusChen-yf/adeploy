@@ -1,7 +1,7 @@
 use std::{
   convert::TryFrom,
-  path::{Path, PathBuf},
-  time::Duration,
+  path::PathBuf,
+  time::{Duration, Instant},
 };
 
 use async_stream::stream;
@@ -17,13 +17,14 @@ use crate::{
   adeploy::{
     deploy_chunk::Payload, deploy_event::Event, deploy_log::Level as DeployLogLevel,
     deploy_service_client::DeployServiceClient, BackupListRequest, DeployChunk, DeployEvent,
-    DeployLog, DeployManifest, DeployResult, DeployStart, PairRequest, PairState, RollbackRequest,
+    DeployLog, DeployManifest, DeployResult, DeployStart, PairRequest, PairResponse, PairState,
+    RollbackRequest,
   },
   auth::{
     backup_list_signing_payload, deploy_start_signing_payload, fingerprint, pair_signing_payload,
     rollback_signing_payload, Auth,
   },
-  config::{ConfigProvider, LoadedConfig, ProjectConfig, ResolvedRemote},
+  config::{is_absolute_somewhere, ConfigProvider, LoadedConfig, ProjectConfig, ResolvedRemote},
   deploy::{describe_archive, DeployManager},
   error::{AdeployError, Result},
   identity::{fetch_server_certificate, SERVER_TLS_NAME},
@@ -158,9 +159,11 @@ fn manifest_for(config: &ProjectConfig, package: &str) -> Result<DeployManifest>
   // Absolute because there is no server-side root to resolve against any more,
   // and a path that means something different on each machine is worse than one
   // that is refused here.
-  if !Path::new(&deploy_path).is_absolute() {
+  if !is_absolute_somewhere(&deploy_path) {
     return Err(Box::new(AdeployError::Config(format!(
-      "deploy_path for '{}' must be absolute, got '{}'",
+      "deploy_path for '{}' must be absolute, got '{}'. Absolute means \
+       /srv/app, C:\\srv\\app or \\\\host\\share\\app, depending on the \
+       server - this machine does not decide which.",
       package, deploy_path
     ))));
   }
@@ -436,7 +439,12 @@ fn format_size(bytes: u64) -> String {
 /// Deliberately a separate command rather than something a failed deployment
 /// does on its own: joining a server is a decision, and the operator on the
 /// other end has to be told to expect it.
-pub async fn pair(host: &str, force: bool, provider: &dyn ConfigProvider) -> Result<()> {
+pub async fn pair(
+  host: &str,
+  force: bool,
+  wait: bool,
+  provider: &dyn ConfigProvider,
+) -> Result<()> {
   let loaded = provider.load()?;
   let remote = loaded.config.resolve_remote(host);
   let auth = prepare_auth_resources(provider)?;
@@ -451,35 +459,142 @@ pub async fn pair(host: &str, force: bool, provider: &dyn ConfigProvider) -> Res
   // makes: this machine records who the server is, and the server queues this
   // machine's key for a person to approve.
   let trust = record_server_identity(host, &remote, provider, force).await?;
+  let mut client = connect_deploy_client(host, &remote, &trust).await?;
 
+  let response = send_pair_request(&mut client, &auth, &client_name).await?;
+  match PairState::try_from(response.state).unwrap_or(PairState::Unspecified) {
+    PairState::Approved => {
+      info!(
+        "{} already trusts this machine; deployments will work",
+        host
+      );
+    }
+    PairState::Rejected => return Err(refusal(host, &response.message)),
+    PairState::Pending => {
+      info!("Request queued on {}: {}", host, response.message);
+      // `response.fingerprint` is this machine's own key as the server read
+      // it, which is the value to compare on the server. The server's own
+      // identity is a different fingerprint, reported by
+      // `record_server_identity` above.
+      warn!(
+        "Approve it on {} with:  adeploy server clients  (fingerprint {})",
+        host, response.fingerprint
+      );
+      warn!("Check that fingerprint matches the one printed above before approving");
+      if wait {
+        await_approval(&mut client, host, &auth, &client_name).await?;
+      }
+    }
+    PairState::Unspecified => {
+      warn!(
+        "{} returned an unrecognised pairing state: {}",
+        host, response.message
+      );
+    }
+  }
+  Ok(())
+}
+
+/// Being refused is an answer, not a failure to get one - but it still has to
+/// leave a non-zero exit, or nothing calling this can tell it from approval.
+///
+/// It says the refusal is not remembered because that is the part an operator
+/// cannot see from here: the server drops it as it is delivered, so the next
+/// attempt is a fresh request rather than a rerun of a rejected one.
+fn refusal(host: &str, message: &str) -> Box<AdeployError> {
+  Box::new(AdeployError::Auth(format!(
+    "{host} refused this request: {message}. It answered this one request \
+     only - pairing again asks fresh."
+  )))
+}
+
+/// Build and send one pairing request.
+///
+/// A fresh nonce and timestamp each time, which is what lets the same call be
+/// repeated while waiting without the server's replay protection turning the
+/// second one away.
+async fn send_pair_request(
+  client: &mut DeployServiceClient<Channel>,
+  auth: &AuthResources,
+  client_name: &str,
+) -> Result<PairResponse> {
   let nonce = Uuid::new_v4().to_string();
   let timestamp_ms = now_ms();
-  let payload = pair_signing_payload(&auth.public_key, &client_name, &nonce, timestamp_ms);
+  let payload = pair_signing_payload(&auth.public_key, client_name, &nonce, timestamp_ms);
   let signature = auth
     .ssh_auth
     .sign_data(&payload)
     .map_err(|e| Box::new(AdeployError::Auth(format!("Failed to sign request: {}", e))))?;
 
-  let mut client = connect_deploy_client(host, &remote, &trust).await?;
-  let response = client
-    .pair(tonic::Request::new(PairRequest {
-      public_key: auth.public_key.clone(),
-      client_name,
-      nonce,
-      timestamp_ms,
-      signature: general_purpose::STANDARD.encode(&signature),
-    }))
-    .await
-    .map_err(|status| Box::new(AdeployError::Grpc(status)))?
-    .into_inner();
+  Ok(
+    client
+      .pair(tonic::Request::new(PairRequest {
+        public_key: auth.public_key.clone(),
+        client_name: client_name.to_string(),
+        nonce,
+        timestamp_ms,
+        signature: general_purpose::STANDARD.encode(&signature),
+      }))
+      .await
+      .map_err(|status| Box::new(AdeployError::Grpc(status)))?
+      .into_inner(),
+  )
+}
 
-  report_pair_state(
-    host,
-    &response.state,
-    &response.fingerprint,
-    &response.message,
-  );
-  Ok(())
+/// Hold the command open until a person on the server has decided.
+///
+/// `Pair` is idempotent - a key already queued gets its state back rather than
+/// a second slot in the queue - so waiting needs no protocol of its own, only
+/// the same call repeated. Nothing is lost by giving up either: the request is
+/// already recorded on the server, so Ctrl-C costs the wait and not the work.
+async fn await_approval(
+  client: &mut DeployServiceClient<Channel>,
+  host: &str,
+  auth: &AuthResources,
+  client_name: &str,
+) -> Result<()> {
+  info!("Waiting for that approval - Ctrl-C is safe, the request stays queued");
+
+  let started = Instant::now();
+  let mut last_heartbeat = Instant::now();
+  loop {
+    tokio::time::sleep(PAIR_POLL_INTERVAL).await;
+    let response = send_pair_request(client, auth, client_name).await?;
+
+    match PairState::try_from(response.state).unwrap_or(PairState::Unspecified) {
+      PairState::Approved => {
+        info!(
+          "Approved by {} after {}; deployments will work now",
+          host,
+          describe_elapsed(started.elapsed())
+        );
+        return Ok(());
+      }
+      PairState::Rejected => return Err(refusal(host, &response.message)),
+      PairState::Pending | PairState::Unspecified => {
+        // Say something occasionally, so a long wait stays distinguishable
+        // from the silent hang this command used to be able to produce.
+        if last_heartbeat.elapsed() >= PAIR_WAIT_HEARTBEAT {
+          info!(
+            "Still waiting on {} ({} so far)",
+            host,
+            describe_elapsed(started.elapsed())
+          );
+          last_heartbeat = Instant::now();
+        }
+      }
+    }
+  }
+}
+
+/// A wait in the units a person waiting would use.
+fn describe_elapsed(elapsed: Duration) -> String {
+  let seconds = elapsed.as_secs();
+  if seconds < 60 {
+    format!("{seconds}s")
+  } else {
+    format!("{}m{:02}s", seconds / 60, seconds % 60)
+  }
 }
 
 /// Learn which server answers at `host`, and record it.
@@ -504,7 +619,12 @@ async fn record_server_identity(
     return Ok(ServerTrust::Insecure);
   }
 
-  let presented = fetch_server_certificate(host, remote.port).await?;
+  let presented = fetch_server_certificate(
+    host,
+    remote.port,
+    (remote.connect_timeout > 0).then(|| Duration::from_secs(remote.connect_timeout)),
+  )
+  .await?;
   let path = provider.get_key_paths()?.known_servers();
   let mut known = KnownServers::load(&path)?;
 
@@ -549,38 +669,6 @@ async fn record_server_identity(
 
   known.save(&path)?;
   Ok(ServerTrust::Pinned(presented.certificate_pem))
-}
-
-/// `key_fingerprint` is this machine's own key, as the server read it - the
-/// value an operator pastes into `adeploy server approve`. The server's own
-/// identity is a different fingerprint entirely, reported above by
-/// `record_server_identity`.
-fn report_pair_state(host: &str, state: &i32, key_fingerprint: &str, message: &str) {
-  match PairState::try_from(*state).unwrap_or(PairState::Unspecified) {
-    PairState::Approved => {
-      info!(
-        "{} already trusts this machine; deployments will work",
-        host
-      );
-    }
-    PairState::Pending => {
-      info!("Request queued on {}: {}", host, message);
-      warn!(
-        "Approve it on {} with:  adeploy server approve {}",
-        host, key_fingerprint
-      );
-      warn!("Check that fingerprint matches the one printed above before approving");
-    }
-    PairState::Rejected => {
-      error!("{} has refused this key: {}", host, message);
-    }
-    PairState::Unspecified => {
-      warn!(
-        "{} returned an unrecognised pairing state: {}",
-        host, message
-      );
-    }
-  }
 }
 
 /// Name shown in the server's pending list.
@@ -1047,6 +1135,15 @@ async fn consume_events(
 /// error already, and a silently dead one is what the keepalive pings are for.
 /// The deployment deadline travels in the request instead, so the server
 /// applies the same one from the moment the last byte lands.
+/// How often to ask whether a queued request has been dealt with.
+///
+/// Paced for a person walking to another machine, not for a machine: the
+/// answer arrives when somebody types, and polling faster only adds load.
+const PAIR_POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+/// How often to speak up while waiting.
+const PAIR_WAIT_HEARTBEAT: Duration = Duration::from_secs(30);
+
 fn configure_endpoint(endpoint: Endpoint, remote: &ResolvedRemote) -> Endpoint {
   let endpoint = endpoint
     .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
@@ -1078,6 +1175,41 @@ mod tests {
   /// `manifest_for` refuses a `deploy_path` that is not absolute, and on
   /// Windows a leading separator alone is not.
   const ROOT: &str = if cfg!(windows) { "C:/some" } else { "/some" };
+
+  #[test]
+  fn a_destination_on_the_other_kind_of_machine_is_still_absolute() {
+    // Deploying from Linux to Windows is the case this tool exists for, and
+    // `Path::is_absolute` answers for the machine asking. It called
+    // `C:\Program Files\app` relative and refused it, which left no way to
+    // name a destination on a Windows server at all.
+    for accepted in [
+      "/srv/app",
+      "C:\\Program Files\\app",
+      "c:/tools/app",
+      "\\\\fileserver\\share\\app",
+      "//fileserver/share/app",
+    ] {
+      assert!(
+        is_absolute_somewhere(accepted),
+        "{accepted} is absolute on some machine and must be allowed through"
+      );
+    }
+  }
+
+  #[test]
+  fn what_is_relative_everywhere_is_still_refused() {
+    for refused in [
+      "", "app", "dist/app", "./app", "..\\app",
+      // Relative to wherever that drive happens to be sitting, and to the
+      // current drive respectively - the mistakes this check is here for.
+      "C:app", "\\app", "1:/app",
+    ] {
+      assert!(
+        !is_absolute_somewhere(refused),
+        "{refused:?} is relative under every convention and must be refused"
+      );
+    }
+  }
 
   fn loaded(toml_text: &str) -> LoadedConfig {
     LoadedConfig {

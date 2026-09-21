@@ -137,7 +137,7 @@ impl PairStore {
       )))
     })?;
     let content = format!(
-      "# Managed by adeploy. Use `adeploy server approve|reject|revoke`\n\
+      "# Managed by adeploy. Use `adeploy server clients` to edit it.\n\
        # rather than editing this file by hand.\n\n{body}"
     );
 
@@ -181,11 +181,20 @@ impl PairStore {
     if self.is_approved(key) {
       return PairOutcome::AlreadyApproved;
     }
-    if self
+    // A refusal is a single answer to a single request, not a ban. It is kept
+    // only long enough to reach the client that asked - the operator rejecting
+    // and the server answering are different processes, so the decision has to
+    // travel through this file - and is dropped as it is delivered. Asking
+    // again afterwards queues a fresh request, which is what an operator who
+    // refused the wrong row would expect, and it means a client polling while
+    // it waits cannot be told "rejected" forever by a decision it already
+    // acted on.
+    if let Some(index) = self
       .rejected
       .iter()
-      .any(|client| client.public_key.trim() == key)
+      .position(|client| client.public_key.trim() == key)
     {
+      self.rejected.remove(index);
       return PairOutcome::Rejected;
     }
     // Repeating a request must not consume another slot, so a client retrying
@@ -220,12 +229,20 @@ impl PairStore {
     Ok(client)
   }
 
-  /// Refuse a pending request, remembering the decision.
+  /// Refuse a pending request, once.
+  ///
+  /// The entry left behind is an undelivered answer rather than a record: the
+  /// next request from that key is told it was refused, and the entry goes.
+  /// A client that never comes back leaves one behind, so the set is bounded
+  /// the same way the queue is.
   pub fn reject(&mut self, selector: &str) -> Result<PairedClient> {
     let index = self.find_pending(selector)?;
     let mut client = self.pending.remove(index);
     client.decided_at = Some(Utc::now());
     self.rejected.push(client.clone());
+    while self.rejected.len() > MAX_PENDING {
+      self.rejected.remove(0);
+    }
     Ok(client)
   }
 
@@ -327,16 +344,46 @@ mod tests {
   }
 
   #[test]
-  fn a_rejected_key_is_not_queued_again() {
+  fn a_refusal_is_delivered_once_and_then_forgotten() {
     let mut store = queued_store();
     store.reject("1").expect("reject");
 
     assert_eq!(
       store.request(KEY_A, "dev-box", None),
       PairOutcome::Rejected,
-      "a refused key must not reappear in the queue on its own"
+      "the client that was refused has to be told so"
     );
-    assert!(store.pending.is_empty());
+    assert!(
+      store.pending.is_empty(),
+      "and must not be queued again by the request that carried the answer"
+    );
+
+    // Asking again is a new request, not a repeat of the refused one. A
+    // refusal that outlived its delivery would be a ban nobody asked for, and
+    // would leave a client that polls while waiting stuck being refused a
+    // decision it already acted on.
+    assert_eq!(
+      store.request(KEY_A, "dev-box", None),
+      PairOutcome::Queued,
+      "a later attempt must start over rather than inherit the refusal"
+    );
+    assert_eq!(store.pending.len(), 1);
+  }
+
+  #[test]
+  fn undelivered_refusals_cannot_grow_without_bound() {
+    let mut store = PairStore::default();
+    for index in 0..MAX_PENDING + 5 {
+      let key = format!("key-{index}");
+      store.request(&key, "dev-box", None);
+      store.reject("1").expect("reject");
+    }
+
+    assert_eq!(
+      store.rejected.len(),
+      MAX_PENDING,
+      "clients that never come back must not grow this file for ever"
+    );
   }
 
   #[test]

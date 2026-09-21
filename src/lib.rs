@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod client;
+pub mod clients;
 pub mod config;
 pub mod deploy;
 pub mod deploy_log;

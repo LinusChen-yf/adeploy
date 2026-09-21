@@ -40,7 +40,7 @@ use crate::{
     backup_list_signing_payload, deploy_start_signing_payload, fingerprint, pair_signing_payload,
     rollback_signing_payload, Auth,
   },
-  config::{executable_dir, ConfigProvider, PackageConfig, ProjectConfig},
+  config::{executable_dir, is_absolute_somewhere, ConfigProvider, PackageConfig, ProjectConfig},
   deploy::{backup_directory, list_backups, sweep_abandoned_uploads, DeployManager},
   deploy_log::{DeployLogEntry, LogLevel, LogSink},
   error::{AdeployError, Result},
@@ -90,7 +90,7 @@ pub struct AdeployService {
   config: Arc<RwLock<ProjectConfig>>,
   replay: Arc<ReplayGuard>,
   /// Where approvals live. Read on each request rather than cached, because
-  /// `adeploy server approve` is a separate process editing the same file.
+  /// `adeploy server clients` is a separate process editing the same file.
   paired_path: PathBuf,
   /// Serialises this server's own read-modify-write of that file.
   pair_lock: Arc<tokio::sync::Mutex<()>>,
@@ -208,10 +208,29 @@ fn reject_unusable_deploy_path(
   package_name: &str,
 ) -> std::result::Result<(), Status> {
   if !deploy_path.is_absolute() {
+    // The client lets through anything absolute under some convention, since
+    // it cannot know what this machine is. When the answer is "absolute, but
+    // for the other kind of machine", saying so beats repeating "must be
+    // absolute" at somebody looking at a path that plainly starts with a
+    // drive letter.
+    let elsewhere = is_absolute_somewhere(&deploy_path.to_string_lossy());
     return Err(Status::invalid_argument(format!(
-      "deploy_path for '{}' must be absolute, got '{}'",
+      "deploy_path for '{}' must be absolute, got '{}'{}",
       package_name,
-      deploy_path.display()
+      deploy_path.display(),
+      if elsewhere {
+        let (there, here) = if cfg!(windows) {
+          ("a POSIX system", "Windows")
+        } else {
+          ("Windows", "a POSIX system")
+        };
+        format!(
+          ". That is absolute on {there}, and this server is {here} - check \
+           which server this package is meant for."
+        )
+      } else {
+        String::new()
+      }
     )));
   }
 
@@ -494,7 +513,13 @@ impl DeployService for AdeployService {
       client_address.clone(),
     );
 
-    if matches!(outcome, PairOutcome::Queued | PairOutcome::AlreadyPending) {
+    // `Rejected` is a write too: the refusal is delivered by this call and
+    // dropped as it goes, so not saving here would hand the same answer back
+    // for ever and turn a single refusal into a ban.
+    if matches!(
+      outcome,
+      PairOutcome::Queued | PairOutcome::AlreadyPending | PairOutcome::Rejected
+    ) {
       store
         .save(&self.paired_path)
         .map_err(|e| Status::internal(format!("Failed to record the request: {}", e)))?;
@@ -508,7 +533,7 @@ impl DeployService for AdeployService {
           client_address.as_deref().unwrap_or("an unknown address"),
           key_fingerprint
         );
-        warn!("Run `adeploy server pending` to review it");
+        warn!("Run `adeploy server clients` to review it");
         PairResponse {
           state: PairState::Pending as i32,
           fingerprint: key_fingerprint,
