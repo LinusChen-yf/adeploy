@@ -73,7 +73,7 @@ pub fn browse(store_path: &Path, allowed_keys: &[String]) -> Result<()> {
       return Ok(());
     }
 
-    let Some(choice) = prompt("Pick a number, [r]efresh, [q]uit: ")? else {
+    let Some(choice) = prompt("Pick a number, [r] refresh, [q] quit: ")? else {
       return Ok(());
     };
     match choice.as_str() {
@@ -187,9 +187,12 @@ fn act(store_path: &Path, row: &Row) -> Result<()> {
   let answer = match row.membership {
     Membership::Waiting => {
       println!("  Compare that fingerprint with the one printed on the client itself.");
-      prompt("  [a]pprove, [r]eject, [Enter] to go back: ")?
+      prompt("  [a] approve, [r] reject, [Enter] go back: ")?
     }
-    Membership::Trusted => prompt("  [r]evoke trust, [Enter] to go back: ")?,
+    // `x`, not `r`: reject and revoke both start with the same letter, and a
+    // key that means "refuse this request" on one row and "take away trust
+    // this machine already has" on the next is a mistake waiting to be typed.
+    Membership::Trusted => prompt("  [x] revoke trust, [Enter] go back: ")?,
     Membership::Configured => {
       println!("  This key is in `allowed_keys` in the server's adeploy.toml.");
       println!("  Remove it there; nothing here rewrites that file.\n");
@@ -220,7 +223,7 @@ fn act(store_path: &Path, row: &Row) -> Result<()> {
         client.client_name
       )
     }),
-    (Membership::Trusted, "r" | "R") => store.revoke(&selector).map(|client| {
+    (Membership::Trusted, "x" | "X") => store.revoke(&selector).map(|client| {
       format!(
         "Withdrew trust from {}. It may pair again.",
         client.client_name

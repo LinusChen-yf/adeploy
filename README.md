@@ -240,15 +240,17 @@ Waiting for approval
 Trusted
    2  build-box     192.0.2.12:40110   SHA256:Mn2Zx8kLpQr4TvWy6BcDeFgHiJk...   3d ago
 
-Pick a number, [r]efresh, [q]uit: 1
+Pick a number, [r] refresh, [q] quit: 1
 
   linus-laptop  192.0.2.44:51288
   SHA256:DPHRhwwNlQe81FJZJcXN0fwnhMsqRX0hJ4Ty7awZzHk
   Compare that fingerprint with the one printed on the client itself.
-  [a]pprove, [r]eject, [Enter] to go back:
+  [a] approve, [r] reject, [Enter] go back:
 ```
 
-A trusted row offers `[r]evoke` instead. Keys from `allowed_keys` are listed
+A trusted row offers `[x] revoke` instead — a different key on purpose, since
+refusing a request and taking trust away from a machine that already has it
+are not the same mistake to make by reflex. Keys from `allowed_keys` are listed
 too, marked as belonging to the configuration file, which is not rewritten
 here. Piping the output prints the lists and exits without prompting.
 
