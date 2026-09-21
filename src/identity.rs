@@ -10,7 +10,7 @@
 //! person, so the trust root is simply the certificate itself, recorded the
 //! first time and compared every time after - what SSH does with host keys.
 
-use std::{fs, path::Path, sync::Arc};
+use std::{fs, path::Path, sync::Arc, time::Duration};
 
 use log2::*;
 use rustls::{
@@ -107,9 +107,28 @@ pub fn ensure_server_identity(directory: &Path) -> Result<(ServerIdentity, bool)
 }
 
 /// What a server presented, before anything has decided to trust it.
+#[derive(Debug)]
 pub struct PresentedCertificate {
   pub certificate_pem: String,
   pub fingerprint: String,
+}
+
+/// Run `operation`, giving up after `limit` with a message of its own.
+///
+/// The error says what timed out rather than surfacing a bare Elapsed, because
+/// "timed out reaching the host" and "the handshake never finished" point at
+/// completely different things to go and check.
+async fn within<T>(
+  limit: Option<Duration>,
+  operation: impl std::future::Future<Output = T>,
+  describe: impl FnOnce() -> String,
+) -> Result<T> {
+  match limit {
+    Some(limit) => tokio::time::timeout(limit, operation)
+      .await
+      .map_err(|_| Box::new(AdeployError::Network(describe()))),
+    None => Ok(operation.await),
+  }
 }
 
 /// Ask `host` what certificate it serves, without trusting the answer.
@@ -120,7 +139,16 @@ pub struct PresentedCertificate {
 /// its fingerprint printed for a human to compare, exactly as the client's own
 /// key fingerprint already is - and nothing is sent over this connection, which
 /// is closed as soon as the certificate is in hand.
-pub async fn fetch_server_certificate(host: &str, port: u16) -> Result<PresentedCertificate> {
+///
+/// `connect_timeout` bounds both reaching the host and the handshake. Without
+/// it a dropped SYN - a firewall, a machine that is not there - leaves this
+/// waiting for the operating system to give up, which on Linux is over two
+/// minutes and looks from the outside like the command having silently stopped.
+pub async fn fetch_server_certificate(
+  host: &str,
+  port: u16,
+  connect_timeout: Option<Duration>,
+) -> Result<PresentedCertificate> {
   let provider = Arc::new(rustls::crypto::ring::default_provider());
   let mut config = ClientConfig::builder_with_provider(provider.clone())
     .with_safe_default_protocol_versions()
@@ -130,25 +158,37 @@ pub async fn fetch_server_certificate(host: &str, port: u16) -> Result<Presented
     .with_no_client_auth();
   config.alpn_protocols = vec![b"h2".to_vec()];
 
-  let stream = tokio::net::TcpStream::connect((host, port))
-    .await
-    .map_err(|e| {
-      Box::new(AdeployError::Network(format!(
-        "Failed to reach {host}:{port}: {e}"
-      )))
-    })?;
+  let stream = within(
+    connect_timeout,
+    tokio::net::TcpStream::connect((host, port)),
+    || format!("Timed out reaching {host}:{port}"),
+  )
+  .await?
+  .map_err(|e| {
+    Box::new(AdeployError::Network(format!(
+      "Failed to reach {host}:{port}: {e}"
+    )))
+  })?;
 
   let name = ServerName::try_from(SERVER_TLS_NAME)
     .map_err(|e| Box::new(AdeployError::Network(format!("Invalid TLS name: {e}"))))?
     .to_owned();
-  let session = tokio_rustls::TlsConnector::from(Arc::new(config))
-    .connect(name, stream)
-    .await
-    .map_err(|e| {
-      Box::new(AdeployError::Network(format!(
-        "TLS handshake with {host}:{port} failed: {e}. Is the server running with TLS enabled?"
-      )))
-    })?;
+  let session = within(
+    connect_timeout,
+    tokio_rustls::TlsConnector::from(Arc::new(config)).connect(name, stream),
+    || {
+      format!(
+        "TLS handshake with {host}:{port} timed out. A server running without TLS \
+         accepts the connection and then never answers, which looks exactly like this."
+      )
+    },
+  )
+  .await?
+  .map_err(|e| {
+    Box::new(AdeployError::Network(format!(
+      "TLS handshake with {host}:{port} failed: {e}. Is the server running with TLS enabled?"
+    )))
+  })?;
 
   let (_, connection) = session.get_ref();
   let presented = connection
@@ -352,5 +392,61 @@ mod tests {
       .permissions()
       .mode();
     assert_eq!(mode & 0o077, 0, "group and other must have no access");
+  }
+
+  #[tokio::test]
+  async fn a_handshake_that_never_answers_gives_up() {
+    // A server running without TLS accepts the connection and then says
+    // nothing, which is indistinguishable from a healthy one until something
+    // decides to stop waiting. Nothing did: connect_timeout was applied to the
+    // gRPC channel and not to this probe, so `adeploy pair` against such a
+    // server hung with no output past the fingerprint it had already printed.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+      .await
+      .expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    tokio::spawn(async move {
+      // Accept and hold, never speaking.
+      let mut held = Vec::new();
+      while let Ok((stream, _)) = listener.accept().await {
+        held.push(stream);
+      }
+    });
+
+    let started = std::time::Instant::now();
+    let failure = fetch_server_certificate("127.0.0.1", port, Some(Duration::from_millis(300)))
+      .await
+      .expect_err("a silent peer must not be waited on forever");
+
+    assert!(
+      started.elapsed() < Duration::from_secs(5),
+      "it gave up after {:?}, which is not the limit it was given",
+      started.elapsed()
+    );
+    assert!(
+      failure.to_string().contains("timed out"),
+      "the error should say it timed out, got: {failure}"
+    );
+  }
+
+  #[tokio::test]
+  async fn no_limit_means_no_timeout_error() {
+    // Nothing is listening, so this fails immediately - the point is that it
+    // fails for the right reason rather than being reported as a timeout.
+    let port = {
+      let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+      probe.local_addr().expect("addr").port()
+    };
+
+    let failure = fetch_server_certificate("127.0.0.1", port, None)
+      .await
+      .expect_err("nothing is listening");
+
+    assert!(
+      failure.to_string().contains("Failed to reach"),
+      "a refused connection is not a timeout, got: {failure}"
+    );
   }
 }

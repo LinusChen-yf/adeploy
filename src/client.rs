@@ -504,7 +504,12 @@ async fn record_server_identity(
     return Ok(ServerTrust::Insecure);
   }
 
-  let presented = fetch_server_certificate(host, remote.port).await?;
+  let presented = fetch_server_certificate(
+    host,
+    remote.port,
+    (remote.connect_timeout > 0).then(|| Duration::from_secs(remote.connect_timeout)),
+  )
+  .await?;
   let path = provider.get_key_paths()?.known_servers();
   let mut known = KnownServers::load(&path)?;
 
