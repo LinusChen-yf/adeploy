@@ -248,12 +248,14 @@ Pick a number, [r]efresh, [q]uit: 1
   [a]pprove, [r]eject, [Enter] to go back:
 ```
 
-A trusted row offers `[r]evoke` instead, and a refused one offers to forget the
-refusal so that machine may ask again — a rejection used to be permanent, with
-nothing short of hand-editing `paired.toml` to undo it. Keys from
-`allowed_keys` are listed too, marked as belonging to the configuration file,
-which is not rewritten here. Piping the output prints the lists and exits
-without prompting.
+A trusted row offers `[r]evoke` instead. Keys from `allowed_keys` are listed
+too, marked as belonging to the configuration file, which is not rewritten
+here. Piping the output prints the lists and exits without prompting.
+
+Rejecting answers one request. The client is told it was refused and exits
+non-zero, the refusal is dropped as it is delivered, and asking again starts a
+fresh request — so refusing the wrong row costs somebody one more `adeploy
+pair`, not their ability to pair at all.
 
 `adeploy pair` then holds until somebody has decided, because the person
 running it is usually the person walking over to approve it:

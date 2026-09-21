@@ -494,7 +494,13 @@ impl DeployService for AdeployService {
       client_address.clone(),
     );
 
-    if matches!(outcome, PairOutcome::Queued | PairOutcome::AlreadyPending) {
+    // `Rejected` is a write too: the refusal is delivered by this call and
+    // dropped as it goes, so not saving here would hand the same answer back
+    // for ever and turn a single refusal into a ban.
+    if matches!(
+      outcome,
+      PairOutcome::Queued | PairOutcome::AlreadyPending | PairOutcome::Rejected
+    ) {
       store
         .save(&self.paired_path)
         .map_err(|e| Status::internal(format!("Failed to record the request: {}", e)))?;

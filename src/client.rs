@@ -460,18 +460,50 @@ pub async fn pair(
   let mut client = connect_deploy_client(host, &remote, &trust).await?;
 
   let response = send_pair_request(&mut client, &auth, &client_name).await?;
-  report_pair_state(
-    host,
-    &response.state,
-    &response.fingerprint,
-    &response.message,
-  );
-
-  let queued = matches!(PairState::try_from(response.state), Ok(PairState::Pending));
-  if wait && queued {
-    await_approval(&mut client, host, &auth, &client_name).await?;
+  match PairState::try_from(response.state).unwrap_or(PairState::Unspecified) {
+    PairState::Approved => {
+      info!(
+        "{} already trusts this machine; deployments will work",
+        host
+      );
+    }
+    PairState::Rejected => return Err(refusal(host, &response.message)),
+    PairState::Pending => {
+      info!("Request queued on {}: {}", host, response.message);
+      // `response.fingerprint` is this machine's own key as the server read
+      // it, which is the value to compare on the server. The server's own
+      // identity is a different fingerprint, reported by
+      // `record_server_identity` above.
+      warn!(
+        "Approve it on {} with:  adeploy server clients  (fingerprint {})",
+        host, response.fingerprint
+      );
+      warn!("Check that fingerprint matches the one printed above before approving");
+      if wait {
+        await_approval(&mut client, host, &auth, &client_name).await?;
+      }
+    }
+    PairState::Unspecified => {
+      warn!(
+        "{} returned an unrecognised pairing state: {}",
+        host, response.message
+      );
+    }
   }
   Ok(())
+}
+
+/// Being refused is an answer, not a failure to get one - but it still has to
+/// leave a non-zero exit, or nothing calling this can tell it from approval.
+///
+/// It says the refusal is not remembered because that is the part an operator
+/// cannot see from here: the server drops it as it is delivered, so the next
+/// attempt is a fresh request rather than a rerun of a rejected one.
+fn refusal(host: &str, message: &str) -> Box<AdeployError> {
+  Box::new(AdeployError::Auth(format!(
+    "{host} refused this request: {message}. It answered this one request \
+     only - pairing again asks fresh."
+  )))
 }
 
 /// Build and send one pairing request.
@@ -536,12 +568,7 @@ async fn await_approval(
         );
         return Ok(());
       }
-      PairState::Rejected => {
-        return Err(Box::new(AdeployError::Auth(format!(
-          "{} refused this key: {}",
-          host, response.message
-        ))));
-      }
+      PairState::Rejected => return Err(refusal(host, &response.message)),
       PairState::Pending | PairState::Unspecified => {
         // Say something occasionally, so a long wait stays distinguishable
         // from the silent hang this command used to be able to produce.
@@ -640,38 +667,6 @@ async fn record_server_identity(
 
   known.save(&path)?;
   Ok(ServerTrust::Pinned(presented.certificate_pem))
-}
-
-/// `key_fingerprint` is this machine's own key, as the server read it - the
-/// value an operator compares in `adeploy server clients`. The server's own
-/// identity is a different fingerprint entirely, reported above by
-/// `record_server_identity`.
-fn report_pair_state(host: &str, state: &i32, key_fingerprint: &str, message: &str) {
-  match PairState::try_from(*state).unwrap_or(PairState::Unspecified) {
-    PairState::Approved => {
-      info!(
-        "{} already trusts this machine; deployments will work",
-        host
-      );
-    }
-    PairState::Pending => {
-      info!("Request queued on {}: {}", host, message);
-      warn!(
-        "Approve it on {} with:  adeploy server clients  (fingerprint {})",
-        host, key_fingerprint
-      );
-      warn!("Check that fingerprint matches the one printed above before approving");
-    }
-    PairState::Rejected => {
-      error!("{} has refused this key: {}", host, message);
-    }
-    PairState::Unspecified => {
-      warn!(
-        "{} returned an unrecognised pairing state: {}",
-        host, message
-      );
-    }
-  }
 }
 
 /// Name shown in the server's pending list.

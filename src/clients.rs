@@ -28,7 +28,6 @@ use crate::{
 enum Membership {
   Waiting,
   Trusted,
-  Refused,
   /// Listed in `allowed_keys` in the server's `adeploy.toml`.
   Configured,
 }
@@ -38,7 +37,6 @@ impl Membership {
     match self {
       Membership::Waiting => "Waiting for approval",
       Membership::Trusted | Membership::Configured => "Trusted",
-      Membership::Refused => "Refused",
     }
   }
 }
@@ -128,15 +126,8 @@ fn collect(store: &PairStore, allowed_keys: &[String]) -> Vec<Row> {
       when: None,
     });
   }
-  for (position, client) in store.rejected.iter().enumerate() {
-    rows.push(row_for(
-      client,
-      Membership::Refused,
-      position,
-      client.decided_at.unwrap_or(client.first_seen),
-    ));
-  }
-
+  // Refusals are not listed: rejecting answers one request and is forgotten
+  // as the answer is delivered, so there is no lasting state to show or undo.
   rows
 }
 
@@ -199,10 +190,6 @@ fn act(store_path: &Path, row: &Row) -> Result<()> {
       prompt("  [a]pprove, [r]eject, [Enter] to go back: ")?
     }
     Membership::Trusted => prompt("  [r]evoke trust, [Enter] to go back: ")?,
-    Membership::Refused => {
-      println!("  A refused client is turned away without being queued again.");
-      prompt("  [f]orget the refusal so it may ask again, [Enter] to go back: ")?
-    }
     Membership::Configured => {
       println!("  This key is in `allowed_keys` in the server's adeploy.toml.");
       println!("  Remove it there; nothing here rewrites that file.\n");
@@ -227,18 +214,15 @@ fn act(store_path: &Path, row: &Row) -> Result<()> {
         client.client_name
       )
     }),
-    (Membership::Waiting, "r" | "R") => store
-      .reject(&selector)
-      .map(|client| format!("Refused {}.", client.client_name)),
-    (Membership::Trusted, "r" | "R") => store.revoke(&selector).map(|client| {
+    (Membership::Waiting, "r" | "R") => store.reject(&selector).map(|client| {
       format!(
-        "Withdrew trust from {}. It may pair again.",
+        "Refused {}. It is told so, and may ask again later.",
         client.client_name
       )
     }),
-    (Membership::Refused, "f" | "F") => store.forget(&selector).map(|client| {
+    (Membership::Trusted, "r" | "R") => store.revoke(&selector).map(|client| {
       format!(
-        "Forgot the refusal of {}. It may ask again.",
+        "Withdrew trust from {}. It may pair again.",
         client.client_name
       )
     }),
@@ -289,32 +273,29 @@ fn ago(when: DateTime<Utc>) -> String {
 mod tests {
   use super::*;
 
-  fn store_with_one_of_each() -> PairStore {
+  fn store_with_a_waiting_and_a_trusted_client() -> PairStore {
     let mut store = PairStore::default();
     store.request("waiting-key", "laptop", Some("10.0.0.2:5000".into()));
     store.request("trusted-key", "build-box", None);
     store.approve("2").expect("approve");
-    store.request("refused-key", "stranger", None);
-    store.reject("2").expect("reject");
     store
   }
 
   #[test]
   fn every_list_is_numbered_once_across_the_whole_view() {
-    let store = store_with_one_of_each();
+    let store = store_with_a_waiting_and_a_trusted_client();
     let rows = collect(&store, &[]);
 
-    assert_eq!(rows.len(), 3, "one row per client, whichever list it is in");
+    assert_eq!(rows.len(), 2, "one row per client, whichever list it is in");
     // The position carried by each row is its index in its own list, which is
     // what the store's selectors resolve against - not the number on screen.
     assert_eq!(rows[0].position, 0);
     assert_eq!(rows[1].position, 0);
-    assert_eq!(rows[2].position, 0);
   }
 
   #[test]
   fn a_configured_key_that_is_also_approved_is_not_listed_twice() {
-    let store = store_with_one_of_each();
+    let store = store_with_a_waiting_and_a_trusted_client();
     let already_trusted = "trusted-key".to_string();
 
     let rows = collect(&store, std::slice::from_ref(&already_trusted));
@@ -329,7 +310,7 @@ mod tests {
 
   #[test]
   fn a_configured_key_that_is_not_in_the_store_is_still_shown() {
-    let store = store_with_one_of_each();
+    let store = store_with_a_waiting_and_a_trusted_client();
     let config_only = "config-only-key".to_string();
 
     let rows = collect(&store, std::slice::from_ref(&config_only));

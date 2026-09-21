@@ -168,6 +168,13 @@ impl Harness {
     store.save(&self.paired_path).expect("save store");
   }
 
+  fn pending_count(&self) -> usize {
+    PairStore::load(&self.paired_path)
+      .expect("load store")
+      .pending
+      .len()
+  }
+
   fn reject_all_pending(&self) {
     let mut store = PairStore::load(&self.paired_path).expect("load store");
     while !store.pending.is_empty() {
@@ -409,5 +416,18 @@ async fn pairing_gives_up_when_the_server_refuses() {
   assert!(
     failure.to_string().contains("refused"),
     "the error should say it was refused, got: {failure}"
+  );
+
+  // A refusal answers one request. Asking again has to reach the queue, or
+  // rejecting would be a ban - and a client that polls while it waits would
+  // be refused for ever by a decision it already acted on.
+  harness
+    .pair(false)
+    .await
+    .expect("asking again after a refusal must be allowed");
+  assert_eq!(
+    harness.pending_count(),
+    1,
+    "and must arrive as a fresh request in the queue"
   );
 }
