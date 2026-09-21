@@ -643,7 +643,7 @@ async fn record_server_identity(
 }
 
 /// `key_fingerprint` is this machine's own key, as the server read it - the
-/// value an operator pastes into `adeploy server approve`. The server's own
+/// value an operator compares in `adeploy server clients`. The server's own
 /// identity is a different fingerprint entirely, reported above by
 /// `record_server_identity`.
 fn report_pair_state(host: &str, state: &i32, key_fingerprint: &str, message: &str) {
@@ -657,7 +657,7 @@ fn report_pair_state(host: &str, state: &i32, key_fingerprint: &str, message: &s
     PairState::Pending => {
       info!("Request queued on {}: {}", host, message);
       warn!(
-        "Approve it on {} with:  adeploy server approve {}",
+        "Approve it on {} with:  adeploy server clients  (fingerprint {})",
         host, key_fingerprint
       );
       warn!("Check that fingerprint matches the one printed above before approving");

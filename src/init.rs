@@ -123,7 +123,7 @@ tls = true
 # Base64 Ed25519 public keys allowed to deploy here. A client that is not
 # listed is rejected and prints its own key, ready to be pasted in below.
 #
-# `adeploy server pending` and `adeploy server approve` maintain the same list
+# `adeploy server clients` maintains the same list interactively
 # through pairing, which is usually easier than copying a key by hand.
 allowed_keys = []
 "#;

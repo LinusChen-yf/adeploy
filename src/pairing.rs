@@ -137,7 +137,7 @@ impl PairStore {
       )))
     })?;
     let content = format!(
-      "# Managed by adeploy. Use `adeploy server approve|reject|revoke`\n\
+      "# Managed by adeploy. Use `adeploy server clients` to edit it.\n\
        # rather than editing this file by hand.\n\n{body}"
     );
 
@@ -239,6 +239,21 @@ impl PairStore {
     })?;
     let client = self.approved.remove(index);
     Ok(client)
+  }
+
+  /// Forget a refusal, so that client may ask again.
+  ///
+  /// A rejected key is turned away for good by `request`, and until now
+  /// nothing could undo that - a misclick cost a machine its ability to pair
+  /// until somebody hand-edited this file.
+  pub fn forget(&mut self, selector: &str) -> Result<PairedClient> {
+    let index = find(&self.rejected, selector).ok_or_else(|| {
+      Box::new(AdeployError::Config(format!(
+        "No refused client matches '{}'",
+        selector
+      )))
+    })?;
+    Ok(self.rejected.remove(index))
   }
 
   fn find_pending(&self, selector: &str) -> Result<usize> {

@@ -85,13 +85,19 @@ Deployment succeeded for demo
 
 ### Running as a Service
 ```bash
+adeploy server run                     # run in the foreground, for a first look
 adeploy server install                 # install the server as a system service
 adeploy server install --user          # install a per-user service (systemd --user / launchd)
 adeploy server start                   # start the installed service immediately
 adeploy server status                  # inspect the current service state
 adeploy server stop                    # stop the running service
 adeploy server uninstall               # remove the service definition
+adeploy server clients                 # review who may deploy
 ```
+
+`adeploy server` on its own prints this list rather than starting anything:
+running a server is `adeploy server run`, so a mistyped subcommand cannot leave
+a daemon behind.
 Pass `--label <name>` to customise the service identifier (defaults to `adeploy`). Add `--no-autostart` to skip starting on boot or `--disable-restart-on-failure` to prevent automatic restarts when the service exits with an error.
 
 ## Configuration
@@ -193,8 +199,9 @@ allowed_keys = []
   first run. On by default; see [Who the client thinks it is talking
   to](#who-the-client-thinks-it-is-talking-to).
 - `allowed_keys` — the base64 Ed25519 keys permitted to deploy, which the client
-  prints when it is rejected, and which `adeploy server approve` maintains
-  through pairing.
+  prints when it is rejected. Keys approved through pairing live in
+  `paired.toml` instead and are simply unioned with these; `adeploy server
+  clients` shows both.
 
 The server reloads this file when it changes, so adding a key does not require a
 restart.
@@ -203,8 +210,7 @@ restart.
 
 ```bash
 adeploy pair 192.0.2.10            # on the client; prints its key fingerprint
-adeploy server pending             # on the server: who is waiting, and from where
-adeploy server approve 1           # by position, or by fingerprint
+adeploy server clients             # on the server: everyone, and what to do about them
 ```
 
 Pairing settles both directions in the one trip an operator already makes. The
@@ -223,15 +229,38 @@ Check it matches the `Server identity` line in 192.0.2.10's own log
 
 **Comparing the fingerprints is what makes any of this mean anything**, rather
 than trusting whoever reached the queue first or whoever answered on that
-address. `adeploy server keys` lists who is trusted and `adeploy server revoke`
-withdraws it; the running server picks all of this up without a restart.
+address. `adeploy server clients` is where that comparison happens: it shows
+who is waiting, who is trusted, and who has been refused, and acts on the row
+in front of you rather than on a selector copied between commands. The running
+server picks up every decision without a restart.
+
+```
+Waiting for approval
+   1  linus-laptop  192.0.2.44:51288   SHA256:DPHRhwwNlQe81FJZJcXN0fwnhMsq...   2m ago
+Trusted
+   2  build-box     192.0.2.12:40110   SHA256:Mn2Zx8kLpQr4TvWy6BcDeFgHiJk...   3d ago
+
+Pick a number, [r]efresh, [q]uit: 1
+
+  linus-laptop  192.0.2.44:51288
+  SHA256:DPHRhwwNlQe81FJZJcXN0fwnhMsqRX0hJ4Ty7awZzHk
+  Compare that fingerprint with the one printed on the client itself.
+  [a]pprove, [r]eject, [Enter] to go back:
+```
+
+A trusted row offers `[r]evoke` instead, and a refused one offers to forget the
+refusal so that machine may ask again — a rejection used to be permanent, with
+nothing short of hand-editing `paired.toml` to undo it. Keys from
+`allowed_keys` are listed too, marked as belonging to the configuration file,
+which is not rewritten here. Piping the output prints the lists and exits
+without prompting.
 
 `adeploy pair` then holds until somebody has decided, because the person
 running it is usually the person walking over to approve it:
 
 ```
 Request queued on 192.0.2.10: Queued for approval
-Approve it on 192.0.2.10 with:  adeploy server approve SHA256:DPHRhww...
+Approve it on 192.0.2.10 with:  adeploy server clients  (fingerprint SHA256:DPHRhww...)
 Waiting for that approval - Ctrl-C is safe, the request stays queued
 Approved by 192.0.2.10 after 34s; deployments will work now
 ```

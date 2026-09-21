@@ -4,12 +4,10 @@ use std::{path::PathBuf, process, sync::Arc};
 // Declaring the modules here as well built every one of them twice and ran the
 // unit tests twice, against two sets of types that only looked identical.
 use adeploy::{
-  client,
+  client, clients,
   config::{self, ConfigProvider},
   error::{AdeployError, Result},
-  init,
-  pairing::{self, PairStore},
-  server,
+  init, pairing, server,
 };
 use clap::{Args, Parser, Subcommand};
 use log2::*;
@@ -45,8 +43,10 @@ const DEFAULT_SERVICE_LABEL: &str = "adeploy";
 enum Commands {
   /// Manage the deployment server
   Server {
+    /// Required: running the server is `server run`, not `server` on its own,
+    /// so a mistyped subcommand cannot start a daemon by accident
     #[command(subcommand)]
-    action: Option<ServerAction>,
+    action: ServerAction,
   },
   /// Deploy to a server (explicit client mode)
   Client {
@@ -97,7 +97,7 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ServerAction {
-  /// Run the server in the foreground (default)
+  /// Run the server in the foreground
   Run(ServiceRunArgs),
   /// Install the server as a service
   Install(ServiceInstallArgs),
@@ -109,22 +109,8 @@ enum ServerAction {
   Stop(ServiceTargetArgs),
   /// Show the current service status
   Status(ServiceTargetArgs),
-  /// List clients waiting to be approved
-  Pending,
-  /// Approve a waiting client, by list position or fingerprint
-  Approve(PairSelectorArgs),
-  /// Refuse a waiting client
-  Reject(PairSelectorArgs),
-  /// List the clients this server trusts
-  Keys,
-  /// Withdraw approval from a client
-  Revoke(PairSelectorArgs),
-}
-
-#[derive(Args, Clone)]
-struct PairSelectorArgs {
-  /// Position in the list, or a fingerprint (a unique prefix is enough)
-  selector: String,
+  /// Review who may deploy: approve, refuse, or withdraw trust
+  Clients,
 }
 
 #[derive(Args, Clone, Default)]
@@ -184,8 +170,11 @@ fn main() {
 
 fn initialize_logging(cli: &Cli) -> log2::Handle {
   match &cli.command {
-    Some(Commands::Server { action }) => match action.as_ref() {
-      Some(ServerAction::Run(_)) | None => server::init_server_logging(),
+    Some(Commands::Server { action }) => match action {
+      ServerAction::Run(_) => server::init_server_logging(),
+      // The client browser draws a screen; timestamped log lines through the
+      // middle of it would be unreadable, so it prints for itself.
+      ServerAction::Clients => log2::stdout().level("warn").start(),
       _ => log2::stdout().level("info").start(),
     },
     _ => log2::stdout().level("info").start(),
@@ -203,7 +192,6 @@ fn run_cli(cli: Cli) -> Result<()> {
 
   match command {
     Some(Commands::Server { action }) => {
-      let action = action.unwrap_or(ServerAction::Run(ServiceRunArgs::default()));
       handle_server(action, config_override)?;
     }
     Some(Commands::Client {
@@ -317,7 +305,7 @@ fn usage_error(message: &str) -> Box<AdeployError> {
     "{message}\n\
      Usage: adeploy <HOST> <PACKAGE> [PACKAGE...]\n\
      \x20  or: adeploy client <HOST> <PACKAGE> [PACKAGE...]\n\
-     \x20  or: adeploy server [run|install|start|stop|status|uninstall]\n\
+     \x20  or: adeploy server <run|clients|install|start|stop|status|uninstall>\n\
      \x20  or: adeploy server [pending|approve|reject|keys|revoke]\n\
      \x20  or: adeploy pair <HOST> [--force] [--no-wait]\n\
      \x20  or: adeploy rollback <HOST> <PACKAGE> [--list] [--to NAME]\n\
@@ -335,10 +323,6 @@ fn pair_store_path(config_override: Option<PathBuf>) -> Result<PathBuf> {
       .map(|parent| parent.join(pairing::PAIRED_FILE_NAME))
       .unwrap_or_else(|| PathBuf::from(pairing::PAIRED_FILE_NAME)),
   )
-}
-
-fn load_pair_store(config_override: Option<PathBuf>) -> Result<PairStore> {
-  PairStore::load(&pair_store_path(config_override)?)
 }
 
 fn build_runtime() -> Result<tokio::runtime::Runtime> {
@@ -418,50 +402,16 @@ fn handle_server(action: ServerAction, config_override: Option<PathBuf>) -> Resu
         if opts.user { "user" } else { "system" }
       );
     }
-    ServerAction::Pending => {
-      let store = load_pair_store(config_override)?;
-      if store.pending.is_empty() {
-        info!("No clients are waiting for approval");
-      } else {
-        info!("Clients waiting for approval:");
-        for (position, client) in store.pending.iter().enumerate() {
-          info!("  {}. {}", position + 1, client.describe());
-        }
-        info!("Approve one with `adeploy server approve <number|fingerprint>`");
-      }
-    }
-    ServerAction::Approve(opts) => {
-      let path = pair_store_path(config_override)?;
-      let mut store = PairStore::load(&path)?;
-      let client = store.approve(&opts.selector)?;
-      store.save(&path)?;
-      info!("Approved {}", client.describe());
-      info!("It can deploy now; the server picks this up without a restart");
-    }
-    ServerAction::Reject(opts) => {
-      let path = pair_store_path(config_override)?;
-      let mut store = PairStore::load(&path)?;
-      let client = store.reject(&opts.selector)?;
-      store.save(&path)?;
-      info!("Rejected {}", client.describe());
-    }
-    ServerAction::Keys => {
-      let store = load_pair_store(config_override)?;
-      if store.approved.is_empty() {
-        info!("No clients have been approved through pairing");
-      } else {
-        info!("Approved clients:");
-        for (position, client) in store.approved.iter().enumerate() {
-          info!("  {}. {}", position + 1, client.describe());
-        }
-      }
-    }
-    ServerAction::Revoke(opts) => {
-      let path = pair_store_path(config_override)?;
-      let mut store = PairStore::load(&path)?;
-      let client = store.revoke(&opts.selector)?;
-      store.save(&path)?;
-      info!("Revoked {}", client.describe());
+    ServerAction::Clients => {
+      let provider = config::ConfigProviderImpl::for_server(config_override.clone());
+      // The store is what this edits; `allowed_keys` is only read, so a
+      // server whose configuration cannot be parsed still gets a usable list
+      // rather than no list at all.
+      let allowed_keys = provider
+        .load()
+        .map(|loaded| loaded.config.server.allowed_keys)
+        .unwrap_or_default();
+      clients::browse(&pair_store_path(config_override)?, &allowed_keys)?;
     }
     ServerAction::Status(opts) => {
       let status = server::service_status(&opts.label, opts.user)?;

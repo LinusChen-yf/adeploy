@@ -90,7 +90,7 @@ pub struct AdeployService {
   config: Arc<RwLock<ProjectConfig>>,
   replay: Arc<ReplayGuard>,
   /// Where approvals live. Read on each request rather than cached, because
-  /// `adeploy server approve` is a separate process editing the same file.
+  /// `adeploy server clients` is a separate process editing the same file.
   paired_path: PathBuf,
   /// Serialises this server's own read-modify-write of that file.
   pair_lock: Arc<tokio::sync::Mutex<()>>,
@@ -508,7 +508,7 @@ impl DeployService for AdeployService {
           client_address.as_deref().unwrap_or("an unknown address"),
           key_fingerprint
         );
-        warn!("Run `adeploy server pending` to review it");
+        warn!("Run `adeploy server clients` to review it");
         PairResponse {
           state: PairState::Pending as i32,
           fingerprint: key_fingerprint,
